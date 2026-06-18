@@ -33,26 +33,6 @@
 // Copyright (c) 2026, Virtual Cable S.L.
 // All rights reserved.
 
-/// Window show states (Win32 SW_* constants)
-pub const SW_HIDE: u32 = 0;
-pub const SW_SHOWNORMAL: u32 = 1;
-pub const SW_SHOWMINIMIZED: u32 = 2;
-pub const SW_SHOWMAXIMIZED: u32 = 3;
-pub const SW_SHOWNOACTIVATE: u32 = 4;
-pub const SW_SHOW: u32 = 5;
-pub const SW_MINIMIZE: u32 = 6;
-pub const SW_SHOWMINNOACTIVE: u32 = 7;
-pub const SW_SHOWNA: u32 = 8;
-pub const SW_RESTORE: u32 = 9;
-pub const SW_SHOWDEFAULT: u32 = 10;
-pub const SW_FORCEMINIMIZE: u32 = 11;
-
-/// RAIL System Commands
-pub const SC_MINIMIZE: u32 = 0xF020;
-pub const SC_MAXIMIZE: u32 = 0xF030;
-pub const SC_RESTORE: u32 = 0xF120;
-pub const SC_CLOSE: u32 = 0xF060;
-
 /// Coordinate thresholds and constants
 pub const OFFSCREEN_THRESHOLD: i32 = -1000;
 pub const MINIMIZED_COORD: i32 = -32000;

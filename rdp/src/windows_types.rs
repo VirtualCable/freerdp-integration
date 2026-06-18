@@ -164,3 +164,80 @@ bitflags! {
         const PALETTE_WINDOW        = 0x0000_0188;
     }
 }
+
+/// Win32 ShowWindow commands (SW_* constants).
+///
+/// See: <https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-showwindow>
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ShowWindowCmd {
+    Hide = 0,
+    ShowNormal = 1,
+    ShowMinimized = 2,
+    ShowMaximized = 3,
+    ShowNoActivate = 4,
+    Show = 5,
+    Minimize = 6,
+    ShowMinNoActive = 7,
+    ShowNa = 8,
+    Restore = 9,
+    ShowDefault = 10,
+    ForceMinimize = 11,
+}
+
+impl TryFrom<u32> for ShowWindowCmd {
+    type Error = u32;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Hide),
+            1 => Ok(Self::ShowNormal),
+            2 => Ok(Self::ShowMinimized),
+            3 => Ok(Self::ShowMaximized),
+            4 => Ok(Self::ShowNoActivate),
+            5 => Ok(Self::Show),
+            6 => Ok(Self::Minimize),
+            7 => Ok(Self::ShowMinNoActive),
+            8 => Ok(Self::ShowNa),
+            9 => Ok(Self::Restore),
+            10 => Ok(Self::ShowDefault),
+            11 => Ok(Self::ForceMinimize),
+            _ => Err(value),
+        }
+    }
+}
+
+/// Win32 System Commands (SC_* constants, WM_SYSCOMMAND).
+///
+/// Values from FreeRDP's winpr bindings (`freerdp_sys::SC_*`).
+/// See: <https://learn.microsoft.com/en-us/windows/win32/menurc/wm-syscommand>
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SystemCommand {
+    Size = 0xF000,
+    Move = 0xF010,
+    Minimize = 0xF020,
+    Maximize = 0xF030,
+    Close = 0xF060,
+    KeyMenu = 0xF100,
+    Restore = 0xF120,
+}
+
+impl TryFrom<u32> for SystemCommand {
+    type Error = u32;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            0xF000 => Ok(Self::Size),
+            0xF010 => Ok(Self::Move),
+            0xF020 => Ok(Self::Minimize),
+            0xF030 => Ok(Self::Maximize),
+            0xF060 => Ok(Self::Close),
+            0xF100 => Ok(Self::KeyMenu),
+            0xF120 => Ok(Self::Restore),
+            _ => Err(value),
+        }
+    }
+}
+
+

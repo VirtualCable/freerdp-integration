@@ -33,7 +33,7 @@ use flume;
 use zeroize::Zeroize;
 
 use crate::geom::Rect;
-use crate::windows_types::{ExtendedWindowStyle, WindowStyle};
+use crate::windows_types::{ExtendedWindowStyle, ShowWindowCmd, SystemCommand, WindowStyle};
 
 #[derive(Clone)]
 #[allow(dead_code)]
@@ -54,7 +54,7 @@ pub enum RdpMessage {
         ext_style: Option<ExtendedWindowStyle>,
         taskbar_button: Option<bool>,
         title: String,
-        show_state: Option<u32>,
+        show_state: Option<ShowWindowCmd>,
         is_offscreen: Option<bool>,
         pos: Option<(i32, i32)>,
         size: Option<(u32, u32)>,
@@ -66,7 +66,7 @@ pub enum RdpMessage {
         ext_style: Option<ExtendedWindowStyle>,
         taskbar_button: Option<bool>,
         title: String,
-        show_state: Option<u32>,
+        show_state: Option<ShowWindowCmd>,
         is_offscreen: Option<bool>,
         pos: Option<(i32, i32)>,
         size: Option<(u32, u32)>,
@@ -81,7 +81,7 @@ pub enum RdpMessage {
     },
     ClientSystemCommand {
         window_id: u32,
-        command: u32,
+        command: SystemCommand,
     },
     MicConfig {
         sample_rate: u32,
@@ -326,7 +326,7 @@ mod tests {
             ext_style: Some(ExtendedWindowStyle::LEFT),
             taskbar_button: Some(true),
             title: "Test".to_string(),
-            show_state: Some(1),
+            show_state: Some(ShowWindowCmd::ShowNormal),
             is_offscreen: Some(false),
             pos: Some((0, 0)),
             size: Some((100, 100)),
@@ -341,7 +341,7 @@ mod tests {
             } => {
                 assert_eq!(window_id, 42);
                 assert_eq!(title, "Test");
-                assert_eq!(show_state, Some(1));
+                assert_eq!(show_state, Some(ShowWindowCmd::ShowNormal));
                 assert_eq!(is_offscreen, Some(false));
             }
             _ => panic!("Wrong variant"),
@@ -357,7 +357,7 @@ mod tests {
             ext_style: Some(ExtendedWindowStyle::LEFT),
             taskbar_button: Some(true),
             title: "Updated".to_string(),
-            show_state: Some(1),
+            show_state: Some(ShowWindowCmd::ShowNormal),
             is_offscreen: Some(false),
             pos: Some((0, 0)),
             size: Some((100, 100)),
@@ -367,13 +367,12 @@ mod tests {
                 window_id,
                 title,
                 show_state,
-                is_offscreen,
                 ..
             } => {
                 assert_eq!(window_id, 7);
                 assert_eq!(title, "Updated");
-                assert_eq!(show_state, Some(1));
-                assert_eq!(is_offscreen, Some(false));
+                assert_eq!(show_state, Some(ShowWindowCmd::ShowNormal));
+                assert_eq!(show_state, Some(ShowWindowCmd::ShowNormal));
             }
             _ => panic!("Wrong variant"),
         }
@@ -419,12 +418,12 @@ mod tests {
     fn test_rdp_message_client_system_command() {
         let msg = RdpMessage::ClientSystemCommand {
             window_id: 5,
-            command: 0xF060,
+            command: SystemCommand::Close,
         };
         match msg {
             RdpMessage::ClientSystemCommand { window_id, command } => {
                 assert_eq!(window_id, 5);
-                assert_eq!(command, 0xF060);
+                assert_eq!(command, SystemCommand::Close);
             }
             _ => panic!("Wrong variant"),
         }

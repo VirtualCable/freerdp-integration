@@ -40,7 +40,7 @@ use freerdp_sys::{
 };
 
 use super::Rdp;
-use crate::windows_types::{ExtendedWindowStyle, WindowStyle};
+use crate::windows_types::{ExtendedWindowStyle, ShowWindowCmd, WindowStyle};
 
 fn get_rail_string(rail_str: &freerdp_sys::RAIL_UNICODE_STRING) -> String {
     if rail_str.string.is_null() || rail_str.length == 0 {
@@ -64,7 +64,7 @@ struct RailWindowState {
     ext_style: Option<ExtendedWindowStyle>,
     taskbar_button: Option<bool>,
     title: String,
-    show_state: Option<u32>,
+    show_state: Option<ShowWindowCmd>,
     is_offscreen: Option<bool>,
     pos: Option<(i32, i32)>,
     size: Option<(u32, u32)>,
@@ -98,7 +98,7 @@ impl RailWindowState {
             None
         };
         let show_state = if info.fieldFlags & WINDOW_ORDER_FIELD_SHOW != 0 {
-            Some(state.showState as u32)
+            ShowWindowCmd::try_from(state.showState).ok()
         } else {
             None
         };
@@ -166,9 +166,11 @@ impl WindowCallbacks for Rdp {
                 pos: rw.pos,
                 size: rw.size,
             });
-            // If the window is being created in SW_SHOW(5) or SW_SHOWMAXIMIZED(3) state,
-            // trigger a screen sync to be safe.
-            if rw.show_state == Some(SW_SHOWMAXIMIZED) || rw.show_state == Some(SW_SHOW) {
+            // If the window is being created as Show or ShowMaximized, trigger a screen sync.
+
+            if rw.show_state == Some(ShowWindowCmd::ShowMaximized)
+                || rw.show_state == Some(ShowWindowCmd::Show)
+            {
                 let _ = tx.send(RdpMessage::UpdateRects(vec![crate::geom::Rect::new(
                     0,
                     0,
@@ -211,7 +213,7 @@ impl WindowCallbacks for Rdp {
             });
 
             if let Some(show_state) = rw.show_state
-                && [SW_SHOW, SW_SHOWNORMAL].contains(&show_state)
+                && [ShowWindowCmd::Show, ShowWindowCmd::ShowNormal].contains(&show_state)
                 && rw.is_offscreen == Some(false)
             {
                 log::info!(
