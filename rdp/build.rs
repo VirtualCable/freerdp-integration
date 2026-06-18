@@ -74,7 +74,8 @@ fn copy_windows_dlls() {
 
     // Out dir is our parent directory of "target" + "local_dlls"
     // We resolve it dynamically using OUT_DIR from Cargo
-    let out_dir = env::var("OUT_DIR").ok()
+    let out_dir = env::var("OUT_DIR")
+        .ok()
         .map(PathBuf::from)
         .and_then(|path| {
             let mut current = path.clone();
@@ -88,8 +89,10 @@ fn copy_windows_dlls() {
         })
         .unwrap_or_else(|| {
             PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
-                .parent().unwrap()
-                .parent().unwrap()
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
                 .join("local_dlls")
         });
 

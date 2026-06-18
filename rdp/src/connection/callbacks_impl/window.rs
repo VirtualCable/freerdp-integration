@@ -40,6 +40,7 @@ use freerdp_sys::{
 };
 
 use super::Rdp;
+use crate::windows_types::{ExtendedWindowStyle, WindowStyle};
 
 fn get_rail_string(rail_str: &freerdp_sys::RAIL_UNICODE_STRING) -> String {
     if rail_str.string.is_null() || rail_str.length == 0 {
@@ -59,8 +60,8 @@ fn is_offscreen_pos(x: i32, y: i32) -> bool {
 struct RailWindowState {
     window_id: u32,
     owner_id: Option<u32>,
-    style: Option<u32>,
-    ext_style: Option<u32>,
+    style: Option<WindowStyle>,
+    ext_style: Option<ExtendedWindowStyle>,
     taskbar_button: Option<bool>,
     title: String,
     show_state: Option<u32>,
@@ -84,7 +85,10 @@ impl RailWindowState {
             None
         };
         let (style, ext_style) = if info.fieldFlags & WINDOW_ORDER_FIELD_STYLE != 0 {
-            (Some(state.style), Some(state.extendedStyle))
+            (
+                Some(WindowStyle::from_bits_truncate(state.style)),
+                Some(ExtendedWindowStyle::from_bits_truncate(state.extendedStyle)),
+            )
         } else {
             (None, None)
         };

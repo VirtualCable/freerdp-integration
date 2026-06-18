@@ -48,6 +48,7 @@ pub mod settings;
 
 pub mod context;
 pub mod messaging;
+pub mod windows_types;
 
 // Re-export sys module
 pub mod sys;

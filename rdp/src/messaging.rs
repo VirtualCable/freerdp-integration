@@ -33,6 +33,7 @@ use flume;
 use zeroize::Zeroize;
 
 use crate::geom::Rect;
+use crate::windows_types::{ExtendedWindowStyle, WindowStyle};
 
 #[derive(Clone)]
 #[allow(dead_code)]
@@ -49,8 +50,8 @@ pub enum RdpMessage {
     WindowCreate {
         window_id: u32,
         owner_id: Option<u32>,
-        style: Option<u32>,
-        ext_style: Option<u32>,
+        style: Option<WindowStyle>,
+        ext_style: Option<ExtendedWindowStyle>,
         taskbar_button: Option<bool>,
         title: String,
         show_state: Option<u32>,
@@ -61,8 +62,8 @@ pub enum RdpMessage {
     WindowUpdate {
         window_id: u32,
         owner_id: Option<u32>,
-        style: Option<u32>,
-        ext_style: Option<u32>,
+        style: Option<WindowStyle>,
+        ext_style: Option<ExtendedWindowStyle>,
         taskbar_button: Option<bool>,
         title: String,
         show_state: Option<u32>,
@@ -321,8 +322,8 @@ mod tests {
         let msg = RdpMessage::WindowCreate {
             window_id: 42,
             owner_id: Some(0),
-            style: Some(0),
-            ext_style: Some(0),
+            style: Some(WindowStyle::OVERLAPPED),
+            ext_style: Some(ExtendedWindowStyle::LEFT),
             taskbar_button: Some(true),
             title: "Test".to_string(),
             show_state: Some(1),
@@ -352,8 +353,8 @@ mod tests {
         let msg = RdpMessage::WindowUpdate {
             window_id: 7,
             owner_id: Some(0),
-            style: Some(0),
-            ext_style: Some(0),
+            style: Some(WindowStyle::OVERLAPPED),
+            ext_style: Some(ExtendedWindowStyle::LEFT),
             taskbar_button: Some(true),
             title: "Updated".to_string(),
             show_state: Some(1),

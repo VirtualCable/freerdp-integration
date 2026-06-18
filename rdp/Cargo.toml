@@ -17,6 +17,9 @@ flume.workspace = true
 zeroize.workspace = true
 serde.workspace = true
 
+# Bitflags
+bitflags.workspace = true
+
 # Clipboard dependencies
 
 # Windows dependencies
