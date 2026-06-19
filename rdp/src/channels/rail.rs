@@ -4,8 +4,8 @@
 // Authors: Adolfo Gómez, dkmaster at dkmon dot com
 
 use crate::context::OwnerFromCtx;
-use crate::utils;
-use crate::utils::log;
+use crate::utils::{self, log};
+use crate::windows_types::SystemCommand;
 use freerdp_sys::*;
 
 #[derive(Clone, Debug)]
@@ -50,17 +50,17 @@ impl RailChannel {
         }
     }
 
-    pub fn send_system_command(&self, window_id: u32, command: u16) {
+    pub fn send_system_command(&self, window_id: u32, command: SystemCommand) {
         if let Some(ptr) = &self.ptr {
             let context = ptr.as_mut_ptr();
             let syscmd = RAIL_SYSCOMMAND_ORDER {
                 windowId: window_id,
-                command,
+                command: command as u16,
             };
             unsafe {
                 if let Some(client_sys_cmd) = (*context).ClientSystemCommand {
                     log::debug!(
-                        "RAIL: Sending System Command {} for window {}",
+                        "RAIL: Sending System Command {:?} for window {}",
                         command,
                         window_id
                     );

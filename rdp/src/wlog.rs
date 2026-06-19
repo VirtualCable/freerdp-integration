@@ -40,21 +40,7 @@ extern "C" fn my_message_cb(msg: *const wLogMessage) -> BOOL {
     1 // TRUE
 }
 
-// Dumps settings uwing freerdp_settings_dump
-#[allow(dead_code)]
-/// # Safety
-/// This function is unsafe because it dereferences raw pointers.
-pub unsafe fn dump_freerdp_settings(settings: *mut rdpSettings) {
-    unsafe {
-        let log = WLog_GetRoot();
-        if !settings.is_null() {
-            freerdp_settings_dump(log, WLOG_DEBUG, settings);
-        }
-    }
-}
-
 #[derive(Copy, Clone)]
-#[allow(dead_code)]
 pub enum WLogLevel {
     Fatal = WLOG_FATAL as isize,
     Error = WLOG_ERROR as isize,
@@ -64,7 +50,6 @@ pub enum WLogLevel {
     Trace = WLOG_TRACE as isize,
 }
 
-#[allow(dead_code)]
 pub fn set_wlog_level(tag: Option<&str>, level: WLogLevel) {
     unsafe {
         let log = match tag {

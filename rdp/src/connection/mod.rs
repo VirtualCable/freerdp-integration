@@ -14,7 +14,6 @@ use crate::{Rdp, context, messaging::RdpMessage};
 pub mod builder;
 pub mod callbacks_impl;
 
-#[allow(dead_code)]
 impl Rdp {
     #[cfg(debug_assertions)]
     pub fn debug_assert_instance(&self) {
@@ -897,16 +896,6 @@ impl Rdp {
                 Ok(rdpversion_str.to_string_lossy().into_owned())
             } else {
                 Err(anyhow::anyhow!("Connection not built"))
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn dump_log_settings(&self) {
-        unsafe {
-            if let Some(conn) = self.instance {
-                let settings = (*conn.context).settings;
-                super::wlog::dump_freerdp_settings(settings);
             }
         }
     }

@@ -56,7 +56,6 @@ pub struct Rdp {
     _pin: std::marker::PhantomPinned, // Do not allow moving
 }
 
-#[allow(dead_code)]
 impl Rdp {
     pub fn new(
         settings: settings::RdpSettings,

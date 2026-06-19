@@ -8,7 +8,7 @@ pub mod log;
 pub mod ptr;
 pub mod trigger;
 
-pub use graphics::{normalize_rects, pixel_format};
+pub use graphics::pixel_format;
 pub use ptr::{SafeHandle, SafePtr, ToStringLossy};
 
 use zeroize::Zeroize;

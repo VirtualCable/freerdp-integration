@@ -13,7 +13,6 @@ use crate::{callbacks::instance_c, utils::SafePtr};
 
 use super::{Rdp, context::RdpContext};
 
-#[allow(dead_code)]
 impl Rdp {
     pub fn build(self: std::pin::Pin<&mut Self>) -> Result<()> {
         log::debug!("Building RDP connection... {:p}", self);
