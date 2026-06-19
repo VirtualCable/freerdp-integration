@@ -1,6 +1,7 @@
 // BSD 3-Clause License
 // Copyright (c) 2026, Virtual Cable S.L.
 // All rights reserved.
+// Authors: Adolfo Gómez, dkmaster at dkmon dot com
 
 pub trait AudioInputIntegration: Send + Sync + std::fmt::Debug {
     /// Starts capturing audio and returns a flume Receiver where RDP will consume recorded frames.
