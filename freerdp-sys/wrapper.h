@@ -29,6 +29,11 @@
 #include <freerdp/channels/rdpsnd.h>
 #include <freerdp/channels/audin.h>
 #include <freerdp/channels/rdpecam.h>
+#include <freerdp/channels/rdpdr.h>
+#include <freerdp/channels/scard.h>
+#include <freerdp/utils/smartcard_call.h>
+#include <freerdp/utils/smartcard_operations.h>
+#include <freerdp/utils/smartcard_pack.h>
 
 #include <freerdp/gdi/gfx.h>
 #include <freerdp/codec/h264.h>

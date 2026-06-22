@@ -7,11 +7,11 @@ use std::sync::OnceLock;
 
 use freerdp_sys::{
     AUDIN_CHANNEL_NAME, BOOL, DWORD, FREERDP_LOAD_CHANNEL_ADDIN_ENTRY_FN, LPCSTR,
-    PVIRTUALCHANNELENTRY, RDPSND_CHANNEL_NAME, UINT, freerdp_get_current_addin_provider,
-    freerdp_register_addin_provider,
+    PDEVICE_SERVICE_ENTRY_POINTS, PVIRTUALCHANNELENTRY, RDPSND_CHANNEL_NAME, UINT,
+    freerdp_get_current_addin_provider, freerdp_register_addin_provider,
 };
 
-use super::{audio_input, audio_output, webcam};
+use super::{audio_input, audio_output, smartcard, webcam};
 use crate::utils::log;
 
 static FREERDP_ADDIN_PROVIDER: OnceLock<FREERDP_LOAD_CHANNEL_ADDIN_ENTRY_FN> = OnceLock::new();
@@ -68,6 +68,14 @@ unsafe extern "C" fn custom_addin_provider(
                     unsafe extern "C" fn(*mut freerdp_sys::IDRDYNVC_ENTRY_POINTS) -> UINT,
                     unsafe extern "C" fn(*mut freerdp_sys::tagCHANNEL_ENTRY_POINTS) -> BOOL,
                 >(webcam::webcam_entry))
+            } else if name == "smartcard"
+                && secure_cstr_from_lpcstr(psz_type) == "DeviceServiceEntry"
+            {
+                log::info!("smartcard DeviceServiceEntry intercepted via custom_addin_provider.");
+                Some(std::mem::transmute::<
+                    unsafe extern "C" fn(PDEVICE_SERVICE_ENTRY_POINTS) -> UINT,
+                    unsafe extern "C" fn(*mut freerdp_sys::tagCHANNEL_ENTRY_POINTS) -> BOOL,
+                >(smartcard::device_service_entry))
             } else {
                 log::debug!("Delegating to underlying addin provider");
                 freerdp_addin_provider(psz_name, psz_subsystem, psz_type, dw_flags)
