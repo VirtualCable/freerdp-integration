@@ -8,8 +8,9 @@
 //! `SmartcardIntegration` trait.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use freerdp_sys::{CHANNEL_RC_OK, DEVICE, IRP, PDEVICE_SERVICE_ENTRY_POINTS, UINT};
 
@@ -19,10 +20,13 @@ use crate::utils::log;
 
 use crate::integrations::smartcard::{
     // Constants
+    IRP_MJ_DEVICE_CONTROL,
     SCARD_E_INVALID_HANDLE,
     SCARD_E_NO_READERS_AVAILABLE,
     SCARD_E_UNSUPPORTED_FEATURE,
     SCARD_S_SUCCESS,
+    STATUS_NOT_SUPPORTED,
+    STATUS_UNSUCCESSFUL,
     ScardContext,
 };
 
@@ -64,6 +68,65 @@ const SCARD_IOCTL_STATE: u32 = 0x0009_00C4;
 const RDPDR_DTYP_SMARTCARD: u32 = 0x0020;
 
 // ---------------------------------------------------------------------------
+// Threading Structures
+// ---------------------------------------------------------------------------
+
+/// Work items sent from the IRP handler to the device thread
+enum IrpWork {
+    Process(*mut IRP),
+    Shutdown,
+}
+
+unsafe impl Send for IrpWork {}
+
+/// Tracks outstanding IRPs for cancellation and cleanup
+struct OutstandingIrpTracker {
+    irps: Mutex<HashMap<u32, OutstandingIrp>>,
+}
+
+struct OutstandingIrp {
+    #[allow(dead_code)]
+    completion_id: u32,
+    #[allow(dead_code)]
+    started_at: Instant,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl OutstandingIrpTracker {
+    fn new() -> Self {
+        OutstandingIrpTracker {
+            irps: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn register(&self, completion_id: u32) -> Arc<AtomicBool> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut map = self.irps.lock().unwrap();
+        map.insert(
+            completion_id,
+            OutstandingIrp {
+                completion_id,
+                started_at: Instant::now(),
+                cancelled: cancelled.clone(),
+            },
+        );
+        cancelled
+    }
+
+    fn complete(&self, completion_id: u32) {
+        let mut map = self.irps.lock().unwrap();
+        map.remove(&completion_id);
+    }
+
+    fn cancel_all(&self) {
+        let map = self.irps.lock().unwrap();
+        for irp in map.values() {
+            irp.cancelled.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Device Structure
 // ---------------------------------------------------------------------------
 
@@ -76,7 +139,16 @@ struct SmartcardDevice {
     integration: Arc<dyn SmartcardIntegration>,
 
     /// Registry of active contexts (ScardContext raw id → ContextEntry).
-    contexts: Mutex<HashMap<u64, ContextEntry>>,
+    contexts: Arc<Mutex<HashMap<u64, ContextEntry>>>,
+
+    /// Channel to send IRPs to the device thread
+    irp_tx: flume::Sender<IrpWork>,
+
+    /// Handle to the device thread (for join on teardown)
+    device_thread: Option<std::thread::JoinHandle<()>>,
+
+    /// Tracker for outstanding IRPs
+    outstanding: Arc<OutstandingIrpTracker>,
 }
 
 // SAFETY: SmartcardDevice is only accessed from FreeRDP callback threads
@@ -324,6 +396,169 @@ unsafe fn end_response(
 }
 
 // ---------------------------------------------------------------------------
+// Device Thread
+// ---------------------------------------------------------------------------
+
+fn device_thread_main(
+    irp_rx: flume::Receiver<IrpWork>,
+    integration: Arc<dyn SmartcardIntegration>,
+    contexts: Arc<Mutex<HashMap<u64, ContextEntry>>>,
+    outstanding: Arc<OutstandingIrpTracker>,
+) {
+    log::info!("smartcard: device thread started");
+
+    while let Ok(work) = irp_rx.recv() {
+        match work {
+            IrpWork::Shutdown => {
+                log::info!("smartcard: device thread received shutdown signal");
+                break;
+            }
+            IrpWork::Process(irp) => {
+                unsafe { process_irp(irp, &integration, &contexts, &outstanding) };
+            }
+        }
+    }
+
+    log::info!("smartcard: device thread exiting");
+}
+
+unsafe fn process_irp(
+    irp: *mut IRP,
+    integration: &Arc<dyn SmartcardIntegration>,
+    contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
+    outstanding: &Arc<OutstandingIrpTracker>,
+) {
+    let mut operation: freerdp_sys::SMARTCARD_OPERATION = unsafe { std::mem::zeroed() };
+    let decode_status = unsafe {
+        freerdp_sys::smartcard_irp_device_control_decode(
+            (*irp).input,
+            (*irp).CompletionId,
+            (*irp).FileId,
+            &mut operation,
+        )
+    };
+
+    if decode_status != SCARD_S_SUCCESS as i32 {
+        log::error!("smartcard: failed to decode IRP: 0x{:08X}", decode_status);
+        unsafe {
+            let irp_ref = &mut *irp;
+            irp_ref.IoStatus = STATUS_UNSUCCESSFUL as i32;
+            if !irp_ref.output.is_null() {
+                freerdp_sys::Stream_SetPosition(irp_ref.output, 16);
+                stream_write_u32(irp_ref.output, 0);
+                freerdp_sys::smartcard_pack_common_type_header(irp_ref.output);
+                freerdp_sys::smartcard_pack_private_type_header(irp_ref.output, 0);
+                stream_write_u32(irp_ref.output, decode_status as u32);
+                freerdp_sys::Stream_SealLength(irp_ref.output);
+            }
+            if let Some(complete_fn) = irp_ref.Complete {
+                complete_fn(irp);
+            }
+        }
+        return;
+    }
+
+    let ioctl = operation.ioControlCode;
+    let completion_id = operation.completionID;
+
+    log::debug!(
+        "smartcard: IRP ioctl=0x{:08X} ({}) completion_id={}",
+        ioctl,
+        ioctl_name(ioctl),
+        completion_id
+    );
+
+    let _cancel_token = outstanding.register(completion_id);
+
+    let mut io_status = crate::integrations::smartcard::STATUS_SUCCESS as i32;
+    let body_pos = unsafe { begin_response((*irp).output) };
+
+    let return_code = dispatch_ioctl(
+        ioctl,
+        &operation,
+        integration,
+        contexts,
+        unsafe { (*irp).output },
+    );
+
+    unsafe {
+        end_response(
+            (*irp).output,
+            body_pos,
+            return_code as i32,
+            operation.outputBufferLength,
+            &mut io_status,
+        );
+        (*irp).IoStatus = io_status;
+        if let Some(complete_fn) = (*irp).Complete {
+            complete_fn(irp);
+        } else {
+            log::error!("smartcard: IRP has no Complete callback");
+        }
+        freerdp_sys::smartcard_operation_free(&mut operation, 0);
+    }
+
+    outstanding.complete(completion_id);
+}
+
+fn dispatch_ioctl(
+    ioctl: u32,
+    operation: &freerdp_sys::SMARTCARD_OPERATION,
+    integration: &Arc<dyn SmartcardIntegration>,
+    contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
+    out: *mut freerdp_sys::wStream,
+) -> u32 {
+    match ioctl {
+        SCARD_IOCTL_ESTABLISHCONTEXT => {
+            handle_establish_context(integration, contexts, operation, out)
+        }
+        SCARD_IOCTL_RELEASECONTEXT => handle_release_context(integration, contexts, operation),
+        SCARD_IOCTL_ISVALIDCONTEXT => handle_is_valid_context(contexts, operation),
+        SCARD_IOCTL_CANCEL => handle_cancel(integration, contexts, operation),
+        SCARD_IOCTL_ACCESSSTARTEDEVENT => handle_access_started_event(operation),
+        SCARD_IOCTL_RELEASETARTEDEVENT => handle_release_started_event(operation),
+        SCARD_IOCTL_LISTREADERGROUPSA | SCARD_IOCTL_LISTREADERSA => {
+            handle_list_readers(integration, contexts, operation, out, false)
+        }
+        SCARD_IOCTL_LISTREADERGROUPSW | SCARD_IOCTL_LISTREADERSW => {
+            handle_list_readers(integration, contexts, operation, out, true)
+        }
+        SCARD_IOCTL_CONNECTA => {
+            handle_connect(integration, contexts, operation, out, false)
+        }
+        SCARD_IOCTL_CONNECTW => {
+            handle_connect(integration, contexts, operation, out, true)
+        }
+        SCARD_IOCTL_RECONNECT => handle_reconnect(integration, operation, out),
+        SCARD_IOCTL_DISCONNECT => handle_disconnect(integration, operation),
+        SCARD_IOCTL_BEGINTRANSACTION => handle_begin_transaction(integration, operation),
+        SCARD_IOCTL_ENDTRANSACTION => handle_end_transaction(integration, operation),
+        SCARD_IOCTL_TRANSMIT => handle_transmit(integration, operation, out),
+        SCARD_IOCTL_CONTROL => handle_control(integration, operation, out),
+        SCARD_IOCTL_GETATTRIB => handle_get_attrib(integration, operation, out),
+        SCARD_IOCTL_SETATTRIB => handle_set_attrib(integration, operation),
+        SCARD_IOCTL_STATE => handle_state(integration, operation, out),
+        SCARD_IOCTL_STATUSA => handle_status(integration, operation, out, false),
+        SCARD_IOCTL_STATUSW => handle_status(integration, operation, out, true),
+        SCARD_IOCTL_GETSTATUSCHANGEA => {
+            handle_get_status_change(integration, contexts, operation, out, false)
+        }
+        SCARD_IOCTL_GETSTATUSCHANGEW => {
+            handle_get_status_change(integration, contexts, operation, out, true)
+        }
+        SCARD_IOCTL_LOCATECARDSA => handle_locate_cards(operation, out, false),
+        SCARD_IOCTL_LOCATECARDSW => handle_locate_cards(operation, out, true),
+        SCARD_IOCTL_LOCATECARDSBYATRA => {
+            handle_locate_cards_by_atr(integration, contexts, operation, out, false)
+        }
+        SCARD_IOCTL_LOCATECARDSBYATRW => {
+            handle_locate_cards_by_atr(integration, contexts, operation, out, true)
+        }
+        _ => SCARD_E_UNSUPPORTED_FEATURE,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DeviceServiceEntry
 // ---------------------------------------------------------------------------
 
@@ -363,10 +598,28 @@ pub unsafe extern "C" fn device_service_entry(
         return CHANNEL_RC_OK;
     }
 
+    let (irp_tx, irp_rx) = flume::unbounded::<IrpWork>();
+    let contexts = Arc::new(Mutex::new(HashMap::<u64, ContextEntry>::new()));
+    let outstanding = Arc::new(OutstandingIrpTracker::new());
+
+    let integration_clone = integration.clone();
+    let contexts_clone = contexts.clone();
+    let outstanding_clone = outstanding.clone();
+
+    let device_thread = std::thread::Builder::new()
+        .name("smartcard-device".to_string())
+        .spawn(move || {
+            device_thread_main(irp_rx, integration_clone, contexts_clone, outstanding_clone);
+        })
+        .expect("failed to spawn smartcard device thread");
+
     let mut device_box = Box::new(SmartcardDevice {
         device: unsafe { std::mem::zeroed() },
         integration,
-        contexts: Mutex::new(HashMap::new()),
+        contexts,
+        irp_tx,
+        device_thread: Some(device_thread),
+        outstanding,
     });
 
     device_box.device.type_ = RDPDR_DTYP_SMARTCARD;
@@ -443,8 +696,8 @@ unsafe extern "C" fn init_handler(device: *mut DEVICE) -> UINT {
     }
     log::info!("smartcard: init_handler called");
     let scard = unsafe { &mut *(device as *mut SmartcardDevice) };
-    let mut contexts = scard.contexts.lock().unwrap();
-    for (_, entry) in contexts.drain() {
+    let mut ctx_map = scard.contexts.lock().unwrap();
+    for (_, entry) in ctx_map.drain() {
         let _ = scard.integration.release_context(&entry.context);
     }
     freerdp_sys::CHANNEL_RC_OK
@@ -462,6 +715,17 @@ unsafe extern "C" fn free_handler(device: *mut DEVICE) -> UINT {
     log::info!("smartcard: free_handler — tearing down device");
 
     let mut scard = unsafe { Box::from_raw(device as *mut SmartcardDevice) };
+
+    scard.outstanding.cancel_all();
+
+    let _ = scard.irp_tx.send(IrpWork::Shutdown);
+
+    if let Some(handle) = scard.device_thread.take() {
+        log::debug!("smartcard: waiting for device thread to finish");
+        if handle.join().is_err() {
+            log::error!("smartcard: device thread panicked during shutdown");
+        }
+    }
 
     {
         let mut contexts = scard.contexts.lock().unwrap();
@@ -502,112 +766,32 @@ unsafe extern "C" fn irp_request_handler(device: *mut DEVICE, irp: *mut IRP) -> 
         return CHANNEL_RC_OK;
     }
 
-    let scard = unsafe { &*(device as *const SmartcardDevice) };
-
-    let mut operation: freerdp_sys::SMARTCARD_OPERATION = unsafe { std::mem::zeroed() };
-    let decode_status = unsafe {
-        freerdp_sys::smartcard_irp_device_control_decode(
-            (*irp).input,
-            (*irp).CompletionId,
-            (*irp).FileId,
-            &mut operation,
-        )
-    };
-
-    if decode_status != crate::integrations::smartcard::SCARD_S_SUCCESS as i32 {
-        log::error!("smartcard: failed to decode IRP: 0x{:08X}", decode_status);
+    if unsafe { (*irp).MajorFunction } != IRP_MJ_DEVICE_CONTROL {
+        log::warn!(
+            "smartcard: unexpected MajorFunction 0x{:08X}, completing with STATUS_NOT_SUPPORTED",
+            unsafe { (*irp).MajorFunction }
+        );
         unsafe {
             let irp_ref = &mut *irp;
-            irp_ref.IoStatus = crate::integrations::smartcard::STATUS_SUCCESS as i32;
-            if !irp_ref.output.is_null() {
-                freerdp_sys::Stream_SetPosition(irp_ref.output, 16);
-                stream_write_u32(irp_ref.output, 0); // OutputBufferLength
-                freerdp_sys::smartcard_pack_common_type_header(irp_ref.output);
-                freerdp_sys::smartcard_pack_private_type_header(irp_ref.output, 0);
-                stream_write_u32(irp_ref.output, decode_status as u32); // Result
-                freerdp_sys::Stream_SealLength(irp_ref.output);
-            }
+            irp_ref.IoStatus = STATUS_NOT_SUPPORTED as i32;
             if let Some(complete_fn) = irp_ref.Complete {
                 complete_fn(irp);
             }
         }
-        return freerdp_sys::CHANNEL_RC_OK;
+        return CHANNEL_RC_OK;
     }
 
-    let ioctl = operation.ioControlCode;
+    let scard = unsafe { &*(device as *const SmartcardDevice) };
 
-    log::debug!(
-        "smartcard: IRP ioctl=0x{:08X} ({}) completion_id={}",
-        ioctl,
-        ioctl_name(ioctl),
-        operation.completionID
-    );
-
-    let mut io_status = crate::integrations::smartcard::STATUS_SUCCESS as i32;
-    let body_pos = unsafe { begin_response((*irp).output) };
-
-    let return_code = match ioctl {
-        SCARD_IOCTL_ESTABLISHCONTEXT => {
-            handle_establish_context(scard, &operation, unsafe { (*irp).output })
+    if let Err(e) = scard.irp_tx.send(IrpWork::Process(irp)) {
+        log::error!("smartcard: failed to enqueue IRP: {}", e);
+        unsafe {
+            let irp_ref = &mut *irp;
+            irp_ref.IoStatus = STATUS_UNSUCCESSFUL as i32;
+            if let Some(complete_fn) = irp_ref.Complete {
+                complete_fn(irp);
+            }
         }
-        SCARD_IOCTL_RELEASECONTEXT => handle_release_context(scard, &operation),
-        SCARD_IOCTL_ISVALIDCONTEXT => handle_is_valid_context(scard, &operation),
-        SCARD_IOCTL_CANCEL => handle_cancel(scard, &operation),
-        SCARD_IOCTL_ACCESSSTARTEDEVENT => handle_access_started_event(scard, &operation),
-        SCARD_IOCTL_RELEASETARTEDEVENT => handle_release_started_event(scard, &operation),
-        SCARD_IOCTL_LISTREADERGROUPSA | SCARD_IOCTL_LISTREADERSA => {
-            handle_list_readers(scard, &operation, unsafe { (*irp).output }, false)
-        }
-        SCARD_IOCTL_LISTREADERGROUPSW | SCARD_IOCTL_LISTREADERSW => {
-            handle_list_readers(scard, &operation, unsafe { (*irp).output }, true)
-        }
-        SCARD_IOCTL_CONNECTA => handle_connect(scard, &operation, unsafe { (*irp).output }, false),
-        SCARD_IOCTL_CONNECTW => handle_connect(scard, &operation, unsafe { (*irp).output }, true),
-        SCARD_IOCTL_RECONNECT => handle_reconnect(scard, &operation, unsafe { (*irp).output }),
-        SCARD_IOCTL_DISCONNECT => handle_disconnect(scard, &operation),
-        SCARD_IOCTL_BEGINTRANSACTION => handle_begin_transaction(scard, &operation),
-        SCARD_IOCTL_ENDTRANSACTION => handle_end_transaction(scard, &operation),
-        SCARD_IOCTL_TRANSMIT => handle_transmit(scard, &operation, unsafe { (*irp).output }),
-        SCARD_IOCTL_CONTROL => handle_control(scard, &operation, unsafe { (*irp).output }),
-        SCARD_IOCTL_GETATTRIB => handle_get_attrib(scard, &operation, unsafe { (*irp).output }),
-        SCARD_IOCTL_SETATTRIB => handle_set_attrib(scard, &operation),
-        SCARD_IOCTL_STATE => handle_state(scard, &operation, unsafe { (*irp).output }),
-        SCARD_IOCTL_STATUSA => handle_status(scard, &operation, unsafe { (*irp).output }, false),
-        SCARD_IOCTL_STATUSW => handle_status(scard, &operation, unsafe { (*irp).output }, true),
-        SCARD_IOCTL_GETSTATUSCHANGEA => {
-            handle_get_status_change(scard, &operation, unsafe { (*irp).output }, false)
-        }
-        SCARD_IOCTL_GETSTATUSCHANGEW => {
-            handle_get_status_change(scard, &operation, unsafe { (*irp).output }, true)
-        }
-        SCARD_IOCTL_LOCATECARDSA => {
-            handle_locate_cards(&operation, unsafe { (*irp).output }, false)
-        }
-        SCARD_IOCTL_LOCATECARDSW => handle_locate_cards(&operation, unsafe { (*irp).output }, true),
-        SCARD_IOCTL_LOCATECARDSBYATRA => {
-            handle_locate_cards_by_atr(scard, &operation, unsafe { (*irp).output }, false)
-        }
-        SCARD_IOCTL_LOCATECARDSBYATRW => {
-            handle_locate_cards_by_atr(scard, &operation, unsafe { (*irp).output }, true)
-        }
-        _ => SCARD_E_UNSUPPORTED_FEATURE,
-    };
-
-    unsafe {
-        end_response(
-            (*irp).output,
-            body_pos,
-            return_code as i32,
-            operation.outputBufferLength,
-            &mut io_status,
-        );
-        (*irp).IoStatus = io_status;
-        if let Some(complete_fn) = (*irp).Complete {
-            complete_fn(irp);
-        } else {
-            log::error!("smartcard: IRP has no Complete callback");
-        }
-        freerdp_sys::smartcard_operation_free(&mut operation, 1);
     }
 
     CHANNEL_RC_OK
@@ -618,20 +802,21 @@ unsafe extern "C" fn irp_request_handler(device: *mut DEVICE, irp: *mut IRP) -> 
 // ---------------------------------------------------------------------------
 
 fn handle_establish_context(
-    scard: &SmartcardDevice,
+    integration: &Arc<dyn SmartcardIntegration>,
+    contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
     operation: &freerdp_sys::SMARTCARD_OPERATION,
     out: *mut freerdp_sys::wStream,
 ) -> u32 {
     let scope = unsafe { operation.call.establishContext.dwScope };
     log::debug!("smartcard: ESTABLISH_CONTEXT scope={}", scope);
 
-    match scard.integration.establish_context(scope) {
+    match integration.establish_context(scope) {
         Ok(ctx) => {
             let ctx_id = ctx.raw();
             log::info!("smartcard: established context 0x{:X}", ctx_id);
 
-            let mut contexts = scard.contexts.lock().unwrap();
-            contexts.insert(ctx_id, ContextEntry { context: ctx });
+            let mut ctx_map = contexts.lock().unwrap();
+            ctx_map.insert(ctx_id, ContextEntry { context: ctx });
 
             unsafe {
                 let mut pb_context = [0u8; 8];
@@ -656,15 +841,16 @@ fn handle_establish_context(
 }
 
 fn handle_release_context(
-    scard: &SmartcardDevice,
+    integration: &Arc<dyn SmartcardIntegration>,
+    contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
     operation: &freerdp_sys::SMARTCARD_OPERATION,
 ) -> u32 {
     let ctx_id = operation.hContext as u64;
     log::debug!("smartcard: RELEASE_CONTEXT 0x{:X}", ctx_id);
 
-    let mut contexts = scard.contexts.lock().unwrap();
-    if let Some(entry) = contexts.remove(&ctx_id) {
-        match scard.integration.release_context(&entry.context) {
+    let mut ctx_map = contexts.lock().unwrap();
+    if let Some(entry) = ctx_map.remove(&ctx_id) {
+        match integration.release_context(&entry.context) {
             Ok(()) => {
                 log::info!("smartcard: released context 0x{:X}", ctx_id);
                 SCARD_S_SUCCESS
@@ -688,25 +874,29 @@ fn handle_release_context(
 }
 
 fn handle_is_valid_context(
-    scard: &SmartcardDevice,
+    contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
     operation: &freerdp_sys::SMARTCARD_OPERATION,
 ) -> u32 {
     let ctx_id = operation.hContext as u64;
-    let contexts = scard.contexts.lock().unwrap();
-    if contexts.contains_key(&ctx_id) {
+    let ctx_map = contexts.lock().unwrap();
+    if ctx_map.contains_key(&ctx_id) {
         SCARD_S_SUCCESS
     } else {
         SCARD_E_INVALID_HANDLE
     }
 }
 
-fn handle_cancel(scard: &SmartcardDevice, operation: &freerdp_sys::SMARTCARD_OPERATION) -> u32 {
+fn handle_cancel(
+    integration: &Arc<dyn SmartcardIntegration>,
+    contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
+    operation: &freerdp_sys::SMARTCARD_OPERATION,
+) -> u32 {
     let ctx_id = operation.hContext as u64;
     log::debug!("smartcard: CANCEL for context 0x{:X}", ctx_id);
 
-    let contexts = scard.contexts.lock().unwrap();
-    if let Some(entry) = contexts.get(&ctx_id) {
-        match scard.integration.cancel(&entry.context) {
+    let ctx_map = contexts.lock().unwrap();
+    if let Some(entry) = ctx_map.get(&ctx_id) {
+        match integration.cancel(&entry.context) {
             Ok(()) => SCARD_S_SUCCESS,
             Err(code) => code,
         }
@@ -715,24 +905,19 @@ fn handle_cancel(scard: &SmartcardDevice, operation: &freerdp_sys::SMARTCARD_OPE
     }
 }
 
-fn handle_access_started_event(
-    _scard: &SmartcardDevice,
-    _operation: &freerdp_sys::SMARTCARD_OPERATION,
-) -> u32 {
+fn handle_access_started_event(_operation: &freerdp_sys::SMARTCARD_OPERATION) -> u32 {
     log::debug!("smartcard: ACCESS_STARTED_EVENT — responding success");
     SCARD_S_SUCCESS
 }
 
-fn handle_release_started_event(
-    _scard: &SmartcardDevice,
-    _operation: &freerdp_sys::SMARTCARD_OPERATION,
-) -> u32 {
+fn handle_release_started_event(_operation: &freerdp_sys::SMARTCARD_OPERATION) -> u32 {
     log::debug!("smartcard: RELEASE_STARTED_EVENT — responding success");
     SCARD_S_SUCCESS
 }
 
 fn handle_list_readers(
-    scard: &SmartcardDevice,
+    integration: &Arc<dyn SmartcardIntegration>,
+    contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
     operation: &freerdp_sys::SMARTCARD_OPERATION,
     out: *mut freerdp_sys::wStream,
     unicode: bool,
@@ -742,14 +927,14 @@ fn handle_list_readers(
     log::debug!("smartcard: LIST_READERS/GROUPS for context 0x{:X}", ctx_id);
 
     let ctx = {
-        let contexts = scard.contexts.lock().unwrap();
-        match contexts.get(&ctx_id) {
+        let ctx_map = contexts.lock().unwrap();
+        match ctx_map.get(&ctx_id) {
             Some(entry) => entry.context,
             None => return SCARD_E_INVALID_HANDLE,
         }
     };
 
-    match scard.integration.list_readers(&ctx, None) {
+    match integration.list_readers(&ctx, None) {
         Ok(readers) => {
             log::debug!(
                 "smartcard: found {} reader(s): {:?}",
@@ -799,7 +984,8 @@ fn handle_list_readers(
 }
 
 fn handle_connect(
-    scard: &SmartcardDevice,
+    integration: &Arc<dyn SmartcardIntegration>,
+    contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
     operation: &freerdp_sys::SMARTCARD_OPERATION,
     out: *mut freerdp_sys::wStream,
     unicode: bool,
@@ -808,8 +994,8 @@ fn handle_connect(
     log::debug!("smartcard: CONNECT for context 0x{:X}", ctx_id);
 
     let ctx = {
-        let contexts = scard.contexts.lock().unwrap();
-        match contexts.get(&ctx_id) {
+        let ctx_map = contexts.lock().unwrap();
+        match ctx_map.get(&ctx_id) {
             Some(entry) => entry.context,
             None => return SCARD_E_INVALID_HANDLE,
         }
@@ -840,9 +1026,7 @@ fn handle_connect(
         }
     };
 
-    match scard
-        .integration
-        .connect(&ctx, &reader_name, share_mode, preferred_protocols)
+    match integration.connect(&ctx, &reader_name, share_mode, preferred_protocols)
     {
         Ok(result) => {
             log::info!(
@@ -884,7 +1068,7 @@ fn handle_connect(
 }
 
 fn handle_reconnect(
-    scard: &SmartcardDevice,
+    integration: &Arc<dyn SmartcardIntegration>,
     operation: &freerdp_sys::SMARTCARD_OPERATION,
     out: *mut freerdp_sys::wStream,
 ) -> u32 {
@@ -901,7 +1085,7 @@ fn handle_reconnect(
         initialization
     );
 
-    match scard.integration.reconnect(
+    match integration.reconnect(
         &card_handle,
         share_mode,
         preferred_protocols,
@@ -921,7 +1105,7 @@ fn handle_reconnect(
     }
 }
 
-fn handle_disconnect(scard: &SmartcardDevice, operation: &freerdp_sys::SMARTCARD_OPERATION) -> u32 {
+fn handle_disconnect(integration: &Arc<dyn SmartcardIntegration>, operation: &freerdp_sys::SMARTCARD_OPERATION) -> u32 {
     let call = unsafe { &operation.call.hCardAndDisposition };
     let card_handle = get_card_handle(&call.handles.hCard);
     let disposition = call.dwDisposition;
@@ -931,14 +1115,14 @@ fn handle_disconnect(scard: &SmartcardDevice, operation: &freerdp_sys::SMARTCARD
         disposition
     );
 
-    match scard.integration.disconnect(&card_handle, disposition) {
+    match integration.disconnect(&card_handle, disposition) {
         Ok(()) => SCARD_S_SUCCESS,
         Err(code) => code,
     }
 }
 
 fn handle_begin_transaction(
-    scard: &SmartcardDevice,
+    integration: &Arc<dyn SmartcardIntegration>,
     operation: &freerdp_sys::SMARTCARD_OPERATION,
 ) -> u32 {
     let call = unsafe { &operation.call.hCardAndDisposition };
@@ -948,14 +1132,14 @@ fn handle_begin_transaction(
         card_handle.raw()
     );
 
-    match scard.integration.begin_transaction(&card_handle) {
+    match integration.begin_transaction(&card_handle) {
         Ok(()) => SCARD_S_SUCCESS,
         Err(code) => code,
     }
 }
 
 fn handle_end_transaction(
-    scard: &SmartcardDevice,
+    integration: &Arc<dyn SmartcardIntegration>,
     operation: &freerdp_sys::SMARTCARD_OPERATION,
 ) -> u32 {
     let call = unsafe { &operation.call.hCardAndDisposition };
@@ -967,14 +1151,14 @@ fn handle_end_transaction(
         disposition
     );
 
-    match scard.integration.end_transaction(&card_handle, disposition) {
+    match integration.end_transaction(&card_handle, disposition) {
         Ok(()) => SCARD_S_SUCCESS,
         Err(code) => code,
     }
 }
 
 fn handle_state(
-    scard: &SmartcardDevice,
+    integration: &Arc<dyn SmartcardIntegration>,
     operation: &freerdp_sys::SMARTCARD_OPERATION,
     out: *mut freerdp_sys::wStream,
 ) -> u32 {
@@ -982,7 +1166,7 @@ fn handle_state(
     let card_handle = get_card_handle(&call.handles.hCard);
     log::debug!("smartcard: STATE card=0x{:X}", card_handle.raw());
 
-    match scard.integration.status(&card_handle) {
+    match integration.status(&card_handle) {
         Ok(status_info) => {
             let mut rg_atr = [0u8; 36];
             let atr_len = status_info.atr.len().min(36);
@@ -1005,7 +1189,7 @@ fn handle_state(
 }
 
 fn handle_status(
-    scard: &SmartcardDevice,
+    integration: &Arc<dyn SmartcardIntegration>,
     operation: &freerdp_sys::SMARTCARD_OPERATION,
     out: *mut freerdp_sys::wStream,
     unicode: bool,
@@ -1014,7 +1198,7 @@ fn handle_status(
     let card_handle = get_card_handle(&call.handles.hCard);
     log::debug!("smartcard: STATUS card=0x{:X}", card_handle.raw());
 
-    match scard.integration.status(&card_handle) {
+    match integration.status(&card_handle) {
         Ok(status_info) => {
             let mut msz_bytes = if unicode {
                 build_multi_string_utf16(&status_info.reader_names)
@@ -1045,7 +1229,7 @@ fn handle_status(
 }
 
 fn handle_transmit(
-    scard: &SmartcardDevice,
+    integration: &Arc<dyn SmartcardIntegration>,
     operation: &freerdp_sys::SMARTCARD_OPERATION,
     out: *mut freerdp_sys::wStream,
 ) -> u32 {
@@ -1061,9 +1245,7 @@ fn handle_transmit(
     let send_data =
         unsafe { std::slice::from_raw_parts(call.pbSendBuffer, call.cbSendLength as usize) };
 
-    match scard
-        .integration
-        .transmit(&card_handle, &send_pci, send_data)
+    match integration.transmit(&card_handle, &send_pci, send_data)
     {
         Ok(result) => {
             log::debug!(
@@ -1103,7 +1285,7 @@ fn handle_transmit(
 }
 
 fn handle_control(
-    scard: &SmartcardDevice,
+    integration: &Arc<dyn SmartcardIntegration>,
     operation: &freerdp_sys::SMARTCARD_OPERATION,
     out: *mut freerdp_sys::wStream,
 ) -> u32 {
@@ -1120,9 +1302,7 @@ fn handle_control(
     let in_data =
         unsafe { std::slice::from_raw_parts(call.pvInBuffer, call.cbInBufferSize as usize) };
 
-    match scard
-        .integration
-        .control(&card_handle, control_code, in_data)
+    match integration.control(&card_handle, control_code, in_data)
     {
         Ok(mut out_data) => {
             log::debug!(
@@ -1144,7 +1324,7 @@ fn handle_control(
 }
 
 fn handle_get_attrib(
-    scard: &SmartcardDevice,
+    integration: &Arc<dyn SmartcardIntegration>,
     operation: &freerdp_sys::SMARTCARD_OPERATION,
     out: *mut freerdp_sys::wStream,
 ) -> u32 {
@@ -1157,7 +1337,7 @@ fn handle_get_attrib(
         attr_id
     );
 
-    match scard.integration.get_attrib(&card_handle, attr_id) {
+    match integration.get_attrib(&card_handle, attr_id) {
         Ok(mut attr_data) => {
             log::debug!(
                 "smartcard: get_attrib success, response_len={}",
@@ -1177,7 +1357,7 @@ fn handle_get_attrib(
     }
 }
 
-fn handle_set_attrib(scard: &SmartcardDevice, operation: &freerdp_sys::SMARTCARD_OPERATION) -> u32 {
+fn handle_set_attrib(integration: &Arc<dyn SmartcardIntegration>, operation: &freerdp_sys::SMARTCARD_OPERATION) -> u32 {
     let call = unsafe { &operation.call.setAttrib };
     let card_handle = get_card_handle(&call.handles.hCard);
     let attr_id = call.dwAttrId;
@@ -1194,22 +1374,23 @@ fn handle_set_attrib(scard: &SmartcardDevice, operation: &freerdp_sys::SMARTCARD
         unsafe { std::slice::from_raw_parts(call.pbAttr, call.cbAttrLen as usize) }
     };
 
-    match scard.integration.set_attrib(&card_handle, attr_id, data) {
+    match integration.set_attrib(&card_handle, attr_id, data) {
         Ok(()) => SCARD_S_SUCCESS,
         Err(code) => code,
     }
 }
 
 fn handle_get_status_change(
-    scard: &SmartcardDevice,
+    integration: &Arc<dyn SmartcardIntegration>,
+    contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
     operation: &freerdp_sys::SMARTCARD_OPERATION,
     out: *mut freerdp_sys::wStream,
     unicode: bool,
 ) -> u32 {
     let ctx_id = operation.hContext as u64;
     let ctx = {
-        let contexts = scard.contexts.lock().unwrap();
-        match contexts.get(&ctx_id) {
+        let ctx_map = contexts.lock().unwrap();
+        match ctx_map.get(&ctx_id) {
             Some(entry) => entry.context,
             None => return SCARD_E_INVALID_HANDLE,
         }
@@ -1244,9 +1425,7 @@ fn handle_get_status_change(
         reader_states_in.len()
     );
 
-    match scard
-        .integration
-        .get_status_change(&ctx, timeout, &reader_states_in)
+    match integration.get_status_change(&ctx, timeout, &reader_states_in)
     {
         Ok(result_states) => {
             log::debug!(
@@ -1282,15 +1461,16 @@ fn handle_locate_cards(
 }
 
 fn handle_locate_cards_by_atr(
-    scard: &SmartcardDevice,
+    integration: &Arc<dyn SmartcardIntegration>,
+    contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
     operation: &freerdp_sys::SMARTCARD_OPERATION,
     out: *mut freerdp_sys::wStream,
     unicode: bool,
 ) -> u32 {
     let ctx_id = operation.hContext as u64;
     let ctx = {
-        let contexts = scard.contexts.lock().unwrap();
-        match contexts.get(&ctx_id) {
+        let ctx_map = contexts.lock().unwrap();
+        match ctx_map.get(&ctx_id) {
             Some(entry) => entry.context,
             None => return SCARD_E_INVALID_HANDLE,
         }
@@ -1319,9 +1499,7 @@ fn handle_locate_cards_by_atr(
         reader_states_in.len()
     );
 
-    match scard
-        .integration
-        .locate_cards_by_atr(&ctx, &atrs, &reader_states_in)
+    match integration.locate_cards_by_atr(&ctx, &atrs, &reader_states_in)
     {
         Ok(results) => {
             log::debug!(
@@ -1394,5 +1572,101 @@ fn ioctl_name(ioctl: u32) -> &'static str {
         SCARD_IOCTL_LOCATECARDSBYATRA => "LOCATE_CARDS_BY_ATR_A",
         SCARD_IOCTL_LOCATECARDSBYATRW => "LOCATE_CARDS_BY_ATR_W",
         _ => "UNKNOWN",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outstanding_tracker_register_and_complete() {
+        let tracker = OutstandingIrpTracker::new();
+
+        let token1 = tracker.register(1);
+        let token2 = tracker.register(2);
+
+        assert!(!token1.load(Ordering::SeqCst));
+        assert!(!token2.load(Ordering::SeqCst));
+
+        tracker.complete(1);
+        tracker.complete(2);
+    }
+
+    #[test]
+    fn outstanding_tracker_cancel_all() {
+        let tracker = OutstandingIrpTracker::new();
+
+        let token1 = tracker.register(10);
+        let token2 = tracker.register(20);
+        let token3 = tracker.register(30);
+
+        tracker.cancel_all();
+
+        assert!(token1.load(Ordering::SeqCst));
+        assert!(token2.load(Ordering::SeqCst));
+        assert!(token3.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn outstanding_tracker_complete_removes_entry() {
+        let tracker = OutstandingIrpTracker::new();
+
+        let _token = tracker.register(42);
+        tracker.complete(42);
+
+        let map = tracker.irps.lock().unwrap();
+        assert!(!map.contains_key(&42));
+    }
+
+    #[test]
+    fn outstanding_tracker_cancel_empty_is_noop() {
+        let tracker = OutstandingIrpTracker::new();
+        tracker.cancel_all();
+    }
+
+    #[test]
+    fn device_thread_processes_work() {
+        use crate::integrations::smartcard::dummy::DummySmartcardHandle;
+
+        let (tx, rx) = flume::unbounded::<IrpWork>();
+        let integration: Arc<dyn SmartcardIntegration> = Arc::new(DummySmartcardHandle::new());
+        let contexts = Arc::new(Mutex::new(HashMap::<u64, ContextEntry>::new()));
+        let outstanding = Arc::new(OutstandingIrpTracker::new());
+
+        let integration_clone = integration.clone();
+        let contexts_clone = contexts.clone();
+        let outstanding_clone = outstanding.clone();
+
+        let handle = std::thread::spawn(move || {
+            device_thread_main(rx, integration_clone, contexts_clone, outstanding_clone);
+        });
+
+        tx.send(IrpWork::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn device_thread_shutdown_on_empty_queue() {
+        use crate::integrations::smartcard::dummy::DummySmartcardHandle;
+
+        let (tx, rx) = flume::unbounded::<IrpWork>();
+        let integration: Arc<dyn SmartcardIntegration> = Arc::new(DummySmartcardHandle::new());
+        let contexts = Arc::new(Mutex::new(HashMap::<u64, ContextEntry>::new()));
+        let outstanding = Arc::new(OutstandingIrpTracker::new());
+
+        let integration_clone = integration.clone();
+        let contexts_clone = contexts.clone();
+        let outstanding_clone = outstanding.clone();
+
+        let handle = std::thread::spawn(move || {
+            device_thread_main(rx, integration_clone, contexts_clone, outstanding_clone);
+        });
+
+        std::thread::sleep(Duration::from_millis(10));
+        tx.send(IrpWork::Shutdown).unwrap();
+
+        let result = handle.join();
+        assert!(result.is_ok());
     }
 }

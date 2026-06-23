@@ -279,9 +279,14 @@ pub const SCARD_W_CARD_NOT_AUTHENTICATED: u32 = 0x8010_006F;
 
 // NTSTATUS values used in IRP IoStatus
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
+pub const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+pub const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
 pub const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 pub const STATUS_DEVICE_DATA_ERROR: u32 = 0xC000_009C;
 pub const STATUS_CANCELLED: u32 = 0xC000_0120;
+
+/// IRP MajorFunction for device control (IOCTL dispatch)
+pub const IRP_MJ_DEVICE_CONTROL: u32 = 0x0000_000E;
 
 /// Maximum buffer size for SCardTransmit (66560 = 64.5 KB).
 pub const SCARD_TRANSMIT_MAX: usize = 66560;
@@ -618,5 +623,392 @@ mod tests {
         assert!(is_ntstatus(0xC0000002));
         assert!(!is_ntstatus(0x8010000C)); // SCARD code
         assert!(!is_ntstatus(0x00000000)); // STATUS_SUCCESS
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DummySmartcardHandle — for integration testing
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+pub mod dummy {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+
+    #[derive(Debug)]
+    struct DummyCard {
+        reader: String,
+        atr: Vec<u8>,
+        handle: Option<ScardHandle>,
+    }
+
+    #[derive(Debug)]
+    pub struct DummySmartcardHandle {
+        cards: RwLock<Vec<DummyCard>>,
+        contexts: RwLock<HashMap<u64, ScardContext>>,
+    }
+
+    impl Default for DummySmartcardHandle {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl DummySmartcardHandle {
+        pub fn new() -> Self {
+            DummySmartcardHandle {
+                cards: RwLock::new(Vec::new()),
+                contexts: RwLock::new(HashMap::new()),
+            }
+        }
+
+        pub fn add_card(&self, reader: &str, atr: Vec<u8>) {
+            let mut cards = self.cards.write().unwrap();
+            cards.push(DummyCard {
+                reader: reader.to_string(),
+                atr,
+                handle: None,
+            });
+        }
+    }
+
+    impl SmartcardIntegration for DummySmartcardHandle {
+        fn establish_context(&self, _scope: u32) -> Result<ScardContext, u32> {
+            let ctx = ScardContext::new();
+            let mut contexts = self.contexts.write().unwrap();
+            contexts.insert(ctx.raw(), ctx);
+            Ok(ctx)
+        }
+
+        fn release_context(&self, ctx: &ScardContext) -> Result<(), u32> {
+            let mut contexts = self.contexts.write().unwrap();
+            contexts.remove(&ctx.raw()).ok_or(SCARD_E_INVALID_HANDLE)?;
+            Ok(())
+        }
+
+        fn is_valid_context(&self, ctx: &ScardContext) -> bool {
+            let contexts = self.contexts.read().unwrap();
+            contexts.contains_key(&ctx.raw())
+        }
+
+        fn list_readers(
+            &self,
+            _ctx: &ScardContext,
+            _groups: Option<&[String]>,
+        ) -> Result<Vec<String>, u32> {
+            let cards = self.cards.read().unwrap();
+            Ok(cards.iter().map(|c| c.reader.clone()).collect())
+        }
+
+        fn connect(
+            &self,
+            _ctx: &ScardContext,
+            reader: &str,
+            _share_mode: u32,
+            _preferred_protocols: u32,
+        ) -> Result<ConnectResult, u32> {
+            let mut cards = self.cards.write().unwrap();
+            for card in cards.iter_mut() {
+                if card.reader == reader {
+                    let handle = ScardHandle::new(SCARD_PROTOCOL_T0);
+                    card.handle = Some(handle);
+                    return Ok(ConnectResult {
+                        handle,
+                        active_protocol: SCARD_PROTOCOL_T0,
+                    });
+                }
+            }
+            Err(SCARD_E_UNKNOWN_READER)
+        }
+
+        fn disconnect(&self, handle: &ScardHandle, _disposition: u32) -> Result<(), u32> {
+            let mut cards = self.cards.write().unwrap();
+            for card in cards.iter_mut() {
+                if let Some(h) = &card.handle
+                    && h.raw() == handle.raw()
+                {
+                    card.handle = None;
+                    return Ok(());
+                }
+            }
+            Err(SCARD_E_INVALID_HANDLE)
+        }
+
+        fn reconnect(
+            &self,
+            handle: &ScardHandle,
+            _share_mode: u32,
+            _preferred_protocols: u32,
+            _initialization: u32,
+        ) -> Result<u32, u32> {
+            let cards = self.cards.read().unwrap();
+            for card in cards.iter() {
+                if let Some(h) = &card.handle
+                    && h.raw() == handle.raw()
+                {
+                    return Ok(SCARD_PROTOCOL_T0);
+                }
+            }
+
+            Err(SCARD_E_INVALID_HANDLE)
+        }
+
+        fn transmit(
+            &self,
+            handle: &ScardHandle,
+            _send_pci: &ScardIORequest,
+            _data: &[u8],
+        ) -> Result<TransmitResult, u32> {
+            let cards = self.cards.read().unwrap();
+            for card in cards.iter() {
+                if let Some(h) = &card.handle
+                    && h.raw() == handle.raw()
+                {
+                    return Ok(TransmitResult {
+                        recv_pci: None,
+                        recv_buffer: vec![0x90, 0x00],
+                    });
+                }
+            }
+            Err(SCARD_E_INVALID_HANDLE)
+        }
+
+        fn control(
+            &self,
+            _handle: &ScardHandle,
+            _control_code: u32,
+            _in_data: &[u8],
+        ) -> Result<Vec<u8>, u32> {
+            Ok(vec![])
+        }
+
+        fn status(&self, handle: &ScardHandle) -> Result<ScardStatus, u32> {
+            let cards = self.cards.read().unwrap();
+            for card in cards.iter() {
+                if let Some(h) = &card.handle
+                    && h.raw() == handle.raw()
+                {
+                    return Ok(ScardStatus {
+                        reader_names: vec![card.reader.clone()],
+                        state: SCARD_STATE_PRESENT,
+                        protocol: SCARD_PROTOCOL_T0,
+                        atr: card.atr.clone(),
+                    });
+                }
+            }
+            Err(SCARD_E_INVALID_HANDLE)
+        }
+
+        fn get_status_change(
+            &self,
+            _ctx: &ScardContext,
+            _timeout: Duration,
+            reader_states: &[ReaderStateIn],
+        ) -> Result<Vec<ReaderStateOut>, u32> {
+            let cards = self.cards.read().unwrap();
+            Ok(reader_states
+                .iter()
+                .map(|rs| {
+                    let present = cards.iter().any(|c| c.reader == rs.reader_name);
+                    ReaderStateOut {
+                        reader_name: rs.reader_name.clone(),
+                        event_state: if present {
+                            SCARD_STATE_PRESENT | SCARD_STATE_CHANGED
+                        } else {
+                            SCARD_STATE_EMPTY | SCARD_STATE_CHANGED
+                        },
+                        atr: cards
+                            .iter()
+                            .find(|c| c.reader == rs.reader_name)
+                            .map(|c| c.atr.clone())
+                            .unwrap_or_default(),
+                    }
+                })
+                .collect())
+        }
+
+        fn begin_transaction(&self, _handle: &ScardHandle) -> Result<(), u32> {
+            Ok(())
+        }
+
+        fn end_transaction(&self, _handle: &ScardHandle, _disposition: u32) -> Result<(), u32> {
+            Ok(())
+        }
+
+        fn get_attrib(&self, _handle: &ScardHandle, _attr_id: u32) -> Result<Vec<u8>, u32> {
+            Ok(vec![0x00])
+        }
+
+        fn set_attrib(
+            &self,
+            _handle: &ScardHandle,
+            _attr_id: u32,
+            _data: &[u8],
+        ) -> Result<(), u32> {
+            Ok(())
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn make_dummy() -> DummySmartcardHandle {
+            let dummy = DummySmartcardHandle::new();
+            dummy.add_card("Virtual Reader 0", vec![0x3B, 0x90, 0x95, 0x80, 0x1F, 0xC3]);
+            dummy
+        }
+
+        #[test]
+        fn dummy_establish_context() {
+            let dummy = make_dummy();
+            let ctx = dummy.establish_context(SCARD_SCOPE_SYSTEM).unwrap();
+            assert_ne!(ctx.raw(), 0);
+            assert!(dummy.is_valid_context(&ctx));
+        }
+
+        #[test]
+        fn dummy_release_context() {
+            let dummy = make_dummy();
+            let ctx = dummy.establish_context(SCARD_SCOPE_SYSTEM).unwrap();
+            dummy.release_context(&ctx).unwrap();
+            assert!(!dummy.is_valid_context(&ctx));
+        }
+
+        #[test]
+        fn dummy_list_readers() {
+            let dummy = make_dummy();
+            let ctx = dummy.establish_context(SCARD_SCOPE_SYSTEM).unwrap();
+            let readers = dummy.list_readers(&ctx, None).unwrap();
+            assert_eq!(readers, vec!["Virtual Reader 0"]);
+        }
+
+        #[test]
+        fn dummy_connect_and_transmit() {
+            let dummy = make_dummy();
+            let ctx = dummy.establish_context(SCARD_SCOPE_SYSTEM).unwrap();
+            let result = dummy
+                .connect(
+                    &ctx,
+                    "Virtual Reader 0",
+                    SCARD_SHARE_SHARED,
+                    SCARD_PROTOCOL_T0,
+                )
+                .unwrap();
+            assert_eq!(result.active_protocol, SCARD_PROTOCOL_T0);
+
+            let transmit_result = dummy
+                .transmit(&result.handle, &ScardIORequest::t0(), &[0x00, 0xA4])
+                .unwrap();
+            assert_eq!(transmit_result.recv_buffer, vec![0x90, 0x00]);
+        }
+
+        #[test]
+        fn dummy_disconnect() {
+            let dummy = make_dummy();
+            let ctx = dummy.establish_context(SCARD_SCOPE_SYSTEM).unwrap();
+            let result = dummy
+                .connect(
+                    &ctx,
+                    "Virtual Reader 0",
+                    SCARD_SHARE_SHARED,
+                    SCARD_PROTOCOL_T0,
+                )
+                .unwrap();
+            dummy.disconnect(&result.handle, SCARD_LEAVE_CARD).unwrap();
+        }
+
+        #[test]
+        fn dummy_status() {
+            let dummy = make_dummy();
+            let ctx = dummy.establish_context(SCARD_SCOPE_SYSTEM).unwrap();
+            let result = dummy
+                .connect(
+                    &ctx,
+                    "Virtual Reader 0",
+                    SCARD_SHARE_SHARED,
+                    SCARD_PROTOCOL_T0,
+                )
+                .unwrap();
+            let status = dummy.status(&result.handle).unwrap();
+            assert_eq!(status.reader_names, vec!["Virtual Reader 0"]);
+            assert_eq!(status.atr, vec![0x3B, 0x90, 0x95, 0x80, 0x1F, 0xC3]);
+        }
+
+        #[test]
+        fn dummy_full_cycle() {
+            let dummy = make_dummy();
+
+            let ctx = dummy.establish_context(SCARD_SCOPE_SYSTEM).unwrap();
+            assert!(dummy.is_valid_context(&ctx));
+
+            let readers = dummy.list_readers(&ctx, None).unwrap();
+            assert!(!readers.is_empty());
+
+            let connect_result = dummy
+                .connect(&ctx, &readers[0], SCARD_SHARE_SHARED, SCARD_PROTOCOL_T0)
+                .unwrap();
+
+            let status = dummy.status(&connect_result.handle).unwrap();
+            assert_eq!(status.state, SCARD_STATE_PRESENT);
+
+            let transmit_result = dummy
+                .transmit(
+                    &connect_result.handle,
+                    &ScardIORequest::t0(),
+                    &[0x00, 0xA4, 0x04, 0x00],
+                )
+                .unwrap();
+            assert_eq!(transmit_result.recv_buffer, vec![0x90, 0x00]);
+
+            dummy
+                .disconnect(&connect_result.handle, SCARD_LEAVE_CARD)
+                .unwrap();
+            dummy.release_context(&ctx).unwrap();
+            assert!(!dummy.is_valid_context(&ctx));
+        }
+
+        #[test]
+        fn dummy_unknown_reader_returns_error() {
+            let dummy = make_dummy();
+            let ctx = dummy.establish_context(SCARD_SCOPE_SYSTEM).unwrap();
+            let result = dummy.connect(&ctx, "NonExistent", SCARD_SHARE_SHARED, SCARD_PROTOCOL_T0);
+            assert_eq!(result.unwrap_err(), SCARD_E_UNKNOWN_READER);
+        }
+
+        #[test]
+        fn dummy_invalid_context_returns_error() {
+            let dummy = make_dummy();
+            let fake_ctx = ScardContext::from_raw(0xDEADBEEF);
+            let result = dummy.list_readers(&fake_ctx, None);
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn dummy_concurrent_contexts() {
+            use std::sync::Arc;
+            use std::thread;
+
+            let dummy = Arc::new(make_dummy());
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    let dummy_clone = dummy.clone();
+                    thread::spawn(move || {
+                        let ctx = dummy_clone.establish_context(SCARD_SCOPE_SYSTEM).unwrap();
+                        let _readers = dummy_clone.list_readers(&ctx, None).unwrap();
+                        dummy_clone.release_context(&ctx).unwrap();
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                h.join().unwrap();
+            }
+        }
     }
 }
