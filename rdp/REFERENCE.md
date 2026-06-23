@@ -22,6 +22,7 @@ graph TD
 ## 2. Configuration System
 
 ### `RdpSettings`
+
 Contains all target parameters, rendering instructions, and redirection configurations.
 
 ```rust
@@ -54,6 +55,7 @@ pub struct RdpOptions {
 ```
 
 ### `RdpRedirections`
+
 Redirection features grouped logically under a nested block:
 
 ```rust
@@ -62,6 +64,7 @@ pub struct RdpRedirections {
     pub audio: bool,
     pub mic: bool,
     pub printing: bool,
+    pub smartcard: bool,
     pub drives: Vec<String>,
     pub webcam: Option<WebcamSettings>,
     pub sound_latency_threshold: Option<u16>,
@@ -69,6 +72,7 @@ pub struct RdpRedirections {
 ```
 
 ### `RailSettings` & `RailBehavior`
+
 Enables RemoteApp mode and sets the rendering behavior strategy.
 
 ```rust
@@ -104,11 +108,14 @@ pub struct RdpIntegrations {
     pub audio_output: Option<Box<dyn AudioOutputIntegration>>,
     pub audio_input: Option<Box<dyn AudioInputIntegration>>,
     pub webcam: Option<Box<dyn WebcamIntegration>>,
+    pub smartcard: Option<Arc<dyn SmartcardIntegration>>,
 }
 ```
 
 ### `ClipboardIntegration`
+
 Handles bidirectional text and format synchronization.
+
 ```rust
 pub trait ClipboardIntegration: Send + Sync + std::fmt::Debug {
     fn on_format_advertised(&self, format: u32);
@@ -118,7 +125,9 @@ pub trait ClipboardIntegration: Send + Sync + std::fmt::Debug {
 ```
 
 ### `AudioOutputIntegration`
+
 Outputs audio packets received from the server.
+
 ```rust
 pub trait AudioOutputIntegration: Send + Sync + std::fmt::Debug {
     fn play_samples(&self, format: u16, channels: u16, rate: u32, data: &[u8]);
@@ -126,7 +135,9 @@ pub trait AudioOutputIntegration: Send + Sync + std::fmt::Debug {
 ```
 
 ### `AudioInputIntegration`
+
 Supplies microphone capture samples to be transmitted to the RDP server.
+
 ```rust
 pub trait AudioInputIntegration: Send + Sync + std::fmt::Debug {
     fn capture_samples(&self) -> Option<Vec<i16>>;
@@ -135,7 +146,9 @@ pub trait AudioInputIntegration: Send + Sync + std::fmt::Debug {
 ```
 
 ### `WebcamIntegration`
+
 Supplies captured webcam frames for the MS-RDPECAM channel.
+
 ```rust
 pub trait WebcamIntegration: Send + Sync + std::fmt::Debug {
     fn is_h264_available(&self) -> bool;
@@ -153,6 +166,77 @@ pub trait WebcamIntegration: Send + Sync + std::fmt::Debug {
         "UDS Camera".to_string()
     }
 }
+```
+
+### `SmartcardIntegration`
+
+Provides smartcard redirection capabilities via the [MS-RDPESC] protocol. Unlike other channels which are Dynamic Virtual Channels (DVCs), smartcard uses a **Static Virtual Channel (SVC)** registered through **RDP Device Redirection (RDPDR)** via `custom_addin_provider`. The addin layer (`addins/smartcard.rs`) receives IRPs from the RDPDR channel, decodes them via FreeRDP's `smartcard_irp_device_control_decode`, and dispatches them to the trait.
+
+The trait is backend-agnostic — implementations can back it with dummy responses, pcsc-lite, or a WebSocket bridge.
+
+```rust
+pub trait SmartcardIntegration: Send + Sync + std::fmt::Debug {
+    // === Context Management ===
+    fn establish_context(&self, scope: u32) -> Result<ScardContext, u32>;
+    fn release_context(&self, ctx: &ScardContext) -> Result<(), u32>;
+    fn is_valid_context(&self, ctx: &ScardContext) -> bool;
+
+    // === Reader Discovery ===
+    fn list_readers(&self, ctx: &ScardContext, groups: Option<&[String]>)
+        -> Result<Vec<String>, u32>;
+
+    // === Card Connection ===
+    fn connect(&self, ctx: &ScardContext, reader: &str, share_mode: u32,
+               preferred_protocols: u32) -> Result<ConnectResult, u32>;
+    fn disconnect(&self, handle: &ScardHandle, disposition: u32) -> Result<(), u32>;
+    fn reconnect(&self, handle: &ScardHandle, share_mode: u32,
+                 preferred_protocols: u32, initialization: u32) -> Result<u32, u32>;
+
+    // === Card Communication ===
+    fn transmit(&self, handle: &ScardHandle, send_pci: &ScardIORequest,
+                data: &[u8]) -> Result<TransmitResult, u32>;
+    fn control(&self, handle: &ScardHandle, control_code: u32,
+               in_data: &[u8]) -> Result<Vec<u8>, u32>;
+
+    // === Status & State ===
+    fn status(&self, handle: &ScardHandle) -> Result<ScardStatus, u32>;
+    fn get_status_change(&self, ctx: &ScardContext, timeout: Duration,
+                         reader_states: &[ReaderStateIn])
+        -> Result<Vec<ReaderStateOut>, u32>;
+
+    // === Transactions ===
+    fn begin_transaction(&self, handle: &ScardHandle) -> Result<(), u32>;
+    fn end_transaction(&self, handle: &ScardHandle, disposition: u32) -> Result<(), u32>;
+
+    // === Attributes ===
+    fn get_attrib(&self, handle: &ScardHandle, attr_id: u32) -> Result<Vec<u8>, u32>;
+    fn set_attrib(&self, handle: &ScardHandle, attr_id: u32, data: &[u8]) -> Result<(), u32>;
+
+    // === ATR Matching ===
+    fn locate_cards_by_atr(&self, ctx: &ScardContext, atrs: &[(Vec<u8>, Vec<u8>)],
+                           reader_states: &[ReaderStateIn])
+        -> Result<Vec<LocateCardResult>, u32>;
+
+    // === Cancel ===
+    fn cancel(&self, ctx: &ScardContext) -> Result<(), u32>;
+
+    // === Meta ===
+    fn is_available(&self) -> bool;
+}
+```
+
+#### Auxiliary Types
+
+```rust
+pub struct ScardContext(u64);      // Opaque SCARDCONTEXT handle
+pub struct ScardHandle { ... }     // Opaque SCARDHANDLE + active_protocol
+pub struct ScardIORequest { ... }  // Protocol ID + extra bytes
+pub struct TransmitResult { ... }  // recv_pci + recv_buffer
+pub struct ScardStatus { ... }     // reader_names, state, protocol, atr
+pub struct ReaderStateIn { ... }   // reader_name + current_state
+pub struct ReaderStateOut { ... }  // reader_name + event_state + atr
+pub struct LocateCardResult { ... }// reader_name + atr_match + event_state
+pub struct ConnectResult { ... }   // handle + active_protocol
 ```
 
 ---

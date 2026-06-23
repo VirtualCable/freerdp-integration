@@ -43,6 +43,12 @@ fn next_nonzero(counter: &AtomicU64) -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ScardContext(u64);
 
+impl Default for ScardContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ScardContext {
     /// Create a new context with a unique, non-zero ID.
     pub fn new() -> Self {
@@ -433,12 +439,7 @@ pub trait SmartcardIntegration: Send + Sync + std::fmt::Debug {
     fn get_attrib(&self, handle: &ScardHandle, attr_id: u32) -> Result<Vec<u8>, u32>;
 
     /// Set an attribute of the card or reader.
-    fn set_attrib(
-        &self,
-        handle: &ScardHandle,
-        attr_id: u32,
-        data: &[u8],
-    ) -> Result<(), u32>;
+    fn set_attrib(&self, handle: &ScardHandle, attr_id: u32, data: &[u8]) -> Result<(), u32>;
 
     // === ATR Matching ===
 
@@ -608,10 +609,7 @@ mod tests {
             classify_error(SCARD_E_NO_SMARTCARD),
             ErrorPlacement::ReturnCode
         );
-        assert_eq!(
-            classify_error(SCARD_S_SUCCESS),
-            ErrorPlacement::ReturnCode
-        );
+        assert_eq!(classify_error(SCARD_S_SUCCESS), ErrorPlacement::ReturnCode);
     }
 
     #[test]

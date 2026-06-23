@@ -11,21 +11,19 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use freerdp_sys::{
-    CHANNEL_RC_OK, DEVICE, IRP, PDEVICE_SERVICE_ENTRY_POINTS, UINT,
-};
+use freerdp_sys::{CHANNEL_RC_OK, DEVICE, IRP, PDEVICE_SERVICE_ENTRY_POINTS, UINT};
 
 use crate::context::OwnerFromCtx;
 use crate::integrations::SmartcardIntegration;
 use crate::utils::log;
 
 use crate::integrations::smartcard::{
-    ScardContext,
     // Constants
     SCARD_E_INVALID_HANDLE,
     SCARD_E_NO_READERS_AVAILABLE,
     SCARD_E_UNSUPPORTED_FEATURE,
     SCARD_S_SUCCESS,
+    ScardContext,
 };
 
 // ---------------------------------------------------------------------------
@@ -97,7 +95,7 @@ struct ContextEntry {
 unsafe fn stream_write_u32(stream: *mut freerdp_sys::wStream, val: u32) {
     unsafe {
         let s = &mut *stream;
-        let ptr = s.pointer as *mut u8;
+        let ptr = s.pointer;
         std::ptr::copy_nonoverlapping(val.to_le_bytes().as_ptr(), ptr, 4);
         s.pointer = s.pointer.add(4);
     }
@@ -139,14 +137,18 @@ fn build_multi_string_utf16(strings: &[String]) -> Vec<u8> {
     result
 }
 
-fn get_card_handle(h_card: &freerdp_sys::REDIR_SCARDHANDLE) -> crate::integrations::smartcard::ScardHandle {
+fn get_card_handle(
+    h_card: &freerdp_sys::REDIR_SCARDHANDLE,
+) -> crate::integrations::smartcard::ScardHandle {
     let mut handle_bytes = [0u8; 8];
     handle_bytes.copy_from_slice(&h_card.pbHandle[..8]);
     let handle_id = u64::from_le_bytes(handle_bytes);
     crate::integrations::smartcard::ScardHandle::from_raw(handle_id, 0)
 }
 
-fn get_io_request(pci: freerdp_sys::LPSCARD_IO_REQUEST) -> crate::integrations::smartcard::ScardIORequest {
+fn get_io_request(
+    pci: freerdp_sys::LPSCARD_IO_REQUEST,
+) -> crate::integrations::smartcard::ScardIORequest {
     if pci.is_null() {
         return crate::integrations::smartcard::ScardIORequest::t0();
     }
@@ -216,17 +218,20 @@ fn get_reader_states_in_w(
 fn pack_reader_states_out(
     states_out: &[crate::integrations::smartcard::ReaderStateOut],
 ) -> Vec<freerdp_sys::ReaderState_Return> {
-    states_out.iter().map(|rs| {
-        let mut rgb_atr = [0u8; 36];
-        let atr_len = rs.atr.len().min(36);
-        rgb_atr[..atr_len].copy_from_slice(&rs.atr[..atr_len]);
-        freerdp_sys::ReaderState_Return {
-            dwCurrentState: 0,
-            dwEventState: rs.event_state,
-            cbAtr: atr_len as u32,
-            rgbAtr: rgb_atr,
-        }
-    }).collect()
+    states_out
+        .iter()
+        .map(|rs| {
+            let mut rgb_atr = [0u8; 36];
+            let atr_len = rs.atr.len().min(36);
+            rgb_atr[..atr_len].copy_from_slice(&rs.atr[..atr_len]);
+            freerdp_sys::ReaderState_Return {
+                dwCurrentState: 0,
+                dwEventState: rs.event_state,
+                cbAtr: atr_len as u32,
+                rgbAtr: rgb_atr,
+            }
+        })
+        .collect()
 }
 
 fn get_atr_masks(
@@ -260,7 +265,7 @@ unsafe fn begin_response(out: *mut freerdp_sys::wStream) -> usize {
         stream_write_u32(out, 0); // PrivateTypeHeader pt 1
         stream_write_u32(out, 0); // PrivateTypeHeader pt 2
         stream_write_u32(out, 0); // Result
-        
+
         let s = &*out;
         (s.pointer as usize).saturating_sub(s.buffer as usize)
     }
@@ -280,19 +285,19 @@ unsafe fn end_response(
         let body_len = current_pos - body_pos;
         let padding = (8 - (body_len % 8)) % 8;
         if padding > 0 {
-            let ptr = (&mut *out).pointer as *mut u8;
+            let ptr = (&mut *out).pointer;
             std::ptr::write_bytes(ptr, 0, padding);
             (&mut *out).pointer = (&mut *out).pointer.add(padding);
         }
         freerdp_sys::Stream_SealLength(out);
-        
+
         let total_len = (*out).length;
-        
+
         let mut output_buf_len = total_len - 20;
         let mut obj_buf_len = output_buf_len - 16;
-        
+
         let mut final_result = result;
-        
+
         if output_buf_len > output_buffer_length_limit as usize {
             log::warn!(
                 "smartcard IRP: expected outputBufferLength {}, but current length {}, returning STATUS_BUFFER_TOO_SMALL",
@@ -306,14 +311,14 @@ unsafe fn end_response(
         } else {
             *p_io_status = crate::integrations::smartcard::STATUS_SUCCESS as i32;
         }
-        
+
         freerdp_sys::Stream_SetPosition(out, 16);
-        
+
         stream_write_u32(out, output_buf_len as u32);
         freerdp_sys::smartcard_pack_common_type_header(out);
         freerdp_sys::smartcard_pack_private_type_header(out, obj_buf_len as u32);
         stream_write_u32(out, final_result as u32);
-        
+
         freerdp_sys::Stream_SetPosition(out, total_len);
     }
 }
@@ -379,13 +384,15 @@ pub unsafe extern "C" fn device_service_entry(
     let data_stream = unsafe { freerdp_sys::Stream_New(std::ptr::null_mut(), name_len + 1) };
     if data_stream.is_null() {
         log::error!("smartcard: Stream_New failed for device.data");
-        unsafe { freerdp_sys::free(name_ptr as *mut std::ffi::c_void); }
+        unsafe {
+            freerdp_sys::free(name_ptr as *mut std::ffi::c_void);
+        }
         return freerdp_sys::CHANNEL_RC_NO_MEMORY;
     }
 
     unsafe {
         let bytes = name_c.as_bytes_with_nul();
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), (*data_stream).pointer as *mut u8, bytes.len());
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), (*data_stream).pointer, bytes.len());
         (*data_stream).pointer = (*data_stream).pointer.add(bytes.len());
         device_box.device.data = data_stream;
     }
@@ -459,7 +466,10 @@ unsafe extern "C" fn free_handler(device: *mut DEVICE) -> UINT {
     {
         let mut contexts = scard.contexts.lock().unwrap();
         for (ctx_id, entry) in contexts.drain() {
-            log::debug!("smartcard: releasing context 0x{:X} during teardown", ctx_id);
+            log::debug!(
+                "smartcard: releasing context 0x{:X} during teardown",
+                ctx_id
+            );
             let _ = scard.integration.release_context(&entry.context);
         }
     }
@@ -537,7 +547,9 @@ unsafe extern "C" fn irp_request_handler(device: *mut DEVICE, irp: *mut IRP) -> 
     let body_pos = unsafe { begin_response((*irp).output) };
 
     let return_code = match ioctl {
-        SCARD_IOCTL_ESTABLISHCONTEXT => handle_establish_context(scard, &operation, unsafe { (*irp).output }),
+        SCARD_IOCTL_ESTABLISHCONTEXT => {
+            handle_establish_context(scard, &operation, unsafe { (*irp).output })
+        }
         SCARD_IOCTL_RELEASECONTEXT => handle_release_context(scard, &operation),
         SCARD_IOCTL_ISVALIDCONTEXT => handle_is_valid_context(scard, &operation),
         SCARD_IOCTL_CANCEL => handle_cancel(scard, &operation),
@@ -562,12 +574,22 @@ unsafe extern "C" fn irp_request_handler(device: *mut DEVICE, irp: *mut IRP) -> 
         SCARD_IOCTL_STATE => handle_state(scard, &operation, unsafe { (*irp).output }),
         SCARD_IOCTL_STATUSA => handle_status(scard, &operation, unsafe { (*irp).output }, false),
         SCARD_IOCTL_STATUSW => handle_status(scard, &operation, unsafe { (*irp).output }, true),
-        SCARD_IOCTL_GETSTATUSCHANGEA => handle_get_status_change(scard, &operation, unsafe { (*irp).output }, false),
-        SCARD_IOCTL_GETSTATUSCHANGEW => handle_get_status_change(scard, &operation, unsafe { (*irp).output }, true),
-        SCARD_IOCTL_LOCATECARDSA => handle_locate_cards(&operation, unsafe { (*irp).output }, false),
+        SCARD_IOCTL_GETSTATUSCHANGEA => {
+            handle_get_status_change(scard, &operation, unsafe { (*irp).output }, false)
+        }
+        SCARD_IOCTL_GETSTATUSCHANGEW => {
+            handle_get_status_change(scard, &operation, unsafe { (*irp).output }, true)
+        }
+        SCARD_IOCTL_LOCATECARDSA => {
+            handle_locate_cards(&operation, unsafe { (*irp).output }, false)
+        }
         SCARD_IOCTL_LOCATECARDSW => handle_locate_cards(&operation, unsafe { (*irp).output }, true),
-        SCARD_IOCTL_LOCATECARDSBYATRA => handle_locate_cards_by_atr(scard, &operation, unsafe { (*irp).output }, false),
-        SCARD_IOCTL_LOCATECARDSBYATRW => handle_locate_cards_by_atr(scard, &operation, unsafe { (*irp).output }, true),
+        SCARD_IOCTL_LOCATECARDSBYATRA => {
+            handle_locate_cards_by_atr(scard, &operation, unsafe { (*irp).output }, false)
+        }
+        SCARD_IOCTL_LOCATECARDSBYATRW => {
+            handle_locate_cards_by_atr(scard, &operation, unsafe { (*irp).output }, true)
+        }
         _ => SCARD_E_UNSUPPORTED_FEATURE,
     };
 
@@ -633,7 +655,10 @@ fn handle_establish_context(
     }
 }
 
-fn handle_release_context(scard: &SmartcardDevice, operation: &freerdp_sys::SMARTCARD_OPERATION) -> u32 {
+fn handle_release_context(
+    scard: &SmartcardDevice,
+    operation: &freerdp_sys::SMARTCARD_OPERATION,
+) -> u32 {
     let ctx_id = operation.hContext as u64;
     log::debug!("smartcard: RELEASE_CONTEXT 0x{:X}", ctx_id);
 
@@ -645,17 +670,27 @@ fn handle_release_context(scard: &SmartcardDevice, operation: &freerdp_sys::SMAR
                 SCARD_S_SUCCESS
             }
             Err(code) => {
-                log::error!("smartcard: release_context failed for 0x{:X}: 0x{:08X}", ctx_id, code);
+                log::error!(
+                    "smartcard: release_context failed for 0x{:X}: 0x{:08X}",
+                    ctx_id,
+                    code
+                );
                 code
             }
         }
     } else {
-        log::warn!("smartcard: RELEASE_CONTEXT for unknown context 0x{:X}", ctx_id);
+        log::warn!(
+            "smartcard: RELEASE_CONTEXT for unknown context 0x{:X}",
+            ctx_id
+        );
         SCARD_E_INVALID_HANDLE
     }
 }
 
-fn handle_is_valid_context(scard: &SmartcardDevice, operation: &freerdp_sys::SMARTCARD_OPERATION) -> u32 {
+fn handle_is_valid_context(
+    scard: &SmartcardDevice,
+    operation: &freerdp_sys::SMARTCARD_OPERATION,
+) -> u32 {
     let ctx_id = operation.hContext as u64;
     let contexts = scard.contexts.lock().unwrap();
     if contexts.contains_key(&ctx_id) {
@@ -680,12 +715,18 @@ fn handle_cancel(scard: &SmartcardDevice, operation: &freerdp_sys::SMARTCARD_OPE
     }
 }
 
-fn handle_access_started_event(_scard: &SmartcardDevice, _operation: &freerdp_sys::SMARTCARD_OPERATION) -> u32 {
+fn handle_access_started_event(
+    _scard: &SmartcardDevice,
+    _operation: &freerdp_sys::SMARTCARD_OPERATION,
+) -> u32 {
     log::debug!("smartcard: ACCESS_STARTED_EVENT — responding success");
     SCARD_S_SUCCESS
 }
 
-fn handle_release_started_event(_scard: &SmartcardDevice, _operation: &freerdp_sys::SMARTCARD_OPERATION) -> u32 {
+fn handle_release_started_event(
+    _scard: &SmartcardDevice,
+    _operation: &freerdp_sys::SMARTCARD_OPERATION,
+) -> u32 {
     log::debug!("smartcard: RELEASE_STARTED_EVENT — responding success");
     SCARD_S_SUCCESS
 }
@@ -710,7 +751,11 @@ fn handle_list_readers(
 
     match scard.integration.list_readers(&ctx, None) {
         Ok(readers) => {
-            log::debug!("smartcard: found {} reader(s): {:?}", readers.len(), readers);
+            log::debug!(
+                "smartcard: found {} reader(s): {:?}",
+                readers.len(),
+                readers
+            );
             if readers.is_empty() {
                 return SCARD_E_NO_READERS_AVAILABLE;
             }
@@ -728,7 +773,8 @@ fn handle_list_readers(
             };
 
             unsafe {
-                if ioctl == SCARD_IOCTL_LISTREADERGROUPSA || ioctl == SCARD_IOCTL_LISTREADERGROUPSW {
+                if ioctl == SCARD_IOCTL_LISTREADERGROUPSA || ioctl == SCARD_IOCTL_LISTREADERGROUPSW
+                {
                     freerdp_sys::smartcard_pack_list_reader_groups_return(
                         out,
                         &ret,
@@ -786,16 +832,18 @@ fn handle_connect(
                     .to_string_lossy()
                     .into_owned()
             };
-            (name, call.Common.dwShareMode, call.Common.dwPreferredProtocols)
+            (
+                name,
+                call.Common.dwShareMode,
+                call.Common.dwPreferredProtocols,
+            )
         }
     };
 
-    match scard.integration.connect(
-        &ctx,
-        &reader_name,
-        share_mode,
-        preferred_protocols,
-    ) {
+    match scard
+        .integration
+        .connect(&ctx, &reader_name, share_mode, preferred_protocols)
+    {
         Ok(result) => {
             log::info!(
                 "smartcard: connected to '{}', handle=0x{:X}, protocol=0x{:X}",
@@ -853,7 +901,12 @@ fn handle_reconnect(
         initialization
     );
 
-    match scard.integration.reconnect(&card_handle, share_mode, preferred_protocols, initialization) {
+    match scard.integration.reconnect(
+        &card_handle,
+        share_mode,
+        preferred_protocols,
+        initialization,
+    ) {
         Ok(active_protocol) => {
             unsafe {
                 let ret = freerdp_sys::Reconnect_Return {
@@ -868,14 +921,15 @@ fn handle_reconnect(
     }
 }
 
-fn handle_disconnect(
-    scard: &SmartcardDevice,
-    operation: &freerdp_sys::SMARTCARD_OPERATION,
-) -> u32 {
+fn handle_disconnect(scard: &SmartcardDevice, operation: &freerdp_sys::SMARTCARD_OPERATION) -> u32 {
     let call = unsafe { &operation.call.hCardAndDisposition };
     let card_handle = get_card_handle(&call.handles.hCard);
     let disposition = call.dwDisposition;
-    log::debug!("smartcard: DISCONNECT card=0x{:X} disposition={}", card_handle.raw(), disposition);
+    log::debug!(
+        "smartcard: DISCONNECT card=0x{:X} disposition={}",
+        card_handle.raw(),
+        disposition
+    );
 
     match scard.integration.disconnect(&card_handle, disposition) {
         Ok(()) => SCARD_S_SUCCESS,
@@ -889,7 +943,10 @@ fn handle_begin_transaction(
 ) -> u32 {
     let call = unsafe { &operation.call.hCardAndDisposition };
     let card_handle = get_card_handle(&call.handles.hCard);
-    log::debug!("smartcard: BEGIN_TRANSACTION card=0x{:X}", card_handle.raw());
+    log::debug!(
+        "smartcard: BEGIN_TRANSACTION card=0x{:X}",
+        card_handle.raw()
+    );
 
     match scard.integration.begin_transaction(&card_handle) {
         Ok(()) => SCARD_S_SUCCESS,
@@ -904,7 +961,11 @@ fn handle_end_transaction(
     let call = unsafe { &operation.call.hCardAndDisposition };
     let card_handle = get_card_handle(&call.handles.hCard);
     let disposition = call.dwDisposition;
-    log::debug!("smartcard: END_TRANSACTION card=0x{:X} disposition={}", card_handle.raw(), disposition);
+    log::debug!(
+        "smartcard: END_TRANSACTION card=0x{:X} disposition={}",
+        card_handle.raw(),
+        disposition
+    );
 
     match scard.integration.end_transaction(&card_handle, disposition) {
         Ok(()) => SCARD_S_SUCCESS,
@@ -990,14 +1051,25 @@ fn handle_transmit(
 ) -> u32 {
     let call = unsafe { &operation.call.transmit };
     let card_handle = get_card_handle(&call.handles.hCard);
-    log::debug!("smartcard: TRANSMIT card=0x{:X} send_len={}", card_handle.raw(), call.cbSendLength);
+    log::debug!(
+        "smartcard: TRANSMIT card=0x{:X} send_len={}",
+        card_handle.raw(),
+        call.cbSendLength
+    );
 
     let send_pci = get_io_request(call.pioSendPci);
-    let send_data = unsafe { std::slice::from_raw_parts(call.pbSendBuffer, call.cbSendLength as usize) };
+    let send_data =
+        unsafe { std::slice::from_raw_parts(call.pbSendBuffer, call.cbSendLength as usize) };
 
-    match scard.integration.transmit(&card_handle, &send_pci, send_data) {
+    match scard
+        .integration
+        .transmit(&card_handle, &send_pci, send_data)
+    {
         Ok(result) => {
-            log::debug!("smartcard: transmit success, recv_len={}", result.recv_buffer.len());
+            log::debug!(
+                "smartcard: transmit success, recv_len={}",
+                result.recv_buffer.len()
+            );
 
             let pio_recv_pci = if let Some(ref recv_pci) = result.recv_pci {
                 let mut pci_buf = Vec::new();
@@ -1013,7 +1085,10 @@ fn handle_transmit(
             let mut recv_buf = result.recv_buffer;
             let ret = freerdp_sys::Transmit_Return {
                 ReturnCode: crate::integrations::smartcard::SCARD_S_SUCCESS as i32,
-                pioRecvPci: pio_recv_pci.as_ref().map(|b| b.as_ptr() as freerdp_sys::LPSCARD_IO_REQUEST).unwrap_or(std::ptr::null_mut()),
+                pioRecvPci: pio_recv_pci
+                    .as_ref()
+                    .map(|b| b.as_ptr() as freerdp_sys::LPSCARD_IO_REQUEST)
+                    .unwrap_or(std::ptr::null_mut()),
                 cbRecvLength: recv_buf.len() as u32,
                 pbRecvBuffer: recv_buf.as_mut_ptr(),
             };
@@ -1035,13 +1110,25 @@ fn handle_control(
     let call = unsafe { &operation.call.control };
     let card_handle = get_card_handle(&call.handles.hCard);
     let control_code = call.dwControlCode;
-    log::debug!("smartcard: CONTROL card=0x{:X} code=0x{:X} len={}", card_handle.raw(), control_code, call.cbInBufferSize);
+    log::debug!(
+        "smartcard: CONTROL card=0x{:X} code=0x{:X} len={}",
+        card_handle.raw(),
+        control_code,
+        call.cbInBufferSize
+    );
 
-    let in_data = unsafe { std::slice::from_raw_parts(call.pvInBuffer, call.cbInBufferSize as usize) };
+    let in_data =
+        unsafe { std::slice::from_raw_parts(call.pvInBuffer, call.cbInBufferSize as usize) };
 
-    match scard.integration.control(&card_handle, control_code, in_data) {
+    match scard
+        .integration
+        .control(&card_handle, control_code, in_data)
+    {
         Ok(mut out_data) => {
-            log::debug!("smartcard: control success, response_len={}", out_data.len());
+            log::debug!(
+                "smartcard: control success, response_len={}",
+                out_data.len()
+            );
             unsafe {
                 let ret = freerdp_sys::Control_Return {
                     ReturnCode: crate::integrations::smartcard::SCARD_S_SUCCESS as i32,
@@ -1064,11 +1151,18 @@ fn handle_get_attrib(
     let call = unsafe { &operation.call.getAttrib };
     let card_handle = get_card_handle(&call.handles.hCard);
     let attr_id = call.dwAttrId;
-    log::debug!("smartcard: GET_ATTRIB card=0x{:X} attr_id=0x{:X}", card_handle.raw(), attr_id);
+    log::debug!(
+        "smartcard: GET_ATTRIB card=0x{:X} attr_id=0x{:X}",
+        card_handle.raw(),
+        attr_id
+    );
 
     match scard.integration.get_attrib(&card_handle, attr_id) {
         Ok(mut attr_data) => {
-            log::debug!("smartcard: get_attrib success, response_len={}", attr_data.len());
+            log::debug!(
+                "smartcard: get_attrib success, response_len={}",
+                attr_data.len()
+            );
             unsafe {
                 let ret = freerdp_sys::GetAttrib_Return {
                     ReturnCode: crate::integrations::smartcard::SCARD_S_SUCCESS as i32,
@@ -1083,16 +1177,22 @@ fn handle_get_attrib(
     }
 }
 
-fn handle_set_attrib(
-    scard: &SmartcardDevice,
-    operation: &freerdp_sys::SMARTCARD_OPERATION,
-) -> u32 {
+fn handle_set_attrib(scard: &SmartcardDevice, operation: &freerdp_sys::SMARTCARD_OPERATION) -> u32 {
     let call = unsafe { &operation.call.setAttrib };
     let card_handle = get_card_handle(&call.handles.hCard);
     let attr_id = call.dwAttrId;
-    log::debug!("smartcard: SET_ATTRIB card=0x{:X} attr_id=0x{:X} len={}", card_handle.raw(), attr_id, call.cbAttrLen);
+    log::debug!(
+        "smartcard: SET_ATTRIB card=0x{:X} attr_id=0x{:X} len={}",
+        card_handle.raw(),
+        attr_id,
+        call.cbAttrLen
+    );
 
-    let data = unsafe { std::slice::from_raw_parts(call.pbAttr, call.cbAttrLen as usize) };
+    let data: &[u8] = if call.pbAttr.is_null() || call.cbAttrLen == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(call.pbAttr, call.cbAttrLen as usize) }
+    };
 
     match scard.integration.set_attrib(&card_handle, attr_id, data) {
         Ok(()) => SCARD_S_SUCCESS,
@@ -1118,10 +1218,16 @@ fn handle_get_status_change(
     let (timeout_ms, reader_states_in) = unsafe {
         if unicode {
             let call = &operation.call.getStatusChangeW;
-            (call.dwTimeOut, get_reader_states_in_w(call.rgReaderStates, call.cReaders))
+            (
+                call.dwTimeOut,
+                get_reader_states_in_w(call.rgReaderStates, call.cReaders),
+            )
         } else {
             let call = &operation.call.getStatusChangeA;
-            (call.dwTimeOut, get_reader_states_in_a(call.rgReaderStates, call.cReaders))
+            (
+                call.dwTimeOut,
+                get_reader_states_in_a(call.rgReaderStates, call.cReaders),
+            )
         }
     };
 
@@ -1131,11 +1237,22 @@ fn handle_get_status_change(
         Duration::from_millis(timeout_ms as u64)
     };
 
-    log::debug!("smartcard: GET_STATUS_CHANGE context=0x{:X} timeout_ms={} count={}", ctx_id, timeout_ms, reader_states_in.len());
+    log::debug!(
+        "smartcard: GET_STATUS_CHANGE context=0x{:X} timeout_ms={} count={}",
+        ctx_id,
+        timeout_ms,
+        reader_states_in.len()
+    );
 
-    match scard.integration.get_status_change(&ctx, timeout, &reader_states_in) {
+    match scard
+        .integration
+        .get_status_change(&ctx, timeout, &reader_states_in)
+    {
         Ok(result_states) => {
-            log::debug!("smartcard: get_status_change success, count={}", result_states.len());
+            log::debug!(
+                "smartcard: get_status_change success, count={}",
+                result_states.len()
+            );
             let mut returned_states = pack_reader_states_out(&result_states);
             let ret = freerdp_sys::LocateCards_Return {
                 ReturnCode: crate::integrations::smartcard::SCARD_S_SUCCESS as i32,
@@ -1143,7 +1260,11 @@ fn handle_get_status_change(
                 rgReaderStates: returned_states.as_mut_ptr(),
             };
             unsafe {
-                freerdp_sys::smartcard_pack_get_status_change_return(out, &ret, if unicode { 1 } else { 0 });
+                freerdp_sys::smartcard_pack_get_status_change_return(
+                    out,
+                    &ret,
+                    if unicode { 1 } else { 0 },
+                );
             }
             SCARD_S_SUCCESS
         }
@@ -1152,62 +1273,12 @@ fn handle_get_status_change(
 }
 
 fn handle_locate_cards(
-    operation: &freerdp_sys::SMARTCARD_OPERATION,
-    out: *mut freerdp_sys::wStream,
-    unicode: bool,
+    _operation: &freerdp_sys::SMARTCARD_OPERATION,
+    _out: *mut freerdp_sys::wStream,
+    _unicode: bool,
 ) -> u32 {
-    let (c_readers, rg_reader_states) = unsafe {
-        if unicode {
-            let call = &operation.call.locateCardsW;
-            (call.cReaders, call.rgReaderStates as *mut std::ffi::c_void)
-        } else {
-            let call = &operation.call.locateCardsA;
-            (call.cReaders, call.rgReaderStates as *mut std::ffi::c_void)
-        }
-    };
-
-    log::debug!("smartcard: LOCATE_CARDS count={}", c_readers);
-
-    let mut returned_states = Vec::new();
-    if c_readers > 0 && !rg_reader_states.is_null() {
-        for i in 0..(c_readers as usize) {
-            unsafe {
-                if unicode {
-                    let state = &*(rg_reader_states as *mut freerdp_sys::SCARD_READERSTATEW).add(i);
-                    let mut rgb_atr = [0u8; 36];
-                    rgb_atr[..36].copy_from_slice(&state.rgbAtr[..36]);
-                    returned_states.push(freerdp_sys::ReaderState_Return {
-                        dwCurrentState: state.dwCurrentState,
-                        dwEventState: state.dwEventState,
-                        cbAtr: state.cbAtr,
-                        rgbAtr: rgb_atr,
-                    });
-                } else {
-                    let state = &*(rg_reader_states as *mut freerdp_sys::SCARD_READERSTATEA).add(i);
-                    let mut rgb_atr = [0u8; 36];
-                    rgb_atr[..36].copy_from_slice(&state.rgbAtr[..36]);
-                    returned_states.push(freerdp_sys::ReaderState_Return {
-                        dwCurrentState: state.dwCurrentState,
-                        dwEventState: state.dwEventState,
-                        cbAtr: state.cbAtr,
-                        rgbAtr: rgb_atr,
-                    });
-                }
-            }
-        }
-    }
-
-    let ret = freerdp_sys::LocateCards_Return {
-        ReturnCode: crate::integrations::smartcard::SCARD_S_SUCCESS as i32,
-        cReaders: returned_states.len() as u32,
-        rgReaderStates: returned_states.as_mut_ptr(),
-    };
-
-    unsafe {
-        freerdp_sys::smartcard_pack_locate_cards_return(out, &ret);
-    }
-
-    SCARD_S_SUCCESS
+    log::debug!("smartcard: LOCATE_CARDS not supported");
+    crate::integrations::smartcard::SCARD_E_UNSUPPORTED_FEATURE
 }
 
 fn handle_locate_cards_by_atr(
@@ -1248,25 +1319,32 @@ fn handle_locate_cards_by_atr(
         reader_states_in.len()
     );
 
-    match scard.integration.locate_cards_by_atr(&ctx, &atrs, &reader_states_in) {
+    match scard
+        .integration
+        .locate_cards_by_atr(&ctx, &atrs, &reader_states_in)
+    {
         Ok(results) => {
-            log::debug!("smartcard: locate_cards_by_atr success, count={}", results.len());
+            log::debug!(
+                "smartcard: locate_cards_by_atr success, count={}",
+                results.len()
+            );
             let mut returned_states = results
                 .iter()
                 .map(|r| {
-                    let rgb_atr = [0u8; 36];
-                    let atr_len = 0;
-                    
+                    let rs_in = reader_states_in
+                        .iter()
+                        .find(|rs| rs.reader_name == r.reader_name);
+
                     let mut dw_event_state = r.event_state;
                     if r.atr_match {
                         dw_event_state |= crate::integrations::smartcard::SCARD_STATE_ATRMATCH;
                     }
 
                     freerdp_sys::ReaderState_Return {
-                        dwCurrentState: 0,
+                        dwCurrentState: rs_in.map(|rs| rs.current_state).unwrap_or(0),
                         dwEventState: dw_event_state,
-                        cbAtr: atr_len,
-                        rgbAtr: rgb_atr,
+                        cbAtr: 0,
+                        rgbAtr: [0u8; 36],
                     }
                 })
                 .collect::<Vec<_>>();
