@@ -1,0 +1,77 @@
+// BSD 3-Clause License
+// Copyright (c) 2026, Virtual Cable S.L.
+// All rights reserved.
+// Authors: Adolfo Gómez, dkmaster at dkmon dot com
+
+//! IOCTL constants for the smartcard channel (MS-RDPESC).
+
+// ---------------------------------------------------------------------------
+// IOCTL Constants (MS-RDPESC)
+// ---------------------------------------------------------------------------
+
+pub(crate) const SCARD_IOCTL_ESTABLISHCONTEXT: u32 = 0x0009_0014;
+pub(crate) const SCARD_IOCTL_RELEASECONTEXT: u32 = 0x0009_0018;
+pub(crate) const SCARD_IOCTL_ISVALIDCONTEXT: u32 = 0x0009_001C;
+pub(crate) const SCARD_IOCTL_LISTREADERGROUPSA: u32 = 0x0009_0020;
+pub(crate) const SCARD_IOCTL_LISTREADERGROUPSW: u32 = 0x0009_0024;
+pub(crate) const SCARD_IOCTL_LISTREADERSA: u32 = 0x0009_0028;
+pub(crate) const SCARD_IOCTL_LISTREADERSW: u32 = 0x0009_002C;
+pub(crate) const SCARD_IOCTL_GETSTATUSCHANGEA: u32 = 0x0009_00A0;
+pub(crate) const SCARD_IOCTL_GETSTATUSCHANGEW: u32 = 0x0009_00A4;
+pub(crate) const SCARD_IOCTL_CANCEL: u32 = 0x0009_00A8;
+pub(crate) const SCARD_IOCTL_CONNECTA: u32 = 0x0009_00AC;
+pub(crate) const SCARD_IOCTL_CONNECTW: u32 = 0x0009_00B0;
+pub(crate) const SCARD_IOCTL_RECONNECT: u32 = 0x0009_00B4;
+pub(crate) const SCARD_IOCTL_DISCONNECT: u32 = 0x0009_00B8;
+pub(crate) const SCARD_IOCTL_BEGINTRANSACTION: u32 = 0x0009_00BC;
+pub(crate) const SCARD_IOCTL_ENDTRANSACTION: u32 = 0x0009_00C0;
+pub(crate) const SCARD_IOCTL_STATUSA: u32 = 0x0009_00C8;
+pub(crate) const SCARD_IOCTL_STATUSW: u32 = 0x0009_00CC;
+pub(crate) const SCARD_IOCTL_TRANSMIT: u32 = 0x0009_00D0;
+pub(crate) const SCARD_IOCTL_CONTROL: u32 = 0x0009_00D4;
+pub(crate) const SCARD_IOCTL_GETATTRIB: u32 = 0x0009_00D8;
+pub(crate) const SCARD_IOCTL_SETATTRIB: u32 = 0x0009_00DC;
+pub(crate) const SCARD_IOCTL_ACCESSSTARTEDEVENT: u32 = 0x0009_00E0;
+pub(crate) const SCARD_IOCTL_RELEASETARTEDEVENT: u32 = 0x0009_00E4;
+pub(crate) const SCARD_IOCTL_LOCATECARDSBYATRA: u32 = 0x0009_00E8;
+pub(crate) const SCARD_IOCTL_LOCATECARDSBYATRW: u32 = 0x0009_00EC;
+pub(crate) const SCARD_IOCTL_LOCATECARDSA: u32 = 0x0009_0098;
+pub(crate) const SCARD_IOCTL_LOCATECARDSW: u32 = 0x0009_009C;
+pub(crate) const SCARD_IOCTL_STATE: u32 = 0x0009_00C4;
+
+/// RDPDR device type for smartcard.
+pub(crate) const RDPDR_DTYP_SMARTCARD: u32 = 0x0020;
+
+/// Return a human-readable name for an IOCTL code.
+pub(crate) fn ioctl_name(ioctl: u32) -> &'static str {
+    match ioctl {
+        SCARD_IOCTL_ESTABLISHCONTEXT => "ESTABLISH_CONTEXT",
+        SCARD_IOCTL_RELEASECONTEXT => "RELEASE_CONTEXT",
+        SCARD_IOCTL_ISVALIDCONTEXT => "IS_VALID_CONTEXT",
+        SCARD_IOCTL_CANCEL => "CANCEL",
+        SCARD_IOCTL_ACCESSSTARTEDEVENT => "ACCESS_STARTED_EVENT",
+        SCARD_IOCTL_RELEASETARTEDEVENT => "RELEASE_STARTED_EVENT",
+        SCARD_IOCTL_LISTREADERGROUPSA | SCARD_IOCTL_LISTREADERSA => "LIST_READERS_A",
+        SCARD_IOCTL_LISTREADERGROUPSW | SCARD_IOCTL_LISTREADERSW => "LIST_READERS_W",
+        SCARD_IOCTL_CONNECTA => "CONNECT_A",
+        SCARD_IOCTL_CONNECTW => "CONNECT_W",
+        SCARD_IOCTL_RECONNECT => "RECONNECT",
+        SCARD_IOCTL_DISCONNECT => "DISCONNECT",
+        SCARD_IOCTL_TRANSMIT => "TRANSMIT",
+        SCARD_IOCTL_STATUSA => "STATUS_A",
+        SCARD_IOCTL_STATUSW => "STATUS_W",
+        SCARD_IOCTL_GETSTATUSCHANGEA => "GET_STATUS_CHANGE_A",
+        SCARD_IOCTL_GETSTATUSCHANGEW => "GET_STATUS_CHANGE_W",
+        SCARD_IOCTL_BEGINTRANSACTION => "BEGIN_TRANSACTION",
+        SCARD_IOCTL_ENDTRANSACTION => "END_TRANSACTION",
+        SCARD_IOCTL_GETATTRIB => "GET_ATTRIB",
+        SCARD_IOCTL_SETATTRIB => "SET_ATTRIB",
+        SCARD_IOCTL_CONTROL => "CONTROL",
+        SCARD_IOCTL_LOCATECARDSA => "LOCATE_CARDS_A",
+        SCARD_IOCTL_LOCATECARDSW => "LOCATE_CARDS_W",
+        SCARD_IOCTL_STATE => "STATE",
+        SCARD_IOCTL_LOCATECARDSBYATRA => "LOCATE_CARDS_BY_ATR_A",
+        SCARD_IOCTL_LOCATECARDSBYATRW => "LOCATE_CARDS_BY_ATR_W",
+        _ => "UNKNOWN",
+    }
+}
