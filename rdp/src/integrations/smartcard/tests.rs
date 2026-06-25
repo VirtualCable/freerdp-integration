@@ -200,6 +200,7 @@ pub mod dummy {
                     let present = cards.iter().any(|c| c.reader == rs.reader_name);
                     ReaderStateOut {
                         reader_name: rs.reader_name.clone(),
+                        current_state: rs.current_state,
                         event_state: if present {
                             SCARD_STATE_PRESENT | SCARD_STATE_CHANGED
                         } else {
@@ -243,8 +244,8 @@ pub mod dummy {
 
     #[cfg(test)]
     mod tests {
-        use super::*;
         use super::super::super::consts::SCARD_STATE_PRESENT;
+        use super::*;
 
         #[test]
         fn dummy_establish_context() {
@@ -324,10 +325,10 @@ pub mod dummy {
 
 #[cfg(test)]
 mod unit_tests {
-    use super::*;
     use super::super::consts::{
         SCARD_E_NO_SMARTCARD, SCARD_S_SUCCESS, STATUS_BUFFER_TOO_SMALL, STATUS_CANCELLED,
     };
+    use super::*;
 
     #[test]
     fn scard_context_is_nonzero() {

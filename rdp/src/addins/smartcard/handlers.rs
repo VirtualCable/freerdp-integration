@@ -76,6 +76,8 @@ pub(crate) fn dispatch_ioctl(
         SCARD_IOCTL_LOCATECARDSBYATRW => {
             handle_locate_cards_by_atr(integration, contexts, operation, out, true)
         }
+        SCARD_IOCTL_GETTRANSMITCOUNT => handle_get_transmit_count(operation, out),
+        SCARD_IOCTL_GETDEVICETYPEID => handle_get_device_type_id(operation, out),
         _ => SCARD_E_UNSUPPORTED_FEATURE,
     }
 }
@@ -530,11 +532,27 @@ fn handle_transmit(
     let send_data =
         unsafe { std::slice::from_raw_parts(call.pbSendBuffer, call.cbSendLength as usize) };
 
+    log::debug!(
+        "smartcard: TRANSMIT APDU send ({} bytes): {}",
+        send_data.len(),
+        send_data
+            .iter()
+            .map(|b| format!("{:02X}", b))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+
     match integration.transmit(&card_handle, &send_pci, send_data) {
         Ok(result) => {
             log::debug!(
-                "smartcard: transmit success, recv_len={}",
-                result.recv_buffer.len()
+                "smartcard: TRANSMIT APDU recv ({} bytes): {}",
+                result.recv_buffer.len(),
+                result
+                    .recv_buffer
+                    .iter()
+                    .map(|b| format!("{:02X}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ")
             );
 
             let pio_recv_pci = if let Some(ref recv_pci) = result.recv_pci {
@@ -583,8 +601,11 @@ fn handle_control(
         call.cbInBufferSize
     );
 
-    let in_data =
-        unsafe { std::slice::from_raw_parts(call.pvInBuffer, call.cbInBufferSize as usize) };
+    let in_data = if call.pvInBuffer.is_null() || call.cbInBufferSize == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(call.pvInBuffer, call.cbInBufferSize as usize) }
+    };
 
     match integration.control(&card_handle, control_code, in_data) {
         Ok(mut out_data) => {
@@ -704,7 +725,7 @@ fn handle_get_status_change(
         Duration::from_millis(timeout_ms as u64)
     };
 
-    log::debug!(
+    log::trace!(
         "smartcard: GET_STATUS_CHANGE context=0x{:X} timeout_ms={} count={}",
         ctx_id,
         timeout_ms,
@@ -713,7 +734,7 @@ fn handle_get_status_change(
 
     match integration.get_status_change(&ctx, timeout, &reader_states_in) {
         Ok(result_states) => {
-            log::debug!(
+            log::trace!(
                 "smartcard: get_status_change success, count={}",
                 result_states.len()
             );
@@ -824,4 +845,41 @@ fn handle_locate_cards_by_atr(
         }
         Err(code) => code,
     }
+}
+
+// ---------------------------------------------------------------------------
+// GET_TRANSMIT_COUNT
+// ---------------------------------------------------------------------------
+
+fn handle_get_transmit_count(
+    _operation: &freerdp_sys::SMARTCARD_OPERATION,
+    out: *mut freerdp_sys::wStream,
+) -> u32 {
+    log::debug!("smartcard: GET_TRANSMIT_COUNT — returning 0");
+    unsafe {
+        let ret = freerdp_sys::GetTransmitCount_Return {
+            ReturnCode: SCARD_S_SUCCESS as i32,
+            cTransmitCount: 0,
+        };
+        freerdp_sys::smartcard_pack_get_transmit_count_return(out, &ret);
+    }
+    SCARD_S_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// GET_DEVICE_TYPE_ID
+// ---------------------------------------------------------------------------
+
+fn handle_get_device_type_id(
+    _operation: &freerdp_sys::SMARTCARD_OPERATION,
+    out: *mut freerdp_sys::wStream,
+) -> u32 {
+    // RDPDR_DTYP_SMARTCARD = 0x0020
+    log::debug!("smartcard: GET_DEVICE_TYPE_ID — returning 0x0020");
+    unsafe {
+        use crate::addins::smartcard::device::stream_write_u32;
+        stream_write_u32(out, SCARD_S_SUCCESS);
+        stream_write_u32(out, 0x0020);
+    }
+    SCARD_S_SUCCESS
 }

@@ -165,6 +165,8 @@ pub struct ReaderStateIn {
 pub struct ReaderStateOut {
     /// Name of the reader.
     pub reader_name: String,
+    /// The current state as known by the caller (echoed back from input).
+    pub current_state: u32,
     /// The state that triggered the return (SCARD_STATE_* flags).
     pub event_state: u32,
     /// ATR of the card (if present in the reader).

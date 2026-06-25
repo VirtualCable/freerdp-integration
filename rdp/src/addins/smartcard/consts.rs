@@ -38,6 +38,8 @@ pub(crate) const SCARD_IOCTL_LOCATECARDSBYATRW: u32 = 0x0009_00EC;
 pub(crate) const SCARD_IOCTL_LOCATECARDSA: u32 = 0x0009_0098;
 pub(crate) const SCARD_IOCTL_LOCATECARDSW: u32 = 0x0009_009C;
 pub(crate) const SCARD_IOCTL_STATE: u32 = 0x0009_00C4;
+pub(crate) const SCARD_IOCTL_GETTRANSMITCOUNT: u32 = 0x0009_0104;
+pub(crate) const SCARD_IOCTL_GETDEVICETYPEID: u32 = 0x0009_0108;
 
 /// RDPDR device type for smartcard.
 pub(crate) const RDPDR_DTYP_SMARTCARD: u32 = 0x0020;
@@ -72,6 +74,8 @@ pub(crate) fn ioctl_name(ioctl: u32) -> &'static str {
         SCARD_IOCTL_STATE => "STATE",
         SCARD_IOCTL_LOCATECARDSBYATRA => "LOCATE_CARDS_BY_ATR_A",
         SCARD_IOCTL_LOCATECARDSBYATRW => "LOCATE_CARDS_BY_ATR_W",
+        SCARD_IOCTL_GETTRANSMITCOUNT => "GET_TRANSMIT_COUNT",
+        SCARD_IOCTL_GETDEVICETYPEID => "GET_DEVICE_TYPE_ID",
         _ => "UNKNOWN",
     }
 }

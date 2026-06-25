@@ -260,7 +260,7 @@ pub(crate) fn pack_reader_states_out(
             let atr_len = rs.atr.len().min(36);
             rgb_atr[..atr_len].copy_from_slice(&rs.atr[..atr_len]);
             freerdp_sys::ReaderState_Return {
-                dwCurrentState: 0,
+                dwCurrentState: rs.current_state,
                 dwEventState: rs.event_state,
                 cbAtr: atr_len as u32,
                 rgbAtr: rgb_atr,
@@ -424,12 +424,24 @@ unsafe fn process_irp(
     let ioctl = operation.ioControlCode;
     let completion_id = operation.completionID;
 
-    log::debug!(
-        "smartcard: IRP ioctl=0x{:08X} ({}) completion_id={}",
-        ioctl,
-        ioctl_name(ioctl),
-        completion_id
-    );
+    // Reduce log noise: GET_STATUS_CHANGE floods the log every 50ms
+    let is_status_change = ioctl == crate::addins::smartcard::consts::SCARD_IOCTL_GETSTATUSCHANGEA
+        || ioctl == crate::addins::smartcard::consts::SCARD_IOCTL_GETSTATUSCHANGEW;
+    if is_status_change {
+        log::trace!(
+            "smartcard: IRP ioctl=0x{:08X} ({}) completion_id={}",
+            ioctl,
+            ioctl_name(ioctl),
+            completion_id
+        );
+    } else {
+        log::debug!(
+            "smartcard: IRP ioctl=0x{:08X} ({}) completion_id={}",
+            ioctl,
+            ioctl_name(ioctl),
+            completion_id
+        );
+    }
 
     let _cancel_token = outstanding.register(completion_id);
 
