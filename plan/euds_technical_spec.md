@@ -150,10 +150,11 @@ R-APDU (not ready):  69 85    (conditions of use not satisfied)
 
 Retrieves the X.509 certificate in DER format. Used by the minidriver to serve `mscp\kxc00`.
 
+**Case 2 Extended APDU** (no data in, data out — standard READ BINARY):
 ```
-C-APDU: 80 B0 00 00 00 [len_hi] [len_lo]
-        │  │  │  │  │   │      └── Le_lo
-        │  │  │  │  │   └── Le_hi (00 00 = return all available)
+C-APDU: 80 B0 00 00 00 00 00
+        │  │  │  │  │  │  └── Le_lo = 00
+        │  │  │  │  │  └── Le_hi = 00 (Le = 0 = return all available)
         │  │  │  │  └── Extended length indicator
         │  │  │  └── P2 = 00 (offset low)
         │  │  └── P1 = 00 (offset high)
@@ -164,7 +165,7 @@ R-APDU: [DER_bytes] 90 00
 ```
 
 **Notes**:
-- Uses **extended APDU** format (Lc/Le are 2 bytes each)
+- Uses **extended APDU case 2** format (no Lc, Le is 2 bytes)
 - Returns the complete DER-encoded X.509 certificate
 - Typical certificate size: 1,000–3,000 bytes (fits in extended APDU)
 - If response > 65,535 bytes (impossible for X.509), engine would use chaining
@@ -247,28 +248,31 @@ R-APDU: [signature: 256 bytes] 90 00
 
 Performs RSA decryption (PKCS#1 v1.5 or OAEP).
 
+**Case 4 Extended APDU** (data in + data out):
 ```
-C-APDU: 80 2A 80 86 00 01 00 [ciphertext: 256 bytes]
-        │  │  │  │  │  │  │  └── Encrypted data (RSA block)
-        │  │  │  │  │  │  └── Lc_lo = 00
-        │  │  │  │  │  └── Lc_hi = 01 (Lc = 256)
-        │  │  │  │  └── Extended length indicator
-        │  │  │  └── P2 = 86 (decrypt)
-        │  │  └── P1 = 80 (confidentiality)
-        │  └── INS = 2A (PERFORM SECURITY_OPERATION)
-        └── CLA = 80 (proprietary)
+C-APDU: 80 2A 80 86 00 01 00 [ciphertext: 256 bytes] 00 00
+        │  │  │  │  │  │  │  └────────── Encrypted data (RSA block)
+        │  │  │  │  │  │  └───────────── Lc_lo = 00
+        │  │  │  │  │  └──────────────── Lc_hi = 01 (Lc = 256)
+        │  │  │  │  └─────────────────── Extended length indicator
+        │  │  │  └────────────────────── P2 = 86 (decrypt)
+        │  │  └───────────────────────── P1 = 80 (confidentiality)
+        │  └──────────────────────────── INS = 2A (PERFORM SECURITY_OPERATION)
+        └─────────────────────────────── CLA = 80 (proprietary)
+                                        Le_hi = 00, Le_lo = 00 (Le = 0 = max available)
 
 R-APDU: [plaintext] 90 00
 ```
 
-**CRITICAL**: This command **requires extended APDU** because:
+**CRITICAL**: This command **requires extended APDU case 4** because:
 - RSA-2048 ciphertext = 256 bytes
 - Short APDU Lc maximum = 255 bytes (1 byte)
 - 256 > 255 → short APDU cannot carry the input
+- Must include `Le_hi Le_lo` (2 bytes) at the end per ISO 7816-4 case 4 extended
 
 **Notes**:
 - PIN must be verified first (else `69 82`)
-- Engine must support extended APDU parsing (Lc as 2-byte field)
+- Engine must support extended APDU parsing (Lc as 2-byte field, Le as 2-byte field)
 - The FreeRDP addon passes extended APDUs transparently (no interpretation)
 - Output size depends on padding:
   - PKCS#1 v1.5: up to 245 bytes (256 - 11 overhead)
@@ -430,7 +434,7 @@ Offset  Size  Value                          Meaning
 | `CardAcquireContext` | Version negotiation, init context, set all function pointers | 0 (success) |
 | `CardDeleteContext` | Free `pvVendorSpecific`, cleanup | 0 |
 | `CardGetProperty` | Return properties (see Section 5) | 0 |
-| `CardSetProperty` | Accept silently or return UNSUPPORTED for read-only props | 0 |
+| `CardSetProperty` | Handle writable properties; return UNSUPPORTED for read-only | 0 |
 | `CardReadFile` | Serve virtual files (see Section 3) | 0 |
 | `CardEnumFiles` | Return multi-string of filenames per directory | 0 |
 | `CardGetFileInfo` | Return file size and access condition | 0 |
@@ -521,6 +525,122 @@ unsafe extern "system" fn CardAcquireContext(
 
 ---
 
+### 4.4 CardAuthenticateEx Details
+
+```rust
+unsafe extern "system" fn CardAuthenticateEx(
+    pCardData: PCARD_DATA,
+    PinId: PIN_ID,              // 0 = user PIN
+    dwFlags: DWORD,             // CARD_AUTHENTICATE_* flags
+    pbPinData: *const BYTE,     // PIN bytes
+    cbPinData: DWORD,           // PIN length
+    ppbSessionPin: *mut *mut BYTE, // OUT: session PIN (if requested)
+    pcbSessionPin: *mut DWORD,  // OUT: session PIN length
+    pcAttemptsRemaining: *mut DWORD, // OUT: retries left
+) -> DWORD {
+    // 1. Validate PinId
+    if PinId != 0 {
+        return SCARD_E_INVALID_PARAMETER; // Only PIN 0 supported
+    }
+
+    // 2. Handle flags
+    let silent = (dwFlags & CARD_PIN_SILENT_CONTEXT) != 0;
+    let gen_session = (dwFlags & CARD_AUTHENTICATE_GENERATE_SESSION_PIN) != 0;
+    let use_session = (dwFlags & CARD_AUTHENTICATE_SESSION_PIN) != 0;
+
+    // 3. Get context
+    let ctx = get_context(pCardData);
+
+    // 4. If session PIN requested, use it instead of pbPinData
+    let pin_bytes = if use_session {
+        // Session PIN should have been cached from previous GENERATE_SESSION_PIN
+        ctx.get_session_pin()
+    } else {
+        // Regular PIN: pbPinData is ANSI bytes
+        slice::from_raw_parts(pbPinData, cbPinData as usize)
+    };
+
+    // 5. Send VERIFY PIN APDU to engine
+    let apdu = build_verify_pin_apdu(pin_bytes);
+    let response = transmit_apdu(pCardData, &apdu)?;
+
+    // 6. Parse response
+    match response.sw {
+        0x9000 => {
+            ctx.set_pin_verified(true);
+            ctx.increment_pin_freshness();
+            
+            // 7. Handle session PIN generation if requested
+            if gen_session {
+                let session_pin = generate_session_pin();
+                ctx.set_session_pin(session_pin.clone());
+                // Return session PIN to CSP
+                *ppbSessionPin = csp_alloc(session_pin.len())?;
+                copy_to_csp(session_pin, *ppbSessionPin);
+                *pcbSessionPin = session_pin.len() as DWORD;
+            }
+            
+            if let Some(attempts) = pcAttemptsRemaining.as_mut() {
+                *attempts = ctx.get_pin_retries();
+            }
+            SCARD_S_SUCCESS
+        }
+        0x63C0..=0x63CF => {
+            // 63 CX = wrong PIN, X retries left
+            let retries = (response.sw & 0xF) as DWORD;
+            if let Some(attempts) = pcAttemptsRemaining.as_mut() {
+                *attempts = retries;
+            }
+            if retries == 0 {
+                ctx.set_pin_blocked(true);
+            }
+            SCARD_E_INVALID_VALUE
+        }
+        0x6983 => {
+            // PIN blocked
+            ctx.set_pin_blocked(true);
+            SCARD_W_CHV_BLOCKED
+        }
+        _ => SCARD_F_COMM_ERROR,
+    }
+}
+```
+
+**Flags handling**:
+
+| Flag | Value | Meaning | Our Handling |
+|------|-------|---------|--------------|
+| `CARD_AUTHENTICATE_GENERATE_SESSION_PIN` | 0x00000001 | Generate session PIN | Generate random, cache, return |
+| `CARD_AUTHENTICATE_SESSION_PIN` | 0x00000002 | Use session PIN | Use cached session PIN |
+| `CARD_PIN_SILENT_CONTEXT` | 0x00000010 | No UI prompts | Just don't show UI (handled by CSP) |
+
+---
+
+### 4.5 CardDeauthenticateEx Details
+
+```rust
+unsafe extern "system" fn CardDeauthenticateEx(
+    pCardData: PCARD_DATA,
+    PinIdSet: PIN_SET,   // Bitmask of PINs to deauthenticate
+    dwFlags: DWORD,      // Must be 0
+) -> DWORD {
+    let ctx = get_context(pCardData);
+
+    // PinIdSet bit 0 = PIN 0 (user), bit 1 = PIN 1 (admin), etc.
+    // We only support PIN 0
+    if PinIdSet & 0x01 != 0 {
+        ctx.set_pin_verified(false);
+        ctx.clear_session_pin();
+        ctx.increment_pin_freshness();
+    }
+
+    // Other PINs not supported but don't error
+    SCARD_S_SUCCESS
+}
+```
+
+---
+
 ## 5. CardGetProperty — Complete Property Table
 
 ### 5.1 Required Properties
@@ -536,6 +656,8 @@ unsafe extern "system" fn CardAcquireContext(
 | `"Cache Mode"` | DWORD | 4 | `0x00000002` (SESSION_ONLY) | |
 | `"PIN Information"` | PIN_INFO | 36 | See below | dwFlags = PinId |
 | `"PIN List"` | PIN_SET | 4 | `0x00000001` | PIN 0 active |
+| `"Authenticated State"` | PIN_SET | 4 | Dynamic | **Required**: tells CSP which PINs are verified |
+| `"Card Serial Number"` | BYTE[16] | 16 | Same as Card Identifier | Optional per spec, but CSP expects it |
 
 ### 5.2 Property Values in Detail
 
@@ -590,17 +712,46 @@ PIN_INFO {
 // Size: 36 bytes
 ```
 
+#### Authenticated State (no dwFlags)
+```rust
+// Returns PIN_SET bitmask indicating which PINs are currently authenticated
+// 0x00 = none verified
+// 0x01 = PIN 0 (user) verified
+// Updated by CardAuthenticateEx / CardDeauthenticateEx
+// Size: 4 bytes (DWORD)
+```
+
+#### Card Serial Number
+```rust
+// Returns same 16-byte GUID as "Card Identifier"
+// Some tools (certutil, mmc) display this
+// Size: 16 bytes
+```
+
 ### 5.3 Optional Properties (return SCARD_E_UNSUPPORTED_FEATURE if not implemented)
 
 | Property | Recommendation |
 |----------|---------------|
-| `"Card Serial Number"` | Optional, can return same as Card Identifier |
-| `"Authenticated State"` | Optional, return `0x00000001` if PIN verified |
 | `"PIN Strength Verify"` | Optional, return `CARD_PIN_STRENGTH_PLAINTEXT` |
 | `"Key Import Support"` | Return `0` (no key import) |
 | `"Enum Algorithms"` | Optional, not needed for read-only |
 | `"Padding Schemes"` | Optional, not needed for basic operations |
 | `"Chaining Modes"` | Optional, not needed |
+
+---
+
+### 5.4 CardSetProperty — Writable Properties
+
+The following properties **MUST** be writable (not return `SCARD_E_UNSUPPORTED_FEATURE`):
+
+| Property | Writable By | Action |
+|----------|-------------|--------|
+| `CP_CARD_CACHE_MODE` ("Cache Mode") | Administrator | Update cache mode (SESSION_ONLY/NO_CACHE/GLOBAL) |
+| `CP_CARD_PIN_INFO` ("PIN Information") | Administrator | Update PIN policy (retry count, cache policy, etc.) |
+| `CP_PARENT_WINDOW` ("Parent Window") | Everyone | Store HWND for external PIN entry UI |
+| `CP_PIN_CONTEXT_STRING` ("PIN Context String") | Everyone | Store context string for external PIN entry |
+
+All other properties are read-only and must return `SCARD_E_UNSUPPORTED_FEATURE` or `SCARD_W_SECURITY_VIOLATION` if set.
 
 ---
 
@@ -913,16 +1064,71 @@ The Base CSP frees returned buffers using `pCardData->pfnCspFree`. The minidrive
 ### 9.3 Vendor-Specific Context
 
 ```rust
+use parking_lot::RwLock; // or std::sync::RwLock
+
 struct EudsContext {
+    // Immutable after init
     card_id: [u8; 16],           // Static GUID
-    cert_der: Option<Vec<u8>>,   // Cached certificate (lazy loaded)
-    pub_key_blob: Option<Vec<u8>>, // Cached BCRYPT_RSAKEY_BLOB (lazy loaded)
-    pin_verified: bool,
-    pin_freshness: u8,           // Incremented on verify/deauth
+    // Mutable state — protected by RwLock for thread safety
+    cert_der: RwLock<Option<Vec<u8>>>,       // Cached certificate (lazy loaded)
+    pub_key_blob: RwLock<Option<Vec<u8>>>,   // Cached BCRYPT_RSAKEY_BLOB (lazy loaded)
+    pin_verified: RwLock<bool>,              // PIN verified in THIS session
+    pin_blocked: RwLock<bool>,               // PIN blocked (3 failed attempts)
+    pin_retries: RwLock<u8>,                 // Remaining retries (0-3)
+    pin_freshness: RwLock<u8>,               // Incremented on verify/deauth
+    session_pin: RwLock<Option<Vec<u8>>>,    // Session PIN if generated
+    cache_mode: RwLock<u32>,                 // CP_CARD_CACHE_MODE value
+    pin_info: RwLock<PIN_INFO>,              // CP_CARD_PIN_INFO value
+    parent_window: RwLock<Option<HWND>>,     // CP_PARENT_WINDOW value
+    pin_context_string: RwLock<Option<String>>, // CP_PIN_CONTEXT_STRING value
 }
 ```
 
+**Thread Safety Requirements**:
+- The Base CSP calls minidriver functions from **multiple threads concurrently**
+- All mutable fields in `EudsContext` MUST be protected by `RwLock` or `Mutex`
+- Read-mostly fields (cert_der, pub_key_blob) use `RwLock` for concurrent reads
+- Write-heavy fields (pin_verified, pin_retries) use `Mutex` if contention high
+
 Allocated in `CardAcquireContext` with `Box::new()`, freed in `CardDeleteContext` with `Box::from_raw()`.
+
+---
+
+### 9.5 Per-Session State Architecture
+
+**Critical Design**: Each `CardAcquireContext` call creates a **new independent session** with its own `EudsContext`.
+
+```
+Process A (certutil)          Process B (Outlook)          Process C (lsass)
+      │                            │                            │
+      ▼                            ▼                            ▼
+CardAcquireContext          CardAcquireContext          CardAcquireContext
+      │                            │                            │
+      ▼                            ▼                            ▼
+EudsContext#1               EudsContext#2               EudsContext#3
+  pin_verified=false          pin_verified=false          pin_verified=false
+  pin_retries=3               pin_retries=3               pin_retries=3
+  session_pin=None            session_pin=None            session_pin=None
+```
+
+**Why this matters**:
+- If engine had global state: Process A verifies PIN → Process B signs without PIN → **SECURITY BYPASS**
+- Each Windows process gets its own CSP context → its own minidriver context → its own PIN state
+- The engine (Linux) is **stateless** — it only processes APDUs, doesn't track sessions
+- Session state lives in `EudsContext` (minidriver side)
+
+**Implementation**:
+```rust
+// In CardAcquireContext:
+let ctx = Box::new(EudsContext::new());  // Fresh state per session
+(*pCardData).pvVendorSpecific = Box::into_raw(ctx) as PVOID;
+
+// In CardDeleteContext:
+let ctx = unsafe { Box::from_raw((*pCardData).pvVendorSpecific as *mut EudsContext) };
+drop(ctx); // Clean up session state
+```
+
+---
 
 ### 9.4 CardReadFile Allocation Pattern
 
