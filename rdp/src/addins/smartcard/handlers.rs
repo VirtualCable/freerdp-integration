@@ -78,6 +78,13 @@ pub(crate) fn dispatch_ioctl(
         }
         SCARD_IOCTL_GETTRANSMITCOUNT => handle_get_transmit_count(operation, out),
         SCARD_IOCTL_GETDEVICETYPEID => handle_get_device_type_id(operation, out),
+        SCARD_IOCTL_READCACHEA | SCARD_IOCTL_READCACHEW => {
+            handle_read_cache(operation, out, ioctl == SCARD_IOCTL_READCACHEW)
+        }
+        SCARD_IOCTL_WRITECACHEA | SCARD_IOCTL_WRITECACHEW => {
+            handle_write_cache(operation, ioctl == SCARD_IOCTL_WRITECACHEW)
+        }
+        SCARD_IOCTL_GETREADERICON => SCARD_S_SUCCESS,
         _ => SCARD_E_UNSUPPORTED_FEATURE,
     }
 }
@@ -543,7 +550,35 @@ fn handle_transmit(
     );
 
     match integration.transmit(&card_handle, &send_pci, send_data) {
-        Ok(result) => {
+        Ok(mut result) => {
+            // Auto-handle GET RESPONSE chaining (61 XX status)
+            // SCard API should handle this transparently, but through RDP redirect
+            // we must do it manually so msclmd receives the complete response.
+            while result.recv_buffer.len() >= 2 {
+                let last = result.recv_buffer.len();
+                let sw1 = result.recv_buffer[last - 2];
+                let sw2 = result.recv_buffer[last - 1];
+                if sw1 != 0x61 {
+                    break;
+                }
+                // Strip 61 XX, issue GET RESPONSE for remaining bytes
+                let remaining = sw2 as usize;
+                result.recv_buffer.truncate(last - 2);
+                let get_resp = [
+                    0x00,
+                    0xC0,
+                    0x00,
+                    0x00,
+                    if remaining == 0 { 0x00 } else { sw2 },
+                ];
+                match integration.transmit(&card_handle, &send_pci, &get_resp) {
+                    Ok(gr) => {
+                        result.recv_buffer.extend_from_slice(&gr.recv_buffer);
+                    }
+                    Err(_) => break,
+                }
+            }
+
             log::debug!(
                 "smartcard: TRANSMIT APDU recv ({} bytes): {}",
                 result.recv_buffer.len(),
@@ -882,4 +917,61 @@ fn handle_get_device_type_id(
         stream_write_u32(out, 0x0020);
     }
     SCARD_S_SUCCESS
+}
+
+// ===========================================================================
+// READ_CACHE / WRITE_CACHE — key-value store so msclmd doesn't loop
+// ===========================================================================
+
+static CARD_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<Vec<u16>, Vec<u8>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+unsafe fn widestr_to_vec(ptr: *const u16) -> Vec<u16> {
+    if ptr.is_null() {
+        return Vec::new();
+    }
+    let mut len = 0usize;
+    while unsafe { *ptr.add(len) } != 0 {
+        len += 1;
+    }
+    unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+}
+
+fn handle_write_cache(operation: &freerdp_sys::SMARTCARD_OPERATION, _is_wide: bool) -> u32 {
+    let call = unsafe { &operation.call.writeCacheW };
+    let name = unsafe { widestr_to_vec(call.szLookupName) };
+    let pb = call.Common.pbData;
+    let cb = call.Common.cbDataLen;
+    if pb.is_null() || cb == 0 {
+        log::debug!("smartcard: WRITE_CACHE — empty");
+        return SCARD_S_SUCCESS;
+    }
+    let data = unsafe { std::slice::from_raw_parts(pb, cb as usize) };
+    log::debug!(
+        "smartcard: WRITE_CACHE — storing {} bytes (key len={})",
+        data.len(),
+        name.len()
+    );
+    CARD_CACHE.lock().unwrap().insert(name, data.to_vec());
+    SCARD_S_SUCCESS
+}
+
+fn handle_read_cache(
+    operation: &freerdp_sys::SMARTCARD_OPERATION,
+    out: *mut freerdp_sys::wStream,
+    _is_wide: bool,
+) -> u32 {
+    let call = unsafe { &operation.call.readCacheW };
+    let name = unsafe { widestr_to_vec(call.szLookupName) };
+    log::debug!("smartcard: READ_CACHE — NOT_FOUND (key len={})", name.len());
+    unsafe {
+        let ret = freerdp_sys::ReadCache_Return {
+            ReturnCode: 0x80100070u32 as i32,
+            cbDataLen: 0,
+            pbData: std::ptr::null_mut(),
+        };
+        freerdp_sys::smartcard_pack_read_cache_return(out, &ret);
+    }
+    0x80100070u32
 }
