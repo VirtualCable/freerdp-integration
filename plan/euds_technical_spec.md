@@ -203,11 +203,17 @@ Offset  Size    Field           Example (RSA-2048)
 4+N     var     modulus         [256 bytes, big-endian]
 ```
 
+**Chaining behavior (T=0)**:
+- Total response: 263 bytes (exceeds short APDU max 256)
+- Engine returns first 256 bytes + `61 07` (SW_MORE_DATA with 7 bytes remaining)
+- FreeRDP addon sends `00 C0 00 00 07` (GET RESPONSE)
+- Engine returns remaining 7 bytes + `90 00`
+- FreeRDP addon concatenates → minidriver receives 263 bytes
+
 **Notes**:
 - The engine extracts these from the loaded certificate at startup
 - Total response for RSA-2048: 2 + 3 + 2 + 256 = **263 bytes** + SW
-- Since 263 > 256, the engine uses GET RESPONSE chaining for the last 7 bytes
-- The FreeRDP addon handles this transparently
+- Engine handles chaining internally (stores buffer in session, emits 61 XX)
 - The minidriver uses these components to build `BCRYPT_RSAKEY_BLOB` for `CardGetContainerInfo`
 - Cached after first retrieval
 
@@ -216,7 +222,7 @@ Offset  Size    Field           Example (RSA-2048)
 Performs RSA PKCS#1 v1.5 signature on a DigestInfo structure.
 
 ```
-C-APDU: 80 2A 9E 9A [Lc] [DigestInfo_and_Hash]
+C-APDU: 80 2A 9E 9A [Lc] [DigestInfo_and_Hash] 00
         │  │  │  │  │   └── DigestInfo + Hash bytes
         │  │  │  │  └── Lc = length of data
         │  │  │  └── P2 = 9A (sign hash)
@@ -439,7 +445,7 @@ Offset  Size  Value                          Meaning
 | `CardEnumFiles` | Return multi-string of filenames per directory | 0 |
 | `CardGetFileInfo` | Return file size and access condition | 0 |
 | `CardGetContainerInfo` | Return `CONTAINER_INFO` with `BCRYPT_RSAKEY_BLOB` | 0 |
-| `CardGetContainerProperty` | Handle `CCP_PIN_IDENTIFIER` → PinId 0 | 0 |
+| `CardGetContainerProperty` | Handle `CCP_PIN_IDENTIFIER` → PinId 1 (ROLE_USER) | 0 |
 | `CardAuthenticateEx` | Send VERIFY PIN APDU to engine | 0 |
 | `CardDeauthenticateEx` | Clear PIN state in engine | 0 |
 | `CardSignData` | Send SIGN APDU to engine | 0 |
@@ -530,7 +536,7 @@ unsafe extern "system" fn CardAcquireContext(
 ```rust
 unsafe extern "system" fn CardAuthenticateEx(
     pCardData: PCARD_DATA,
-    PinId: PIN_ID,              // 0 = user PIN
+    PinId: PIN_ID,              // 1 = user PIN (ROLE_USER)
     dwFlags: DWORD,             // CARD_AUTHENTICATE_* flags
     pbPinData: *const BYTE,     // PIN bytes
     cbPinData: DWORD,           // PIN length
@@ -539,8 +545,8 @@ unsafe extern "system" fn CardAuthenticateEx(
     pcAttemptsRemaining: *mut DWORD, // OUT: retries left
 ) -> DWORD {
     // 1. Validate PinId
-    if PinId != 0 {
-        return SCARD_E_INVALID_PARAMETER; // Only PIN 0 supported
+    if PinId != 1 {
+        return SCARD_E_INVALID_PARAMETER; // Only PIN 1 (ROLE_USER) supported
     }
 
     // 2. Handle flags
@@ -594,7 +600,7 @@ unsafe extern "system" fn CardAuthenticateEx(
             if retries == 0 {
                 ctx.set_pin_blocked(true);
             }
-            SCARD_E_INVALID_VALUE
+            SCARD_W_WRONG_CHV  // Corrected to comply with MS spec §4.2.6!
         }
         0x6983 => {
             // PIN blocked
@@ -626,9 +632,12 @@ unsafe extern "system" fn CardDeauthenticateEx(
 ) -> DWORD {
     let ctx = get_context(pCardData);
 
-    // PinIdSet bit 0 = PIN 0 (user), bit 1 = PIN 1 (admin), etc.
-    // We only support PIN 0
-    if PinIdSet & 0x01 != 0 {
+    // PinIdSet bit 0 = ROLE_EVERYONE, bit 1 = ROLE_USER, etc.
+    // We ignore ROLE_EVERYONE (bit 0) per MS spec
+    let active_pins = PinIdSet & !0x01;
+
+    // We only support ROLE_USER (bit 1 / PinId 1)
+    if active_pins & 0x02 != 0 {
         ctx.set_pin_verified(false);
         ctx.clear_session_pin();
         ctx.increment_pin_freshness();
@@ -648,15 +657,15 @@ unsafe extern "system" fn CardDeauthenticateEx(
 | Property Name | Type | Size | Value | Notes |
 |---------------|------|------|-------|-------|
 | `"Card Identifier"` | BYTE[16] | 16 | Static GUID | Must match `cardid` file |
-| `"Read Only Mode"` | BOOL | 4 | `0x00000000` (FALSE) | Allows enumeration |
-| `"Supports Windows x.509 Enrollment"` | BOOL | 4 | `0x00000001` (TRUE) | **CRITICAL**: enables cert enumeration |
+| `"Read Only Mode"` | BOOL | 4 | `0x00000001` (TRUE) | Blocks writes at Base CSP layer |
+| `"Supports Windows x.509 Enrollment"` | BOOL | 4 | `0x00000000` (FALSE) | Enrollment not supported on read-only card |
 | `"Capabilities"` | CARD_CAPABILITIES | 12 | See below | |
 | `"Key Sizes"` | CARD_KEY_SIZES | 20 | See below | dwFlags = AT_KEYEXCHANGE |
 | `"Free Space"` | CARD_FREE_SPACE_INFO | 12 | See below | |
 | `"Cache Mode"` | DWORD | 4 | `0x00000002` (SESSION_ONLY) | |
-| `"PIN Information"` | PIN_INFO | 36 | See below | dwFlags = PinId |
-| `"PIN List"` | PIN_SET | 4 | `0x00000001` | PIN 0 active |
-| `"Authenticated State"` | PIN_SET | 4 | Dynamic | **Required**: tells CSP which PINs are verified |
+| `"PIN Information"` | PIN_INFO | 36 | See below | dwFlags = PinId (1) |
+| `"PIN List"` | PIN_SET | 4 | `0x00000002` | PIN 1 (ROLE_USER) active |
+| `"Authenticated State"` | PIN_SET | 4 | Dynamic | **Required**: tells CSP which PINs are verified (bit 1 active if PIN 1 verified) |
 | `"Card Serial Number"` | BYTE[16] | 16 | Same as Card Identifier | Optional per spec, but CSP expects it |
 
 ### 5.2 Property Values in Detail
@@ -694,7 +703,7 @@ CARD_FREE_SPACE_INFO {
 // Size: 12 bytes
 ```
 
-#### PIN Information (dwFlags = 0, i.e., PinId 0)
+#### PIN Information (dwFlags = 1, i.e., PinId 1)
 ```rust
 PIN_INFO {
     dwVersion: 6,
@@ -716,7 +725,7 @@ PIN_INFO {
 ```rust
 // Returns PIN_SET bitmask indicating which PINs are currently authenticated
 // 0x00 = none verified
-// 0x01 = PIN 0 (user) verified
+// 0x02 = PIN 1 (ROLE_USER) verified
 // Updated by CardAuthenticateEx / CardDeauthenticateEx
 // Size: 4 bytes (DWORD)
 ```
@@ -782,11 +791,11 @@ This is the exact sequence of calls the Base CSP makes when `certutil -scinfo` o
    → Returns: 01 01 01 00 01 00 (6 bytes)
 
 9. CardGetProperty("Read Only Mode")
-   → Returns: FALSE (0x00000000)
+   → Returns: TRUE (0x00000001)
 
 10. CardGetProperty("Supports Windows x.509 Enrollment")
-    → Returns: TRUE (0x00000001)
-    ★ CRITICAL: If FALSE or unsupported, CSP stops here!
+    → Returns: FALSE (0x00000000)
+    ★ NOTE: Enrollment is not supported on a read-only card. This is compliant with MS spec §7.4. Cert enumeration does not require enrollment support.
 
 11. CardGetProperty("Capabilities")
     → Returns: {fCertComp=FALSE, fKeyGen=FALSE}
@@ -828,13 +837,13 @@ This is the exact sequence of calls the Base CSP makes when `certutil -scinfo` o
 
 ```
 17. CardGetProperty("PIN List")
-    → Returns: 0x00000001 (PIN 0 active)
+    → Returns: 0x00000002 (PIN 1 active)
 
-18. CardGetProperty("PIN Information", dwFlags=0)
+18. CardGetProperty("PIN Information", dwFlags=1)
     → Returns: PIN_INFO (36 bytes)
 
 19. User enters PIN in Windows dialog
-20. CardAuthenticateEx(PinId=0, dwFlags=0, pbPinData="1234")
+20. CardAuthenticateEx(PinId=1, dwFlags=0, pbPinData="1234")
     → Minidriver sends VERIFY PIN APDU: 80 20 00 80 04 31 32 33 34
     → Engine verifies PIN
     → Returns: SCARD_S_SUCCESS (or SCARD_E_INVALID_VALUE if wrong)
@@ -1039,6 +1048,25 @@ This is handled automatically by the FreeRDP addon's GET RESPONSE chaining logic
 
 ---
 
+### 8.5 APDU Status Word (SW) to Windows Error Code Mapping
+
+The minidriver must map APDU response status words (the last 2 bytes of any R-APDU) to the corresponding Windows Smart Card Module API error codes:
+
+| APDU SW (Hex) | Windows Error Code | Meaning |
+|---------------|-------------------|---------|
+| `0x9000` | `SCARD_S_SUCCESS` (0) | Success |
+| `0x63C0..=0x63CF` | `SCARD_W_WRONG_CHV` (0x8010006B) | Incorrect PIN (last nibble is retries) |
+| `0x6982` | `SCARD_W_CARD_NOT_AUTHENTICATED` (0x8010006F) | PIN not verified (security status not satisfied) |
+| `0x6983` | `SCARD_W_CHV_BLOCKED` (0x8010006C) | PIN blocked (attempts exhausted) |
+| `0x6A82` | `SCARD_E_FILE_NOT_FOUND` (0x80100024) | File not found |
+| `0x6A88` | `SCARD_E_NO_KEY_CONTAINER` (0x80100030) | Key container / reference not found |
+| `0x6D00` / `0x6E00` | `SCARD_E_UNSUPPORTED_FEATURE` (0x80100022) | Instruction/Class not supported |
+| `0x6700` | `SCARD_E_COMM_DATA_LOST` (0x8010002F) | Data length / Lc mismatch |
+| `0x6A86` / `0x6A80` | `SCARD_E_INVALID_PARAMETER` (0x80100004) | Invalid parameters / command data |
+| Any other error | `SCARD_F_COMM_ERROR` (0x80100013) | Internal communications failure |
+
+---
+
 ## 9. Memory Management Rules
 
 ### 9.1 Allocation
@@ -1114,8 +1142,10 @@ EudsContext#1               EudsContext#2               EudsContext#3
 **Why this matters**:
 - If engine had global state: Process A verifies PIN → Process B signs without PIN → **SECURITY BYPASS**
 - Each Windows process gets its own CSP context → its own minidriver context → its own PIN state
-- The engine (Linux) is **stateless** — it only processes APDUs, doesn't track sessions
-- Session state lives in `EudsContext` (minidriver side)
+- **Hybrid model**: Engine stateful per-connection si PIN required (clave encriptada), stateless si no (clave sin encriptar)
+- **PinMode::Required** (clave encriptada): engine trackea `pin_verified` per connection en `HashMap<u64, SessionState>`
+- **PinMode::NotRequired** (clave sin encriptar): engine stateless, SIGN/DECRYPT directo sin PIN check
+- Minidriver SIEMPRE mantiene su `EudsContext` per-context (cache cert, pubkey, cache_mode, etc.)
 
 **Implementation**:
 ```rust
@@ -1155,6 +1185,63 @@ unsafe extern "system" fn CardReadFile(
     *ppbData = buffer;
     *pcbData = size as DWORD;
     0
+}
+
+/// Helper function to retrieve file data dynamically
+fn get_file_data(
+    pCardData: PCARD_DATA,
+    pszDirectoryName: LPSTR,
+    pszFileName: LPSTR,
+) -> Result<Vec<u8>, DWORD> {
+    if pszFileName.is_null() {
+        return Err(SCARD_E_INVALID_PARAMETER);
+    }
+
+    let ctx = unsafe { &*((*pCardData).pvVendorSpecific as *const EudsContext) };
+
+    // Validate directory
+    let dir = if pszDirectoryName.is_null() {
+        ""
+    } else {
+        unsafe { CStr::from_ptr(pszDirectoryName).to_str().map_err(|_| SCARD_E_INVALID_PARAMETER)? }
+    };
+
+    let file = unsafe { CStr::from_ptr(pszFileName).to_str().map_err(|_| SCARD_E_INVALID_PARAMETER)? };
+
+    match dir {
+        "" => match file {
+            "cardid" => Ok(ctx.card_id.to_vec()),
+            "cardcf" => {
+                // Dynamically construct cache file using latest pin_freshness
+                let pin_fresh = *ctx.pin_freshness.read();
+                Ok(vec![0x01, pin_fresh, 0x01, 0x00, 0x01, 0x00])
+            }
+            "cardapps" => Ok(b"mscp\0\0\0\0".to_vec()),
+            _ => Err(SCARD_E_FILE_NOT_FOUND),
+        },
+        "mscp" => match file {
+            "cmapfile" => {
+                // Return 86-byte CONTAINER_MAP_RECORD
+                Ok(build_cmap_file_bytes())
+            }
+            "kxc00" => {
+                // Lazy-loaded cached certificate DER
+                if let Some(cert) = &*ctx.cert_der.read() {
+                    return Ok(cert.clone());
+                }
+                
+                // Not cached, fetch via GET CERTIFICATE APDU
+                let cert = fetch_certificate_from_card(pCardData)?;
+                
+                // Write to cache under write lock
+                let mut cache = ctx.cert_der.write();
+                *cache = Some(cert.clone());
+                Ok(cert)
+            }
+            _ => Err(SCARD_E_FILE_NOT_FOUND),
+        },
+        _ => Err(SCARD_E_DIR_NOT_FOUND), // Crucial fix for compliance!
+    }
 }
 ```
 

@@ -106,9 +106,10 @@ Used by the minidriver to get RSA public key components for `CardGetContainerInf
 - **Notes**: Returns 263 bytes for RSA-2048. Since 263 > 256, the engine uses GET RESPONSE chaining for the last 7 bytes (handled by FreeRDP addon). The minidriver uses these to build a `BCRYPT_RSAKEY_BLOB`.
 
 ### 4.5 PERFORM SECURITY OPERATION: SIGN DATA (INS 0x2A)
-- **Command (C-APDU)**: `80 2A 9E 9A [Lc] [DigestInfo_and_Hash_Bytes]`
+- **Command (C-APDU)**: `80 2A 9E 9A [Lc] [DigestInfo_and_Hash_Bytes] 00`
   - `P1` = `9E`
   - `P2` = `9A` (Sign hash)
+  - `Le` = `00` (expect 256 bytes response)
 - **Response (R-APDU)**:
   - `[Raw_RSA_Signature_Bytes] 90 00` (256 bytes for RSA-2048)
   - `69 82` = Security Status Not Satisfied (PIN not verified)
@@ -133,7 +134,7 @@ We will implement the eUDS Card Engine in the `uds-client` project:
 1. Create `euds_engine.rs` implementing the custom APDUs (SELECT, VERIFY PIN, GET CERT, GET PUBLIC KEY, SIGN, DECRYPT).
 2. Register the custom ATR: `3B 89 00 45 55 44 53 2D 43 61 72 64 97`.
 3. Read the certificate and private key from the environment variables (same as current setup).
-4. **Engine is stateless** — no PIN state, no session state. Only processes APDUs.
+4. **Engine stateful per-connection si PIN required (clave encriptada), stateless si no (clave sin encriptar)**. VERIFY PIN setea flag per-connection; SIGN/DECRYPT chequean flag. Sin PIN required → engine stateless, ops directas.
 5. Run unit tests to verify signing/decryption against the local private key.
 
 ### Phase 2: eUDS Minidriver (Windows dll)
@@ -142,8 +143,8 @@ We will create a clean, dedicated minidriver project: `euds-smartcard-minidriver
 2. Implement `CardAcquireContext` to support dwVersion 7.
 3. Handle `CardGetProperty` for all core properties:
    - `"Card Identifier"` (16-byte random GUID)
-   - `"Read Only Mode"` (returns `FALSE`)
-   - `"Supports Windows x.509 Enrollment"` (returns `TRUE` as `0x01` DWORD)
+    - `"Read Only Mode"` (returns `TRUE` to block writes at Base CSP layer)
+    - `"Supports Windows x.509 Enrollment"` (returns `FALSE` since card is read-only)
    - `"PIN Information"` (returns 36 bytes indicating PIN characteristics)
    - `"Authenticated State"` (returns PIN_SET bitmask — **required**)
    - `"Card Serial Number"` (returns same GUID as Card Identifier)
@@ -174,7 +175,8 @@ We will create a clean, dedicated minidriver project: `euds-smartcard-minidriver
 1. Connect via RDP using `gui-tester`.
 2. Windows detects `eUDS Custom Card` → loads `euds_minidriver.dll`.
 3. Run `certutil -scinfo`.
-   - The CSP queries `"Supports Windows x.509 Enrollment"`, gets `TRUE`.
+    - The CSP queries `"Supports Windows x.509 Enrollment"`, gets `FALSE` (complying with MS spec §7.4 for read-only cards).
+    - The CSP queries `"Read Only Mode"`, gets `TRUE`.
    - The CSP reads `mscp\cmapfile`, finds `"eUDS Container 00"`.
    - The CSP calls `CardGetContainerInfo(0)`, gets the public key.
    - The CSP reads the certificate from `mscp\kxc00`.
