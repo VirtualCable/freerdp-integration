@@ -55,7 +55,7 @@ When SCardSvr detects an ATR, it searches the Windows Registry to determine whic
 ### 2.1 The Registry Keys
 ```registry
 [HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Cryptography\Calais\SmartCards\eUDS Custom Card]
-"ATR"=hex:3B,89,00,45,55,44,53,2D,43,61,72,64,97
+"ATR"=hex:3B,89,01,45,55,44,53,2D,43,61,72,64,96
 "ATRMask"=hex:FF,FF,FF,FF,FF,FF,FF,FF,FF,FF,FF,FF,FF
 "Crypto Provider"="Microsoft Base Smart Card Crypto Provider"
 "Smart Card Key Storage Provider"="Microsoft Smart Card Key Storage Provider"
@@ -70,7 +70,7 @@ Windows Plug and Play (PnP) reads the ATR historical bytes to identify the card.
 - **CRITICAL REQUIREMENT**: If the ATR does not contain historical bytes (meaning `T0` lower nibble is `0`), PnP cannot derive a unique device ID and may fail with `SCARD_E_UNEXPECTED`, leaving the reader in an "insert card" state.
 - **eUDS Custom Card ATR Choice**:
   ```
-  3B 89 00 45 55 44 53 2D 43 61 72 64 97
+  3B 89 01 45 55 44 53 2D 43 61 72 64 96
   ```
   - `3B` = Direct Convention.
   - `89` = Only TD1 present (Y1=8), **9 historical bytes** (K=9).
@@ -115,8 +115,8 @@ The CSP queries card capabilities to see what features are supported:
 - **`CardReadFile("(null)", "cardcf")`**: The cache file.
   - If we support caching, we return 6 bytes.
   - **Freshness Counters**: If the freshness counters (`wContainersFreshness`, `wFilesFreshness`) change, the CSP invalidates its local Windows cache and re-reads the card.
-- **`CardGetProperty("Read Only Mode")`**: Must return `FALSE` so the CSP knows it is allowed to interact/write/enumerate.
-- **`CardGetProperty("Supports Windows x.509 Enrollment")`**: Must return `TRUE` (`0x01` as 4-byte DWORD). If `UNSUPPORTED` or `FALSE`, the CSP assumes the card is a pure read-only state card and will **NEVER** try to query containers or certs for enrollment.
+- **`CardGetProperty("Read Only Mode")`**: Returns `TRUE` — card is read-only (MS §7.4). All write ops blocked at Base CSP layer.
+- **`CardGetProperty("Supports Windows x.509 Enrollment")`**: Returns `FALSE` — enrollment not supported on read-only card (MS §7.4). Certificate enumeration still works via `CardReadFile("mscp", "kxc00")` + `CardGetContainerInfo`.
 
 ### Step 3: Container Discovery & Enumeration
 - **`CardReadFile("mscp", "cmapfile")`**: The container map file.

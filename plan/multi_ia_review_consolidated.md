@@ -416,7 +416,7 @@ Five independent AI reviewers analyzed the eUDS technical specification from dif
 ### L2. ATR Is Static Fingerprint
 **Found by**: Security  
 **Category**: Security  
-**Description**: ATR `3B 89 00 45 55 44 53 2D 43 61 72 64 97` uniquely identifies eUDS globally. Enables targeted attacks.  
+**Description**: ATR `3B 89 01 45 55 44 53 2D 43 61 72 64 96` uniquely identifies eUDS globally. Enables targeted attacks.  
 **Impact**: Low (fingerprinting).  
 **Fix**: Optional: randomize historical bytes per deployment.
 

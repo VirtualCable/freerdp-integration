@@ -3,7 +3,7 @@
 > **Status**: DESIGN REVIEW — Pending implementation
 > **Target**: `crates/channels/src/smartcard/emulated/`
 > **Platform**: Multiplatform (Windows, Linux, macOS)
-> **Dependencies**: `rsa`, `num-bigint`, `flate2`, `rand`, `pem` (existing)
+> **Dependencies**: `rsa`, `num-bigint`, `rand`, `pem` (existing)
 
 ---
 
@@ -31,7 +31,7 @@ crates/channels/src/smartcard/emulated/
 ├── helpers.rs             # Existing — VERIFY/EXTEND extended APDU parsing
 ├── euds_types.rs          # NEW — Core types (PinMode, SessionState, EudsEngine)
 ├── euds_engine.rs         # NEW — Main engine logic
-├── mod.rs                 # MODIFY — Replace GidsEngine with EudsEngine
+├── mod.rs                 # MODIFY — Add EudsEngine as new emulated backend
 ├── tests.rs               # MODIFY — Replace GIDS tests with eUDS tests
 ├── types.rs               # DEPRECATE (move to euds_types.rs)
 └── consts.rs              # ADD eUDS constants (INS, CLA, SW, ATR, AID)
@@ -52,14 +52,12 @@ crates/channels/src/smartcard/emulated/
 
 // APDU Class
 pub const EUDS_CLA: u8 = 0x80;           // Proprietary class
-pub const EUDS_CLA_CHAINING: u8 = 0x90;  // CLA | 0x10 (chaining bit)
-
 // APDU Instructions
 pub const EUDS_INS_SELECT: u8 = 0xA4;    // Standard SELECT (CLA=0x00)
 pub const EUDS_INS_VERIFY: u8 = 0x20;    // VERIFY PIN
 pub const EUDS_INS_GET_CERT: u8 = 0xB0;  // READ BINARY (extended)
 pub const EUDS_INS_GET_PUBKEY: u8 = 0x46; // GET PUBLIC KEY (custom)
-pub const EUDS_INS_GET_RESP_GET_RESPONSE: u8 = 0xC0; // GET RESPONSE (T=0 chaining)
+pub const EUDS_INS_GET_RESPONSE: u8 = 0xC0; // GET RESPONSE (chaining)
 pub const EUDS_INS_PSO: u8 = 0x2A;       // PERFORM SECURITY OPERATION
 
 // PSO P1/P2
@@ -86,10 +84,10 @@ pub const SW_INVALID_COMMAND_DATA: u16 = 0x6A80;
 
 // eUDS ATR (corrected ISO 7816-3)
 pub const EUDS_ATR: &[u8] = &[
-    0x3B, 0x89, 0x00, 0x45, 0x55, 0x44, 0x53, 0x2D, 0x43, 0x61, 0x72, 0x64, 0x97
+    0x3B, 0x89, 0x01, 0x45, 0x55, 0x44, 0x53, 0x2D, 0x43, 0x61, 0x72, 0x64, 0x96
 ];
-// 3B 89 00 45 55 44 53 2D 43 61 72 64 97
-// TS=3B, T0=89 (Y1=8, K=9), TD1=00 (T=0), H="eUDS-Card", TCK=97
+// 3B 89 01 45 55 44 53 2D 43 61 72 64 96
+// TS=3B, T0=89 (Y1=8, K=9), TD1=01 (T=1), H="eUDS-Card", TCK=96
 
 // Reader name
 pub const EUDS_READER_NAME: &str = "eUDS Virtual Smartcard Reader";
@@ -116,17 +114,37 @@ pub enum PinMode {
     NotRequired,
 }
 
-/// Per-connection session state (only used if PinMode::Required)
-#[derive(Debug, Default, Clone)]
+/// Per-connection session state
+#[derive(Debug, Clone)]
 pub struct SessionState {
     pub pin_verified: bool,
     pub pin_retries: u8,
-    /// Chaining state for responses > 256 bytes (GET PUBLIC KEY, GET CERTIFICATE)
+    /// Chaining state for responses > 256 bytes
     pub chaining_buffer: Option<Vec<u8>>,
+}
+
+/// Manual Default: pin_retries must start at DEFAULT_PIN_RETRIES (3), NOT 0
+impl Default for SessionState {
+    fn default() -> Self {
+        SessionState {
+            pin_verified: false,
+            pin_retries: super::consts::DEFAULT_PIN_RETRIES,
+            chaining_buffer: None,
+        }
+    }
 }
 
 /// Per-connection session key
 pub type ConnectionId = u64;
+
+/// APDU header parsed from raw APDU bytes
+#[derive(Debug, Clone, Copy)]
+pub struct ApduHeader {
+    pub cla: u8,
+    pub ins: u8,
+    pub p1: u8,
+    pub p2: u8,
+}
 
 /// Main eUDS Engine state
 pub struct EudsEngine {
@@ -142,12 +160,12 @@ pub struct EudsEngine {
     pub n: BigUint,
     /// RSA private exponent (d)
     pub d: BigUint,
+    /// RSA public exponent (e) — extracted from key, NOT hardcoded
+    pub e: BigUint,
     /// Key size in bytes (e.g., 256 for RSA-2048)
     pub key_size: usize,
-    /// Public exponent (usually 65537)
-    pub e: BigUint,
-    /// Per-connection session state (only populated if PinMode::Required)
-    pub sessions: std::collections::HashMap<u64, SessionState>,
+    /// Per-connection session state
+    pub sessions: HashMap<u64, SessionState>,
 }
 
 /// Default PIN retry count
@@ -178,23 +196,23 @@ impl EudsEngine {
         pin: String,
         pin_mode: PinMode,
     ) -> Self {
+        // Extract n, e, d from the private key via PKCS#1 DER parsing
         let pkcs1_der = private_key
             .to_pkcs1_der()
             .expect("failed to serialize RSA key to PKCS#1 DER");
-        let (n, d) = super::helpers::parse_rsa_pkcs1_components(pkcs1_der.as_bytes())
-            .expect("failed to parse RSA PKCS#1 components");
+        let (n, e, d) = super::helpers::parse_rsa_pkcs1_components(pkcs1_der.as_bytes())
+            .expect("failed to parse RSA PKCS#1 components (n, e, d)");
         let key_size = (n.bits() as usize).div_ceil(8);
-        let e = BigUint::from(65537u32);
 
         EudsEngine {
             cert_der,
             private_key,
             pin_mode,
-            pin: pin,
+            pin,
             n,
             d,
-            key_size,
             e,
+            key_size,
             sessions: HashMap::new(),
         }
     }
@@ -214,11 +232,11 @@ impl EudsEngine {
         };
         let (data, le) = extract_apdu_data(apdu);
 
-        // Command chaining: CLA bit 4 set + INS=0x2A
-        if header.ins == EUDS_INS_PSO && (header.cla & 0x10) != 0 {
-            // Chaining not strictly needed for our APDUs (all fit in single APDU)
-            // but keep for compatibility
-            return make_status(SW_MORE_DATA);
+        // Clear stale chaining buffer on any new command (except GET RESPONSE)
+        if header.ins != EUDS_INS_GET_RESPONSE {
+            if let Some(session) = self.sessions.get_mut(&conn_id) {
+                session.chaining_buffer = None;
+            }
         }
 
         match header.ins {
@@ -296,15 +314,18 @@ impl EudsEngine {
     // GET PUBLIC KEY (INS=0x46, CLA=0x80)
     // ---------------------------------------------------------------------
     fn get_public_key(&mut self, conn_id: ConnectionId) -> Vec<u8> {
-        // Response format: TLV with exponent (tag 0x81) and modulus (tag 0x82)
-        let exp_bytes = self.e.to_bytes_be(); // 65537 = 01 00 01
+        // Response format: raw length-prefixed (NOT TLV)
+        // [exp_len:2 BE] [exponent] [mod_len:2 BE] [modulus]
+        let exp_bytes = self.e.to_bytes_be(); // typically 3 bytes: 01 00 01
         let mod_bytes = self.n.to_bytes_be(); // 256 bytes for RSA-2048
 
-        let mut resp = Vec::new();
-        tlv_write(&mut resp, 0x81, &exp_bytes);   // tag 0x81 = exponent
-        tlv_write(&mut resp, 0x82, &mod_bytes);   // tag 0x82 = modulus
+        let mut resp = Vec::with_capacity(2 + exp_bytes.len() + 2 + mod_bytes.len());
+        resp.extend_from_slice(&(exp_bytes.len() as u16).to_be_bytes());
+        resp.extend_from_slice(&exp_bytes);
+        resp.extend_from_slice(&(mod_bytes.len() as u16).to_be_bytes());
+        resp.extend_from_slice(&mod_bytes);
 
-        // Total: 2 + 3 + 2 + 256 = 263 bytes → will use GET RESPONSE chaining
+        // Total: 2 + 3 + 2 + 256 = 263 bytes → may need chaining
         self.handle_chaining(conn_id, &resp)
     }
 
@@ -476,18 +497,16 @@ impl EudsEngine {
     }
 }
 
-// -------------------------------------------------------------------------
-// Secure Zeroization on Drop
-// -------------------------------------------------------------------------
-impl Drop for EudsEngine {
-    fn drop(&mut self) {
-        use zeroize::Zeroize;
-        // Zeroize private key material and PIN passphrase
-        self.private_key.zeroize();
-        self.pin.zeroize();
-        self.sessions.clear();
-    }
-}
+// Note: Drop impl with zeroize omitted for MVP.
+// To enable: add "zeroize" to rsa crate features, then implement:
+//   impl Drop for EudsEngine {
+//       fn drop(&mut self) {
+//           use zeroize::Zeroize;
+//           self.private_key.zeroize();
+//           self.pin.zeroize();
+//           self.sessions.clear();
+//       }
+//   }
 
 // -------------------------------------------------------------------------
 // Helper: Response builders (move to helpers.rs or keep here)
@@ -600,22 +619,27 @@ pub fn extract_apdu_data(apdu: &[u8]) -> (&[u8], Option<u16>) {
     (&[], None)
 }
 
-/// Parse RSA PKCS#1 private key DER → (n, d)
-pub fn parse_rsa_pkcs1_components(der: &[u8]) -> Option<(BigUint, BigUint)> {
+/// Parse RSA PKCS#1 private key DER → (n, e, d)
+/// PKCS#1 structure: SEQUENCE { version, modulus(n), publicExponent(e), privateExponent(d), ... }
+pub fn parse_rsa_pkcs1_components(der: &[u8]) -> Option<(BigUint, BigUint, BigUint)> {
     let mut pos = 0;
     if der[pos] != 0x30 {
         return None;
     }
     pos += 1;
     pos += read_der_length(&der[pos..])?.1;
+    // Skip version INTEGER
     let (_, after) = read_integer(&der[pos..])?;
     pos += after;
+    // Read modulus (n)
     let (n, after) = read_integer(&der[pos..])?;
     pos += after;
-    let (_, after) = read_integer(&der[pos..])?;
+    // Read public exponent (e) — previously skipped!
+    let (e, after) = read_integer(&der[pos..])?;
     pos += after;
+    // Read private exponent (d)
     let (d, _) = read_integer(&der[pos..])?;
-    Some((n, d))
+    Some((n, e, d))
 }
 
 fn read_der_length(data: &[u8]) -> Option<(usize, usize)> {
@@ -769,7 +793,7 @@ fn status(&self, _: &ScardHandle) -> Result<ScardStatus, u32> {
     Ok(ScardStatus {
         reader_names: vec![EUDS_READER_NAME.to_string()],
         state: SCARD_STATE_PRESENT,
-        protocol: SCARD_PROTOCOL_T0,
+        protocol: SCARD_PROTOCOL_T1,
         atr: EUDS_ATR.to_vec(),  // NEW ATR
     })
 }
@@ -811,8 +835,8 @@ impl EmulatedBackend {
 // 5. transmit() — pass connection_id to engine
 fn transmit(&self, handle: &ScardHandle, _: &ScardIORequest, data: &[u8]) -> Result<TransmitResult, u32> {
     let mut engine = self.engine.lock().map_err(|_| SCARD_F_INTERNAL_ERROR)?;
-    // Use handle as connection_id (or derive from it)
-    let conn_id = handle.0 as u64; // ScardHandle wraps u32
+    // ScardHandle has a private u64 field — use .raw() accessor
+    let conn_id = handle.raw();
     Ok(TransmitResult {
         recv_pci: None,
         recv_buffer: engine.process_apdu(conn_id, data),
@@ -822,7 +846,7 @@ fn transmit(&self, handle: &ScardHandle, _: &ScardIORequest, data: &[u8]) -> Res
 
 ---
 
-## 7. Tests — `tests.rs` (REPLACE)
+## 8. Tests — `tests.rs` (REPLACE)
 
 ```rust
 // crates/channels/src/smartcard/emulated/tests.rs
@@ -842,7 +866,8 @@ mod tests {
     #[test]
     fn test_select_euds_applet() {
         let mut engine = test_engine(PinMode::NotRequired);
-        let apdu = vec![0x00, 0xA4, 0x04, 0x00, 0x09] + EUDS_AID;
+        let mut apdu = vec![0x00, 0xA4, 0x04, 0x00, 0x09];
+        apdu.extend(EUDS_AID);
         let resp = engine.process_apdu(1, &apdu);
         assert_eq!(resp, vec![0x90, 0x00]);
     }
@@ -874,7 +899,7 @@ mod tests {
     #[test]
     fn test_verify_pin_wrong() {
         let mut engine = test_engine(PinMode::Required);
-        let apdu = vec![0x80, 0x20, 0x00, 0x80, 0x04, 0x77, 0x72, 0x6F, 0x6E, 0x67];
+        let apdu = vec![0x80, 0x20, 0x00, 0x80, 0x05, 0x77, 0x72, 0x6F, 0x6E, 0x67];
         let resp = engine.process_apdu(1, &apdu);
         assert_eq!(resp[0], 0x63); // SW_VERIFY_FAILED
         assert_eq!(resp[1], 0xC2); // 2 retries left
@@ -883,7 +908,7 @@ mod tests {
     #[test]
     fn test_get_certificate() {
         let mut engine = test_engine(PinMode::NotRequired);
-        // Extended APDU Case 2: 80 B0 00 00 00 00 00
+        // Extended APDU Case 2: 80 B0 00 00 00 00
         let apdu = vec![0x80, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x00];
         let resp = engine.process_apdu(1, &apdu);
         assert!(resp.ends_with(&[0x90, 0x00]));
@@ -956,16 +981,29 @@ mod tests {
 
     #[test]
     fn test_decrypt_extended_apdu() {
-        let mut engine = test_engine(PinMode::Required);
+        use rsa::{Pkcs1v15Encrypt, RsaPublicKey};
+        let private_key = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let cert_der = vec![0x30, 0x82];
+        let mut engine = EudsEngine::new(cert_der, private_key.clone(), "testpin".to_string(), PinMode::Required);
         // Verify PIN
         let verify = vec![0x80, 0x20, 0x00, 0x80, 0x04, 0x74, 0x65, 0x73, 0x74];
         engine.process_apdu(1, &verify);
+
+        // Encrypt a known plaintext with the public key
+        let pub_key = RsaPublicKey::from(&private_key);
+        let plaintext = b"eUDS test payload!";
+        let ciphertext = pub_key.encrypt(&mut rand::thread_rng(), Pkcs1v15Encrypt, plaintext).unwrap();
+        assert_eq!(ciphertext.len(), 256); // RSA-2048
+
         // DECRYPT Extended APDU Case 4: 80 2A 80 86 00 01 00 [256B] 00 00
         let mut decrypt = vec![0x80, 0x2A, 0x80, 0x86, 0x00, 0x01, 0x00];
-        decrypt.extend(vec![0x42; 256]); // dummy ciphertext
-        decrypt.extend([0x00, 0x00]); // Le
+        decrypt.extend(&ciphertext);
+        decrypt.extend([0x00, 0x00]); // Le = 2 bytes (extended, 0 = max)
         let resp = engine.process_apdu(1, &decrypt);
         assert!(resp.ends_with(&[0x90, 0x00]));
+        // Verify decrypted data matches original
+        let decrypted = &resp[..resp.len() - 2];
+        assert_eq!(decrypted, plaintext);
     }
 
     #[test]
@@ -985,8 +1023,8 @@ mod tests {
         // ATR check would be in EmulatedBackend::status()
         // Verify constant
         assert_eq!(EUDS_ATR, &[
-            0x3B, 0x89, 0x00, 0x45, 0x55, 0x44, 0x53, 0x2D,
-            0x43, 0x61, 0x72, 0x64, 0x97
+            0x3B, 0x89, 0x01, 0x45, 0x55, 0x44, 0x53, 0x2D,
+            0x43, 0x61, 0x72, 0x64, 0x96
         ]);
     }
 
@@ -1006,15 +1044,14 @@ mod tests {
 
 ---
 
-## 8. Cargo.toml Dependencies (Verify)
+## 9. Cargo.toml Dependencies (Verify)
 
 ```toml
 # crates/channels/Cargo.toml — verify these exist
 [dependencies]
-rsa = { version = "0.9", features = ["pkcs1v15", "pkcs8", "sha1", "sha2"] }
+rsa = { version = "0.9", features = ["pkcs1v15", "pkcs8", "sha1", "sha2", "pkcs1"] }
 num-bigint = "0.4"
 num-traits = "0.2"
-flate2 = "1.0"
 pem = "1.0"
 rand = "0.8"
 sha1 = "0.10"
@@ -1025,7 +1062,7 @@ zeroize = "1.0"  # for future key zeroization
 
 ---
 
-## 9. Environment Variables (Documentation)
+## 10. Environment Variables (Documentation)
 
 ```bash
 # ============================================================================
@@ -1066,7 +1103,7 @@ UDS_SMARTCARD_PIN=mypassphrase
 
 ---
 
-## 10. Implementation Checklist
+## 11. Implementation Checklist
 
 | Step | File | Action | Status |
 |------|------|--------|--------|
@@ -1074,15 +1111,15 @@ UDS_SMARTCARD_PIN=mypassphrase
 | 2 | `euds_engine.rs` | Create new file with process_apdu + 6 APDU handlers | ⏳ |
 | 3 | `consts.rs` | Add eUDS constants (INS, CLA, SW, ATR, AID) | ⏳ |
 | 4 | `helpers.rs` | Verify extended APDU parsing (Case 2, Case 4) | ⏳ |
-| 5 | `mod.rs` | Replace GidsEngine → EudsEngine, update ATR, PinMode detection | ⏳ |
+| 5 | `mod.rs` | Add EudsEngine alongside existing backends, update ATR, PinMode detection | ⏳ |
 | 6 | `tests.rs` | Replace GIDS tests with eUDS tests | ⏳ |
 | 7 | `types.rs` | Deprecate (move VirtualFs, SessionState to euds_types if needed) | ⏳ |
-| 8 | `Cargo.toml` | Verify deps (rsa, num-bigint, flate2, rand, sha1, sha2, zeroize) | ⏳ |
+| 8 | `Cargo.toml` | Verify deps (rsa, num-bigint, rand, sha1, sha2, zeroize) | ⏳ |
 | 9 | Build & Test | `cargo test -p channels smartcard::emulated` | ⏳ |
 
 ---
 
-## 11. Notes for Implementation
+## 12. Notes for Implementation
 
 1. **Connection ID**: Use `ScardHandle`'s internal ID as `ConnectionId`. The handle is created per `connect()` call.
 
@@ -1090,9 +1127,9 @@ UDS_SMARTCARD_PIN=mypassphrase
 
 3. **Extended APDU**: Critical for DECRYPT (256-byte ciphertext > 255 short APDU limit). Verify `helpers.rs` handles Case 4 correctly.
 
-4. **OAEP Decrypt**: Currently only PKCS#1 v1.5 implemented. Add OAEP if minidriver requests it (future).
+5. **OAEP Decrypt**: Currently only PKCS#1 v1.5 implemented. Add OAEP if minidriver requests it (future).
 
-4. **Zeroize**: Use `zeroize` crate for sensitive data in `Drop` impl (future hardening).
+6. **Zeroize**: Use `zeroize` crate for sensitive data in `Drop` impl (future hardening).
 
 5. **Thread Safety**: `Mutex<EudsEngine>` in `EmulatedBackend` — fine for MVP.
 
@@ -1100,14 +1137,14 @@ UDS_SMARTCARD_PIN=mypassphrase
 
 ---
 
-## 12. Review Checklist for External AI
+## 13. Review Checklist for External AI
 
 When reviewing, please verify:
 
 - [ ] APDU formats match spec (Case 2 for GET CERT, Case 4 for DECRYPT)
 - [ ] SIGN APDU includes Le=00 (short) or Le=0000 (extended) — **critical**
 - [ ] DECRYPT uses Extended APDU Case 4 with Le=0000
-- [ ] GET PUBLIC KEY response format (TLV tags 0x81/0x82) is parseable by minidriver
+- [ ] GET PUBLIC KEY response format (raw length-prefixed: exp_len+exp+mod_len+mod) is parseable by minidriver
 - [ ] PinMode detection from PEM header is correct
 - [ ] EmptyPinType → no PIN APDU needed, SIGN/DECRYPT work directly
 - [ ] Per-connection session state isolation works

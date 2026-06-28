@@ -39,14 +39,14 @@ The previously planned ATR `3B F7 18 00 00 80 31 FE 45 55 44 53 2D 43 61 72 64 C
 ### 1.2 Corrected ATR
 
 ```
-3B 89 00 45 55 44 53 2D 43 61 72 64 97
+3B 89 01 45 55 44 53 2D 43 61 72 64 96
 ```
 
 | Byte | Value | Meaning |
 |------|-------|---------|
 | TS | `3B` | Direct convention |
 | T0 | `89` | Y1=8 (only TD1 present), K=9 (9 historical bytes) |
-| TD1 | `00` | Y2=0 (no more interface bytes), T=0 (protocol T=0) |
+| TD1 | `01` | Y2=0 (no more interface bytes), T=1 (protocol T=1) |
 | H1 | `45` | `'e'` |
 | H2 | `55` | `'U'` |
 | H3 | `44` | `'D'` |
@@ -56,15 +56,15 @@ The previously planned ATR `3B F7 18 00 00 80 31 FE 45 55 44 53 2D 43 61 72 64 C
 | H7 | `61` | `'a'` |
 | H8 | `72` | `'r'` |
 | H9 | `64` | `'d'` |
-| TCK | `97` | Checksum (XOR of T0..H9) |
+| TCK | `96` | Checksum (XOR of T0..H9) |
 
 **Total length**: 13 bytes (well within 36-byte RDP limit)
 
 ### 1.3 TCK Verification
 
 ```
-XOR chain: 89 ^ 00 ^ 45 ^ 55 ^ 44 ^ 53 ^ 2D ^ 43 ^ 61 ^ 72 ^ 64 = 97
-Verify:    97 ^ 97 = 00 ✓
+XOR chain: 89 ^ 01 ^ 45 ^ 55 ^ 44 ^ 53 ^ 2D ^ 43 ^ 61 ^ 72 ^ 64 = 96
+Verify:    96 ^ 96 = 00 ✓
 ```
 
 ### 1.4 ATRMask
@@ -74,12 +74,13 @@ Exact match (all FF):
 FF FF FF FF FF FF FF FF FF FF FF FF FF
 ```
 
-### 1.5 Why T=0?
+### 1.5 Why T=1?
 
-- The FreeRDP addon already handles GET RESPONSE chaining (`61 XX`) automatically
-- The emulated engine processes APDUs at the byte level (no T=0/T=1 framing)
-- T=0 is the most widely supported protocol in minidriver implementations
-- Simpler than T=1 for our use case
+- **T=1 is required** because DECRYPT uses Extended APDU Case 4 (256-byte Lc > 255 short limit). T=0 cannot carry extended APDUs natively; Windows PC/SC would convert them to ENVELOPE chaining (INS 0xC3) which the engine does not handle.
+- T=1 supports extended APDUs (Lc/Le up to 65535) natively — no ENVELOPE needed
+- The FreeRDP addon passes APDUs transparently regardless of protocol
+- TCK is mandatory for T=1 (ISO 7816-3), which is correct for our ATR
+- The engine still implements T=0-style `61 XX` GET RESPONSE chaining as a fallback for responses > 256 bytes (GET PUBLIC KEY 263B, large certs). This is harmless under T=1 — the FreeRDP addon handles it transparently.
 
 ---
 
@@ -152,7 +153,7 @@ Retrieves the X.509 certificate in DER format. Used by the minidriver to serve `
 
 **Case 2 Extended APDU** (no data in, data out — standard READ BINARY):
 ```
-C-APDU: 80 B0 00 00 00 00 00
+C-APDU: 80 B0 00 00 00 00
         │  │  │  │  │  │  └── Le_lo = 00
         │  │  │  │  │  └── Le_hi = 00 (Le = 0 = return all available)
         │  │  │  │  └── Extended length indicator
@@ -174,7 +175,7 @@ R-APDU: [DER_bytes] 90 00
 
 **Fallback for engines that don't support extended APDU**:
 ```
-C-APDU: 80 B0 00 00 00    (Le=00 in short format = 256 bytes)
+C-APDU: 80 B0 00 00    (Le=00 in short format = 256 bytes)
 R-APDU: [256 bytes] 61 XX  (XX = remaining bytes, engine uses GET RESPONSE chaining)
 ```
 The FreeRDP addon handles `61 XX` chaining automatically.
@@ -226,7 +227,7 @@ C-APDU: 80 2A 9E 9A [Lc] [DigestInfo_and_Hash] 00
         │  │  │  │  │   └── DigestInfo + Hash bytes
         │  │  │  │  └── Lc = length of data
         │  │  │  └── P2 = 9A (sign hash)
-        │  │  └── P1 = 9E (CRT = sign with private key)
+        │  │  └── P1 = 9E (sign with private key)
         │  └── INS = 2A (PERFORM SECURITY OPERATION)
         └── CLA = 80 (proprietary)
 
@@ -337,7 +338,7 @@ Byte 4-5: wFilesFreshness    = 0x0001 (LE, incremented when files change)
 **Access condition**: `EveryoneReadUserWriteAc`
 
 **Notes**:
-- `bPinsFreshness` should increment when PIN state changes (verify/deauthenticate)
+- For a read-only card, all freshness counters are STATIC (no PIN changes supported)
 - For our read-only card, containers and files never change, so their counters stay constant
 - The Base CSP uses these to decide whether to re-read cached data
 
@@ -348,7 +349,7 @@ Byte 4-5: wFilesFreshness    = 0x0001 (LE, incremented when files change)
 **Content**: 8 bytes
 
 ```
-6D 73 63 70 00 00 00 00
+6D 73 63 70 00 00 00
 m  s  c  p  \0 \0 \0 \0
 ```
 
@@ -549,43 +550,27 @@ unsafe extern "system" fn CardAuthenticateEx(
         return SCARD_E_INVALID_PARAMETER; // Only PIN 1 (ROLE_USER) supported
     }
 
-    // 2. Handle flags
-    let silent = (dwFlags & CARD_PIN_SILENT_CONTEXT) != 0;
-    let gen_session = (dwFlags & CARD_AUTHENTICATE_GENERATE_SESSION_PIN) != 0;
-    let use_session = (dwFlags & CARD_AUTHENTICATE_SESSION_PIN) != 0;
+    // 2. Handle flags — session PIN not supported (PLAINTEXT only per CP_CARD_PIN_STRENGTH_VERIFY)
+    if (dwFlags & CARD_AUTHENTICATE_GENERATE_SESSION_PIN) != 0
+        || (dwFlags & CARD_AUTHENTICATE_SESSION_PIN) != 0
+    {
+        return SCARD_E_UNSUPPORTED_FEATURE;
+    }
+    // CARD_PIN_SILENT_CONTEXT is advisory only (don't show UI) — handled by CSP, ignored by us
 
     // 3. Get context
     let ctx = get_context(pCardData);
 
-    // 4. If session PIN requested, use it instead of pbPinData
-    let pin_bytes = if use_session {
-        // Session PIN should have been cached from previous GENERATE_SESSION_PIN
-        ctx.get_session_pin()
-    } else {
-        // Regular PIN: pbPinData is ANSI bytes
-        slice::from_raw_parts(pbPinData, cbPinData as usize)
-    };
-
-    // 5. Send VERIFY PIN APDU to engine
+    // 4. Send VERIFY PIN APDU to engine with the plaintext PIN
+    let pin_bytes = slice::from_raw_parts(pbPinData, cbPinData as usize);
     let apdu = build_verify_pin_apdu(pin_bytes);
     let response = transmit_apdu(pCardData, &apdu)?;
 
-    // 6. Parse response
+    // 5. Parse response
     match response.sw {
         0x9000 => {
             ctx.set_pin_verified(true);
-            ctx.increment_pin_freshness();
-            
-            // 7. Handle session PIN generation if requested
-            if gen_session {
-                let session_pin = generate_session_pin();
-                ctx.set_session_pin(session_pin.clone());
-                // Return session PIN to CSP
-                *ppbSessionPin = csp_alloc(session_pin.len())?;
-                copy_to_csp(session_pin, *ppbSessionPin);
-                *pcbSessionPin = session_pin.len() as DWORD;
-            }
-            
+
             if let Some(attempts) = pcAttemptsRemaining.as_mut() {
                 *attempts = ctx.get_pin_retries();
             }
@@ -600,7 +585,7 @@ unsafe extern "system" fn CardAuthenticateEx(
             if retries == 0 {
                 ctx.set_pin_blocked(true);
             }
-            SCARD_W_WRONG_CHV  // Corrected to comply with MS spec §4.2.6!
+            SCARD_W_WRONG_CHV  // Per MS spec §4.2.6
         }
         0x6983 => {
             // PIN blocked
@@ -614,11 +599,11 @@ unsafe extern "system" fn CardAuthenticateEx(
 
 **Flags handling**:
 
-| Flag | Value | Meaning | Our Handling |
-|------|-------|---------|--------------|
-| `CARD_AUTHENTICATE_GENERATE_SESSION_PIN` | 0x00000001 | Generate session PIN | Generate random, cache, return |
-| `CARD_AUTHENTICATE_SESSION_PIN` | 0x00000002 | Use session PIN | Use cached session PIN |
-| `CARD_PIN_SILENT_CONTEXT` | 0x00000010 | No UI prompts | Just don't show UI (handled by CSP) |
+| Flag | Value | Our Handling |
+|------|-------|--------------|
+| `CARD_PIN_SILENT_CONTEXT` | 0x00000010 | Advisory only — ignored (CSP handles UI) |
+| `CARD_AUTHENTICATE_GENERATE_SESSION_PIN` | 0x00000001 | `SCARD_E_UNSUPPORTED_FEATURE` (session PIN not supported) |
+| `CARD_AUTHENTICATE_SESSION_PIN` | 0x00000002 | `SCARD_E_UNSUPPORTED_FEATURE` |
 
 ---
 
@@ -639,8 +624,6 @@ unsafe extern "system" fn CardDeauthenticateEx(
     // We only support ROLE_USER (bit 1 / PinId 1)
     if active_pins & 0x02 != 0 {
         ctx.set_pin_verified(false);
-        ctx.clear_session_pin();
-        ctx.increment_pin_freshness();
     }
 
     // Other PINs not supported but don't error
@@ -707,7 +690,7 @@ CARD_FREE_SPACE_INFO {
 ```rust
 PIN_INFO {
     dwVersion: 6,
-    PinType: AlphaNumericPinType,       // 1
+    PinType: AlphaNumericPinType,       // 0 (AlphaNumericPinType = 0 per MS spec §4.2.1)
     PinPurpose: AuthenticationPin,      // 1
     dwChangePermission: 0,              // No one can change
     dwUnblockPermission: 0,             // No one can unblock
@@ -751,16 +734,14 @@ PIN_INFO {
 
 ### 5.4 CardSetProperty — Writable Properties
 
-The following properties **MUST** be writable (not return `SCARD_E_UNSUPPORTED_FEATURE`):
+For a read-only card, MS spec §7.4 specifies that **only** the following properties may be set:
 
 | Property | Writable By | Action |
 |----------|-------------|--------|
-| `CP_CARD_CACHE_MODE` ("Cache Mode") | Administrator | Update cache mode (SESSION_ONLY/NO_CACHE/GLOBAL) |
-| `CP_CARD_PIN_INFO` ("PIN Information") | Administrator | Update PIN policy (retry count, cache policy, etc.) |
 | `CP_PARENT_WINDOW` ("Parent Window") | Everyone | Store HWND for external PIN entry UI |
 | `CP_PIN_CONTEXT_STRING` ("PIN Context String") | Everyone | Store context string for external PIN entry |
 
-All other properties are read-only and must return `SCARD_E_UNSUPPORTED_FEATURE` or `SCARD_W_SECURITY_VIOLATION` if set.
+All other properties (including `CP_CARD_CACHE_MODE`, `CP_CARD_PIN_INFO`, `CP_CARD_READ_ONLY`, etc.) must return `SCARD_E_UNSUPPORTED_FEATURE` or `SCARD_W_SECURITY_VIOLATION` if set.
 
 ---
 
@@ -772,7 +753,7 @@ This is the exact sequence of calls the Base CSP makes when `certutil -scinfo` o
 
 ```
 1. SCardSvr detects card insertion (via RDP redirect)
-2. SCardSvr reads ATR: 3B 89 00 45 55 44 53 2D 43 61 72 64 97
+2. SCardSvr reads ATR: 3B 89 01 45 55 44 53 2D 43 61 72 64 96
 3. SCardSvr matches ATR against Calais database
 4. Finds "eUDS Custom Card" entry
 5. Loads euds_minidriver.dll
@@ -846,7 +827,7 @@ This is the exact sequence of calls the Base CSP makes when `certutil -scinfo` o
 20. CardAuthenticateEx(PinId=1, dwFlags=0, pbPinData="1234")
     → Minidriver sends VERIFY PIN APDU: 80 20 00 80 04 31 32 33 34
     → Engine verifies PIN
-    → Returns: SCARD_S_SUCCESS (or SCARD_E_INVALID_VALUE if wrong)
+    → Returns: SCARD_S_SUCCESS (or SCARD_W_WRONG_CHV if wrong; SCARD_W_CHV_BLOCKED if blocked)
 ```
 
 ### 6.5 Phase 5: Cryptographic Operations
@@ -868,7 +849,7 @@ This is the exact sequence of calls the Base CSP makes when `certutil -scinfo` o
 ### 6.6 Visual Flow
 
 ```
-Windows                    Minidriver                    Engine (Linux)
+Windows                    Minidriver                    Engine (Client)
   │                           │                              │
   │──CardAcquireContext──────►│                              │
   │◄──SUCCESS─────────────────│                              │
@@ -880,10 +861,10 @@ Windows                    Minidriver                    Engine (Linux)
   │◄──6 bytes─────────────────│                              │
   │                           │                              │
   │──GetProperty(ReadOnly)───►│                              │
-  │◄──FALSE───────────────────│                              │
+  │◄──TRUE────────────────────│                              │
   │                           │                              │
   │──GetProperty(X509Enroll)─►│                              │
-  │◄──TRUE────────────────────│  ★ CRITICAL                  │
+  │◄──FALSE───────────────────│  Read-only card (MS §7.4)    │
   │                           │                              │
   │──ReadFile(cardapps)──────►│                              │
   │◄──"mscp\0\0\0\0"─────────│                              │
@@ -946,6 +927,8 @@ Offset  Size  Field           Value           Description
 ```
 
 **Total size**: 283 bytes
+
+**Endianness**: All ULONG header fields (Magic, BitLength, cbPublicExp, cbModulus, cbPrime1, cbPrime2) are serialized **little-endian** (Windows native). Exponent and Modulus are **big-endian** (RSA standard).
 
 ### 7.3 SIGN Operation Flow
 
@@ -1061,7 +1044,7 @@ The minidriver must map APDU response status words (the last 2 bytes of any R-AP
 | `0x6A82` | `SCARD_E_FILE_NOT_FOUND` (0x80100024) | File not found |
 | `0x6A88` | `SCARD_E_NO_KEY_CONTAINER` (0x80100030) | Key container / reference not found |
 | `0x6D00` / `0x6E00` | `SCARD_E_UNSUPPORTED_FEATURE` (0x80100022) | Instruction/Class not supported |
-| `0x6700` | `SCARD_E_COMM_DATA_LOST` (0x8010002F) | Data length / Lc mismatch |
+| `0x6700` | `SCARD_E_INVALID_DATA (0x80100004) | Data length / Lc mismatch |
 | `0x6A86` / `0x6A80` | `SCARD_E_INVALID_PARAMETER` (0x80100004) | Invalid parameters / command data |
 | Any other error | `SCARD_F_COMM_ERROR` (0x80100013) | Internal communications failure |
 
@@ -1103,12 +1086,8 @@ struct EudsContext {
     pin_verified: RwLock<bool>,              // PIN verified in THIS session
     pin_blocked: RwLock<bool>,               // PIN blocked (3 failed attempts)
     pin_retries: RwLock<u8>,                 // Remaining retries (0-3)
-    pin_freshness: RwLock<u8>,               // Incremented on verify/deauth
-    session_pin: RwLock<Option<Vec<u8>>>,    // Session PIN if generated
-    cache_mode: RwLock<u32>,                 // CP_CARD_CACHE_MODE value
-    pin_info: RwLock<PIN_INFO>,              // CP_CARD_PIN_INFO value
-    parent_window: RwLock<Option<HWND>>,     // CP_PARENT_WINDOW value
-    pin_context_string: RwLock<Option<String>>, // CP_PIN_CONTEXT_STRING value
+    parent_window: RwLock<Option<HWND>>,     // CP_PARENT_WINDOW (writable per §7.4)
+    pin_context_string: RwLock<Option<String>>, // CP_PIN_CONTEXT_STRING (writable per §7.4)
 }
 ```
 
@@ -1122,7 +1101,7 @@ Allocated in `CardAcquireContext` with `Box::new()`, freed in `CardDeleteContext
 
 ---
 
-### 9.5 Per-Session State Architecture
+### 9.4 Per-Session State Architecture
 
 **Critical Design**: Each `CardAcquireContext` call creates a **new independent session** with its own `EudsContext`.
 
@@ -1136,7 +1115,6 @@ CardAcquireContext          CardAcquireContext          CardAcquireContext
 EudsContext#1               EudsContext#2               EudsContext#3
   pin_verified=false          pin_verified=false          pin_verified=false
   pin_retries=3               pin_retries=3               pin_retries=3
-  session_pin=None            session_pin=None            session_pin=None
 ```
 
 **Why this matters**:
@@ -1145,7 +1123,7 @@ EudsContext#1               EudsContext#2               EudsContext#3
 - **Hybrid model**: Engine stateful per-connection si PIN required (clave encriptada), stateless si no (clave sin encriptar)
 - **PinMode::Required** (clave encriptada): engine trackea `pin_verified` per connection en `HashMap<u64, SessionState>`
 - **PinMode::NotRequired** (clave sin encriptar): engine stateless, SIGN/DECRYPT directo sin PIN check
-- Minidriver SIEMPRE mantiene su `EudsContext` per-context (cache cert, pubkey, cache_mode, etc.)
+- Minidriver SIEMPRE mantiene su `EudsContext` per-context (cache cert, pubkey, etc.)
 
 **Implementation**:
 ```rust
@@ -1160,7 +1138,7 @@ drop(ctx); // Clean up session state
 
 ---
 
-### 9.4 CardReadFile Allocation Pattern
+### 9.5 CardReadFile Allocation Pattern
 
 ```rust
 unsafe extern "system" fn CardReadFile(
@@ -1213,8 +1191,8 @@ fn get_file_data(
             "cardid" => Ok(ctx.card_id.to_vec()),
             "cardcf" => {
                 // Dynamically construct cache file using latest pin_freshness
-                let pin_fresh = *ctx.pin_freshness.read();
-                Ok(vec![0x01, pin_fresh, 0x01, 0x00, 0x01, 0x00])
+                // Static cardcf — read-only card, no dynamic freshness needed
+                Ok(vec![0x01, 0x01, 0x01, 0x00, 0x01, 0x00])
             }
             "cardapps" => Ok(b"mscp\0\0\0\0".to_vec()),
             _ => Err(SCARD_E_FILE_NOT_FOUND),
@@ -1253,7 +1231,7 @@ fn get_file_data(
 
 ```registry
 [HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Cryptography\Calais\SmartCards\eUDS Custom Card]
-"ATR"=hex:3B,89,00,45,55,44,53,2D,43,61,72,64,97
+"ATR"=hex:3B,89,01,45,55,44,53,2D,43,61,72,64,96
 "ATRMask"=hex:FF,FF,FF,FF,FF,FF,FF,FF,FF,FF,FF,FF,FF
 "Crypto Provider"="Microsoft Base Smart Card Crypto Provider"
 "Smart Card Key Storage Provider"="Microsoft Smart Card Key Storage Provider"
@@ -1264,7 +1242,7 @@ fn get_file_data(
 
 ```registry
 [HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Cryptography\Calais\SmartCards\eUDS Custom Card]
-"ATR"=hex:3B,89,00,45,55,44,53,2D,43,61,72,64,97
+"ATR"=hex:3B,89,01,45,55,44,53,2D,43,61,72,64,96
 "ATRMask"=hex:FF,FF,FF,FF,FF,FF,FF,FF,FF,FF,FF,FF,FF
 "Crypto Provider"="Microsoft Base Smart Card Crypto Provider"
 "Smart Card Key Storage Provider"="Microsoft Smart Card Key Storage Provider"
@@ -1277,7 +1255,7 @@ fn get_file_data(
 # Register eUDS Custom Card minidriver
 $atrPath = "HKLM:\SOFTWARE\Microsoft\Cryptography\Calais\SmartCards\eUDS Custom Card"
 New-Item -Path $atrPath -Force
-Set-ItemProperty -Path $atrPath -Name "ATR" -Value ([byte[]](0x3B,0x89,0x00,0x45,0x55,0x44,0x53,0x2D,0x43,0x61,0x72,0x64,0x97))
+Set-ItemProperty -Path $atrPath -Name "ATR" -Value ([byte[]](0x3B,0x89,0x01,0x45,0x55,0x44,0x53,0x2D,0x43,0x61,0x72,0x64,0x96))
 Set-ItemProperty -Path $atrPath -Name "ATRMask" -Value ([byte[]](0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF))
 Set-ItemProperty -Path $atrPath -Name "Crypto Provider" -Value "Microsoft Base Smart Card Crypto Provider"
 Set-ItemProperty -Path $atrPath -Name "Smart Card Key Storage Provider" -Value "Microsoft Smart Card Key Storage Provider"
@@ -1301,13 +1279,13 @@ Restart-Service SCardSvr
 
 4. **Container name encoding**: The `wszGuid` field in `CONTAINER_MAP_RECORD` is UTF-16LE. We use `"eUDS Container 00"` — this should be verified to not cause issues with any Windows component that expects a GUID format.
 
-5. **PIN freshness counter**: We increment `bPinsFreshness` on verify/deauth. The Base CSP uses this to invalidate its PIN cache. We should verify this works correctly with the Windows PIN dialog.
+5. **PIN freshness counter**: Static for read-only card. No dynamic changes needed (MS §7.4: CSP does not write to cardcf on read-only cards).
 
 ### 11.2 Design Decisions Made
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| ATR protocol | T=0 | Simplest, FreeRDP addon handles chaining |
+| ATR protocol | T=1 | Extended APDUs native, no ENVELOPE needed |
 | Certificate compression | None (DER raw) | Simpler, negligible size difference |
 | Public key retrieval | Dedicated APDU | Avoids ASN.1 parser in minidriver |
 | Container count | 1 (single key) | Simplest, matches our use case |

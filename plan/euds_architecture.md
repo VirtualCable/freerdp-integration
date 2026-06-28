@@ -127,7 +127,7 @@ Windows SCardSvr                       Linux FreeRDP Addon
        │  │  Cifrado: TLS 1.2+ (NLA)         │  │
        │  │  APDU max: 66,560 bytes           │  │
        │  │  ATR max: 36 bytes                │  │
-       │  │  T=0 protocol: GET RESPONSE chain  │  │
+       │  │  T=1 protocol: extended APDUs + GET RESPONSE fallback  │  │
        │  └──────────────────────────────────┘  │
        │                                        │
 ```
@@ -140,7 +140,7 @@ Windows SCardSvr                       Linux FreeRDP Addon
 Windows                     Minidriver                    Engine
    │                           │                             │
    │ 1. SCardSvr detecta ATR  │                             │
-   │    ATR: 3B 89 00 45 55... │                             │
+   │    ATR: 3B 89 01 45 55... │                             │
    │ 2. Calais → euds_minidriver.dll                         │
    │                           │                             │
    │──CardAcquireContext──────►│                             │
@@ -308,7 +308,7 @@ export UDS_SMARTCARD_PIN=mi_passphrase_segura       # PinMode::Required
 # 64-bit DLL registry
 $path = "HKLM:\SOFTWARE\Microsoft\Cryptography\Calais\SmartCards\eUDS Custom Card"
 New-Item -Path $path -Force
-Set-ItemProperty -Path $path -Name "ATR" -Value @(0x3B,0x89,0x00,0x45,0x55,0x44,0x53,0x2D,0x43,0x61,0x72,0x64,0x97)
+Set-ItemProperty -Path $path -Name "ATR" -Value @(0x3B,0x89,0x01,0x45,0x55,0x44,0x53,0x2D,0x43,0x61,0x72,0x64,0x96)
 Set-ItemProperty -Path $path -Name "ATRMask" -Value @(0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF)
 Set-ItemProperty -Path $path -Name "Crypto Provider" -Value "Microsoft Base Smart Card Crypto Provider"
 Set-ItemProperty -Path $path -Name "Smart Card Key Storage Provider" -Value "Microsoft Smart Card Key Storage Provider"
@@ -317,7 +317,7 @@ Set-ItemProperty -Path $path -Name "80000001" -Value "C:\temp\euds_minidriver.dl
 # 32-bit WoW64
 $path32 = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Cryptography\Calais\SmartCards\eUDS Custom Card"
 New-Item -Path $path32 -Force
-Set-ItemProperty -Path $path32 -Name "ATR" -Value @(0x3B,0x89,0x00,0x45,0x55,0x44,0x53,0x2D,0x43,0x61,0x72,0x64,0x97)
+Set-ItemProperty -Path $path32 -Name "ATR" -Value @(0x3B,0x89,0x01,0x45,0x55,0x44,0x53,0x2D,0x43,0x61,0x72,0x64,0x96)
 Set-ItemProperty -Path $path32 -Name "ATRMask" -Value @(0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF)
 Set-ItemProperty -Path $path32 -Name "Crypto Provider" -Value "Microsoft Base Smart Card Crypto Provider"
 Set-ItemProperty -Path $path32 -Name "Smart Card Key Storage Provider" -Value "Microsoft Smart Card Key Storage Provider"

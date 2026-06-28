@@ -48,12 +48,12 @@ By doing this, we control both ends of the wire. We keep the APDU protocol extre
 ### 3.1 ATR (Answer To Reset)
 We will register a custom ATR that represents eUDS and guarantees perfect Plug and Play (PnP) discovery on Windows:
 ```
-3B 89 00 45 55 44 53 2D 43 61 72 64 97
+3B 89 01 45 55 44 53 2D 43 61 72 64 96
 ```
 - **T0 = 0x89**: Y1=8 (only TD1 present), K=9 (9 historical bytes)
-- **TD1 = 0x00**: T=0 protocol, no more interface bytes
+- **TD1 = 0x01 — T=1 protocol protocol, no more interface bytes
 - **Historical Bytes**: `45 55 44 53 2D 43 61 72 64` = ASCII `"eUDS-Card"` (9 bytes)
-- **TCK = 0x97**: XOR checksum (T0..H9 XOR = 00 verified)
+- **TCK = 0x96**: XOR checksum (T0..H9 XOR = 00 verified)
 - **Total length**: 13 bytes (well within 36-byte RDP limit)
 
 > **NOTE**: The previous ATR `3B F7 18 00 00 80 31 FE ...` was malformed — interface byte chain consumed bytes meant as historical, leaving only 7 historical bytes instead of 9. See `plan/euds_technical_spec.md` Section 1 for full analysis.
@@ -95,7 +95,7 @@ To keep communications high-speed and rock-solid, we define a minimal set of APD
 
 ### 4.3 GET CERTIFICATE (INS 0xB0)
 Used once on startup by the minidriver to fetch the X.509 certificate in DER format.
-- **Command (C-APDU)**: `80 B0 00 00 00 00 00` (Extended APDU case 2: READ BINARY, offset=0, Le=0=max)
+- **Command (C-APDU)**: `80 B0 00 00 00 00` (Extended APDU case 2: READ BINARY, offset=0, Le=0=max)
 - **Response (R-APDU)**: `[DER_Bytes] 90 00`
 - **Notes**: Uses extended APDU case 2 format (no Lc, Le=2 bytes = 00 00). The FreeRDP addon handles GET RESPONSE chaining automatically if the engine chunks the response.
 
@@ -132,7 +132,7 @@ Our development is divided into three sequential phases to ensure perfect testin
 ### Phase 1: eUDS Card Emulation (Linux client)
 We will implement the eUDS Card Engine in the `uds-client` project:
 1. Create `euds_engine.rs` implementing the custom APDUs (SELECT, VERIFY PIN, GET CERT, GET PUBLIC KEY, SIGN, DECRYPT).
-2. Register the custom ATR: `3B 89 00 45 55 44 53 2D 43 61 72 64 97`.
+2. Register the custom ATR: `3B 89 01 45 55 44 53 2D 43 61 72 64 96`.
 3. Read the certificate and private key from the environment variables (same as current setup).
 4. **Engine stateful per-connection si PIN required (clave encriptada), stateless si no (clave sin encriptar)**. VERIFY PIN setea flag per-connection; SIGN/DECRYPT chequean flag. Sin PIN required → engine stateless, ops directas.
 5. Run unit tests to verify signing/decryption against the local private key.
@@ -159,11 +159,12 @@ We will create a clean, dedicated minidriver project: `euds-smartcard-minidriver
    - Sends `GET PUBLIC KEY` APDU to engine to retrieve modulus + exponent.
    - Builds `BCRYPT_RSAKEY_BLOB` (283 bytes) and returns it in `CONTAINER_INFO.pbKeyExPublicKey`.
 6. Handle `CardAuthenticateEx`:
-   - Supports `CARD_AUTHENTICATE_GENERATE_SESSION_PIN`, `CARD_AUTHENTICATE_SESSION_PIN`, `CARD_PIN_SILENT_CONTEXT` flags
+   - Supports `CARD_PIN_SILENT_CONTEXT` flag (advisory, ignored)
+   - Returns `SCARD_E_UNSUPPORTED_FEATURE` for session PIN flags (not supported — PLAINTEXT only)
    - Sends VERIFY PIN APDU (`80 20 00 80 [Lc] [PIN]`)
-   - Manages per-session PIN state (verified, retries, blocked, session PIN)
+   - Manages per-session PIN state (verified, retries, blocked)
 7. Handle `CardDeauthenticateEx`:
-   - Accepts `PIN_SET` bitmask, clears state for each PIN in the mask
+   - Accepts `PIN_SET` bitmask, ignores `ROLE_EVERYONE`, clears state for `ROLE_USER` (bit 1)
 8. Handle `CardSignData` and `CardRSADecrypt`:
    - Forwards the request over APDU via `SCardTransmit`
    - **DECRYPT uses extended APDU case 4** (`80 2A 80 86 00 01 00 [256 bytes] 00 00`)
