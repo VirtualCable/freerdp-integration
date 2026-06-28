@@ -92,12 +92,12 @@ We use CLA `0x80` (proprietary) for all custom commands to avoid collisions with
 
 | # | Command | CLA | INS | P1 | P2 | Data In | Data Out |
 |---|---------|-----|-----|----|----|---------|----------|
-| 1 | SELECT Applet | `00` | `A4` | `04` | `00` | AID (9 bytes) | — |
-| 2 | VERIFY PIN | `80` | `20` | `00` | `80` | PIN (ASCII) | — |
-| 3 | GET CERTIFICATE | `80` | `B0` | `00` | `00` | — | DER cert |
+| 1 | SELECT Applet | `00` | `A4` | `04` | `00` | AID (9 bytes) | FCI |
+| 2 | VERIFY PIN | `80` | `B1` | `00` | `80` | PIN (ASCII) | — |
+| 3 | GET CERTIFICATE | `80` | `B4` | `00` | `00` | — | DER cert |
 | 4 | GET PUBLIC KEY | `80` | `46` | `00` | `00` | — | exp + mod |
-| 5 | SIGN DATA | `80` | `2A` | `9E` | `9A` | DigestInfo+Hash | Signature |
-| 6 | DECRYPT DATA | `80` | `2A` | `80` | `86` | Ciphertext | Plaintext |
+| 5 | SIGN DATA | `80` | `B2` | `9E` | `9A` | DigestInfo+Hash | Signature |
+| 6 | DECRYPT DATA | `80` | `B3` | `80` | `86` | Ciphertext | Plaintext |
 
 ### 2.2 Command Details
 
@@ -106,11 +106,11 @@ We use CLA `0x80` (proprietary) for all custom commands to avoid collisions with
 Selects the eUDS application on the card.
 
 ```
-C-APDU: 00 A4 04 00 09 45 55 44 53 2D 43 61 72 64
-        │  │  │  │  │  └──── AID = "eUDS-Card" (ASCII) ────┘
-        │  │  │  │  └── Lc = 9
-        │  │  │  └── P2 = 00 (first or only occurrence)
-        │  │  └── P1 = 04 (select by AID)
+C-APDU: 00 A4 04 00 09 45 55 44 53 2D 43 61 72 64 00
+        │  │  │  │  │  └──── AID = "eUDS-Card" (ASCII) ────┘ │
+        │  │  │  │  └── Lc = 9                               └── Le = 00 (expect FCI response)
+        │  │  │  └── P2 = 00 (return FCI template)
+        │  │  └── P1 = 04 (select by DF name / AID)
         │  └── INS = A4 (SELECT)
         └── CLA = 00 (ISO interindustry)
 
@@ -118,7 +118,8 @@ R-APDU: 90 00
 ```
 
 **Notes**:
-- Uses standard CLA=00 (not proprietary) because SELECT is an ISO command
+- Uses standard CLA=00 (ISO interindustry) with Le=00 to request FCI response per ISO 7816-4 §7.1.1
+- Case 4 short: Lc and Le both short (not mixed)
 - The AID matches the ATR historical bytes for consistency
 - Must be sent first before any other command
 
@@ -127,12 +128,12 @@ R-APDU: 90 00
 Verifies the user PIN against the card's stored PIN.
 
 ```
-C-APDU: 80 20 00 80 [Lc] [PIN_bytes]
+C-APDU: 80 B1 00 80 [Lc] [PIN_bytes]
         │  │  │  │  │   └── PIN in ASCII (4-8 bytes typically)
         │  │  │  │  └── Lc = length of PIN
         │  │  │  └── P2 = 80 (verify user PIN)
         │  │  └── P1 = 00
-        │  └── INS = 20 (VERIFY)
+        │  └── INS = B1 (proprietary: VERIFY PIN)
         └── CLA = 80 (proprietary)
 
 R-APDU (success):    90 00
@@ -153,20 +154,21 @@ Retrieves the X.509 certificate in DER format. Used by the minidriver to serve `
 
 **Case 2 Extended APDU** (no data in, data out — standard READ BINARY):
 ```
-C-APDU: 80 B0 00 00 00 00
-        │  │  │  │  │  │  └── Le_lo = 00
-        │  │  │  │  │  └── Le_hi = 00 (Le = 0 = return all available)
-        │  │  │  │  └── Extended length indicator
-        │  │  │  └── P2 = 00 (offset low)
+C-APDU: 80 B4 00 00 00 00 00
+        │  │  │  │  │  │  │  └── Le_lo = 00
+        │  │  │  │  │  │  └── Le_hi = 00 (Le = 0 = 65536, return all available)
+        │  │  │  │  │  └── Extended length indicator (0x00)
+        │  │  │  │  └── P2 = 00 (offset low)
         │  │  └── P1 = 00 (offset high)
-        │  └── INS = B0 (READ BINARY)
-        └── CLA = 80 (proprietary)
+        │  └── INS = B4 (proprietary: GET CERTIFICATE)
+        │  └── CLA = 80 (proprietary)
+        └── 7 bytes total: CLA INS P1 P2 00 Le_hi Le_lo
 
 R-APDU: [DER_bytes] 90 00
 ```
 
 **Notes**:
-- Uses **extended APDU case 2** format (no Lc, Le is 2 bytes)
+- Uses **extended APDU case 2** format (no Lc, Le is 3 bytes: 00 + Le_hi + Le_lo)
 - Returns the complete DER-encoded X.509 certificate
 - Typical certificate size: 1,000–3,000 bytes (fits in extended APDU)
 - If response > 65,535 bytes (impossible for X.509), engine would use chaining
@@ -175,7 +177,7 @@ R-APDU: [DER_bytes] 90 00
 
 **Fallback for engines that don't support extended APDU**:
 ```
-C-APDU: 80 B0 00 00    (Le=00 in short format = 256 bytes)
+C-APDU: 80 B4 00 00 00    (5 bytes: CLA INS P1 P2 Le, Le=00 = 256 bytes)
 R-APDU: [256 bytes] 61 XX  (XX = remaining bytes, engine uses GET RESPONSE chaining)
 ```
 The FreeRDP addon handles `61 XX` chaining automatically.
@@ -185,11 +187,15 @@ The FreeRDP addon handles `61 XX` chaining automatically.
 Retrieves the RSA public key components (exponent + modulus) extracted from the certificate.
 
 ```
-C-APDU: 80 46 00 00
-        │  │  │  └── P2 = 00
-        │  │  └── P1 = 00
-        │  └── INS = 46 (proprietary: GET PUBLIC KEY)
-        └── CLA = 80 (proprietary)
+C-APDU: 80 46 00 00 00 01 07
+        │  │  │  │  │  │  │  └── Le_lo = 07
+        │  │  │  │  │  │  └── Le_hi = 01 (Le = 263 bytes)
+        │  │  │  │  │  └── Extended length indicator (0x00)
+        │  │  │  │  └── P2 = 00
+        │  │  │  └── P1 = 00
+        │  │  └── INS = 46 (proprietary: GET PUBLIC KEY)
+        │  └── CLA = 80 (proprietary)
+        └── 7 bytes total: CLA INS P1 P2 00 Le_hi Le_lo (Case 2 Extended)
 
 R-APDU: [exp_len_hi] [exp_len_lo] [exponent] [mod_len_hi] [mod_len_lo] [modulus] 90 00
 ```
@@ -207,9 +213,9 @@ Offset  Size    Field           Example (RSA-2048)
 **Chaining behavior (T=0)**:
 - Total response: 263 bytes (exceeds short APDU max 256)
 - Engine returns first 256 bytes + `61 07` (SW_MORE_DATA with 7 bytes remaining)
-- FreeRDP addon sends `00 C0 00 00 07` (GET RESPONSE)
+- Minidriver sends `80 C0 00 00 07` (GET RESPONSE with same CLA=0x80 per ISO 7816-4 §7.6.1)
 - Engine returns remaining 7 bytes + `90 00`
-- FreeRDP addon concatenates → minidriver receives 263 bytes
+- Minidriver concatenates → receives 263 bytes
 
 **Notes**:
 - The engine extracts these from the loaded certificate at startup
@@ -223,12 +229,12 @@ Offset  Size    Field           Example (RSA-2048)
 Performs RSA PKCS#1 v1.5 signature on a DigestInfo structure.
 
 ```
-C-APDU: 80 2A 9E 9A [Lc] [DigestInfo_and_Hash] 00
+C-APDU: 80 B2 9E 9A [Lc] [DigestInfo_and_Hash] 00
         │  │  │  │  │   └── DigestInfo + Hash bytes
         │  │  │  │  └── Lc = length of data
         │  │  │  └── P2 = 9A (sign hash)
         │  │  └── P1 = 9E (sign with private key)
-        │  └── INS = 2A (PERFORM SECURITY OPERATION)
+        │  └── INS = B2 (proprietary: SIGN DATA)
         └── CLA = 80 (proprietary)
 
 R-APDU: [signature: 256 bytes] 90 00
@@ -257,16 +263,16 @@ Performs RSA decryption (PKCS#1 v1.5 or OAEP).
 
 **Case 4 Extended APDU** (data in + data out):
 ```
-C-APDU: 80 2A 80 86 00 01 00 [ciphertext: 256 bytes] 00 00
+C-APDU: 80 B3 80 86 00 01 00 [ciphertext: 256 bytes] 00 00
         │  │  │  │  │  │  │  └────────── Encrypted data (RSA block)
         │  │  │  │  │  │  └───────────── Lc_lo = 00
         │  │  │  │  │  └──────────────── Lc_hi = 01 (Lc = 256)
         │  │  │  │  └─────────────────── Extended length indicator
         │  │  │  └────────────────────── P2 = 86 (decrypt)
         │  │  └───────────────────────── P1 = 80 (confidentiality)
-        │  └──────────────────────────── INS = 2A (PERFORM SECURITY_OPERATION)
+        │  └──────────────────────────── INS = B3 (proprietary: DECRYPT DATA)
         └─────────────────────────────── CLA = 80 (proprietary)
-                                        Le_hi = 00, Le_lo = 00 (Le = 0 = max available)
+                                        Le_hi = 00, Le_lo = 00 (Le = 0 = 65536, max available)
 
 R-APDU: [plaintext] 90 00
 ```
@@ -293,7 +299,7 @@ R-APDU: [plaintext] 90 00
 | SELECT | 9 bytes | 2 (SW) | Short |
 | VERIFY PIN | 4-8 bytes | 2 (SW) | Short |
 | GET CERTIFICATE | 0 bytes | ~1-3 KB | **Extended** |
-| GET PUBLIC KEY | 0 bytes | 263 bytes | Short (with chaining) |
+| GET PUBLIC KEY | 7 bytes | 263 bytes | Extended (with chaining) |
 | SIGN DATA | 35-67 bytes | 256 bytes | Short |
 | DECRYPT DATA | **256 bytes** | ~214-245 bytes | **Extended** |
 
@@ -825,25 +831,25 @@ This is the exact sequence of calls the Base CSP makes when `certutil -scinfo` o
 
 19. User enters PIN in Windows dialog
 20. CardAuthenticateEx(PinId=1, dwFlags=0, pbPinData="1234")
-    → Minidriver sends VERIFY PIN APDU: 80 20 00 80 04 31 32 33 34
-    → Engine verifies PIN
-    → Returns: SCARD_S_SUCCESS (or SCARD_W_WRONG_CHV if wrong; SCARD_W_CHV_BLOCKED if blocked)
+     → Minidriver sends VERIFY PIN APDU: 80 B1 00 80 04 31 32 33 34
+     → Engine verifies PIN
+     → Returns: SCARD_S_SUCCESS (or SCARD_W_WRONG_CHV if wrong; SCARD_W_CHV_BLOCKED if blocked)
 ```
 
 ### 6.5 Phase 5: Cryptographic Operations
 
 ```
 21. CardSignData(pInfo)
-    → pInfo contains: bContainerIndex, aiHashAlg, pbData (hash), dwPaddingType
-    → Minidriver builds APDU: 80 2A 9E 9A [Lc] [DigestInfo+Hash]
-    → Engine performs RSA sign
-    → Returns: signature (256 bytes) in pInfo->pbSignedData
+     → pInfo contains: bContainerIndex, aiHashAlg, pbData (hash), dwPaddingType
+     → Minidriver builds APDU: 80 B2 9E 9A [Lc] [DigestInfo+Hash]
+     → Engine performs RSA sign
+     → Returns: signature (256 bytes) in pInfo->pbSignedData
 
 22. CardRSADecrypt(pInfo)
-    → pInfo contains: bContainerIndex, pbData (ciphertext), dwPaddingType
-    → Minidriver builds APDU: 80 2A 80 86 00 01 00 [256 bytes]
-    → Engine performs RSA decrypt
-    → Returns: plaintext in pInfo->pbData
+     → pInfo contains: bContainerIndex, pbData (ciphertext), dwPaddingType
+     → Minidriver builds APDU: 80 B3 80 86 00 01 00 [256 bytes]
+     → Engine performs RSA decrypt
+     → Returns: plaintext in pInfo->pbData
 ```
 
 ### 6.6 Visual Flow
@@ -944,7 +950,7 @@ Base CSP                          Minidriver                      Engine
   │                                  │  30 31 30 0D 06 09 ...      │
   │                                  │  + 32-byte hash = 51 bytes   │
   │                                  │                              │
-  │                                  │──APDU: 80 2A 9E 9A 33 ─────►│
+  │                                  │──APDU: 80 B2 9E 9A 33 ─────►│
   │                                  │  [51 bytes DigestInfo+Hash]  │
   │                                  │                              │
   │                                  │                    PKCS#1 pad:│
@@ -966,7 +972,7 @@ Base CSP                          Minidriver                      Engine
   │  pInfo->pbData = [256 bytes]     │                              │
   │  pInfo->dwPaddingType = PKCS1    │                              │
   │                                  │                              │
-  │                                  │──APDU: 80 2A 80 86 ────────►│
+  │                                  │──APDU: 80 B3 80 86 ────────►│
   │                                  │  00 01 00 [256 bytes]        │
   │                                  │  (extended APDU)              │
   │                                  │                              │
@@ -999,7 +1005,7 @@ Base CSP                          Minidriver                      Engine
 | SELECT | 14 bytes | 2 bytes | Short | ✓ |
 | VERIFY PIN | ~10 bytes | 2 bytes | Short | ✓ |
 | GET CERTIFICATE | 7 bytes | ~2 KB | Extended | ✓ |
-| GET PUBLIC KEY | 4 bytes | 263 bytes | Short + chaining | ✓ |
+| GET PUBLIC KEY | 7 bytes | 263 bytes | Extended + chaining | ✓ |
 | SIGN DATA | ~57 bytes | 256 bytes | Short | ✓ |
 | DECRYPT DATA | 263 bytes | ~245 bytes | **Extended** | ✓ |
 
@@ -1022,7 +1028,7 @@ The GET PUBLIC KEY response is 263 bytes (2 + 3 + 2 + 256). Since short APDU Le 
 
 ```
 Engine sends first 256 bytes + SW 61 07
-FreeRDP addon sends: 00 C0 00 00 07 (GET RESPONSE)
+FreeRDP addon sends: 80 C0 00 00 07 (GET RESPONSE with same CLA=0x80 per ISO 7816-4 §7.6.1)
 Engine sends remaining 7 bytes + SW 90 00
 FreeRDP addon concatenates → minidriver receives 263 bytes
 ```

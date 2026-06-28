@@ -142,6 +142,6 @@ The CSP queries card capabilities to see what features are supported:
 
 To make the system robust and simple, we follow these architectural rules:
 
-1. **Card API Emulation Level**: The virtual card on the Linux side does **NOT** need to implement a full ISO 7816-4 filesystem. It only needs to answer a very simple wire protocol for private key operations.
+1. **Card API Emulation Level**: The virtual card on the `uds-client` side does **NOT** need to implement a full ISO 7816-4 filesystem. It only needs to answer a very simple wire protocol for private key operations.
 2. **Minidriver is the Brain**: Our Windows minidriver serves `cardcf`, `cmapfile`, and public keys directly from hardcoded structures or local caching, keeping the card APDU layer extremely thin.
 3. **ATR Registry Registration**: We register our custom `eUDS-Card` ATR so that SCardSvr couples it directly with `euds_minidriver.dll`, bypassing the Microsoft inbox minidriver entirely.

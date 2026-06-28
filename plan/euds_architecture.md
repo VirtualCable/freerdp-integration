@@ -99,10 +99,11 @@
 │  │  │                                                 │     │         │
 │  │  │  process_apdu(conn_id, apdu) -> Vec<u8>          │     │         │
 │  │  │    ├─ 0xA4 → SELECT    (AID "eUDS-Card")         │     │         │
-│  │  │    ├─ 0x20 → VERIFY PIN (condicional)            │     │         │
-│  │  │    ├─ 0xB0 → GET CERT  (extended APDU)          │     │
+│  │  │    ├─ 0xB1 → VERIFY PIN (condicional)            │     │         │
+│  │  │    ├─ 0xB4 → GET CERT  (extended APDU)          │     │
 │  │  │    ├─ 0x46 → GET PUBKEY (extended APDU)         │     │
-│  │  │    └─ 0x2A → PSO       (SIGN 9E9A / DEC 8086)   │     │
+│  │  │    ├─ 0xB2 → SIGN      (9E 9A)                  │     │
+│  │  │    └─ 0xB3 → DECRYPT   (80 86)                  │     │
 │  │  └─────────────────────────────────────────────────┘     │         │
 │  │                                                          │         │
 │  │  Lee certificado y clave desde env vars:                 │         │
@@ -172,7 +173,7 @@ Windows                     Minidriver                    Engine
    │                           │                             │
    │──ReadFile(mscp\kxc00)────►│                             │
    │                           │──GET CERT APDU─────────────►│
-   │                           │  80 B0 00 00 00 00 00       │
+   │                           │  80 B4 00 00 00 00 00       │
    │                           │◄──DER cert──────────────────│
    │◄──certificate─────────────│                             │
    │                           │                             │
@@ -187,29 +188,29 @@ Windows                     Minidriver                    Engine
 Windows                     Minidriver                    Engine
    │                           │                             │
    │──CardAuthenticateEx──────►│                             │
-   │   PinId=1, dwFlags=0      │                             │
-   │                           │──VERIFY PIN APDU───────────►│
-   │                           │  80 20 00 80 04 [PIN]       │
-   │                           │◄──90 00 (OK)────────────────│
-   │◄──SCARD_S_SUCCESS─────────│                             │
-   │                           │                             │
-   │──CardSignData────────────►│                             │
-   │   aiHashAlg=SHA256        │                             │
-   │   pbData=[32B hash]       │                             │
-   │   dwPaddingType=PKCS1     │                             │
-   │                           │──SIGN APDU─────────────────►│
-   │                           │  80 2A 9E 9A 20 [hash] 00  │
+    │   PinId=1, dwFlags=0      │                             │
+    │                           │──VERIFY PIN APDU───────────►│
+    │                           │  80 B1 00 80 04 [PIN]       │
+    │                           │◄──90 00 (OK)────────────────│
+    │◄──SCARD_S_SUCCESS─────────│                             │
+    │                           │                             │
+    │──CardSignData────────────►│                             │
+    │   aiHashAlg=SHA256        │                             │
+    │   pbData=[32B hash]       │                             │
+    │   dwPaddingType=PKCS1     │                             │
+    │                           │──SIGN APDU─────────────────►│
+    │                           │  80 B2 9E 9A 20 [hash] 00  │
    │                           │                             │
    │                           │              PKCS#1 v1.5:   │
    │                           │              00 01 FF..FF 00│
    │                           │              + DigestInfo    │
    │                           │              m^d mod n      │
    │                           │                             │
-   │                           │◄──61 00─────────────────────│
-   │                           │──GET RESPONSE──────────────►│
-   │                           │  00 C0 00 00 00             │
-   │                           │◄──[256B sig] 90 00──────────│
-   │◄──[256 bytes signature]───│                             │
+    │                           │◄──61 00─────────────────────│
+    │                           │──GET RESPONSE──────────────►│
+    │                           │  80 C0 00 00 00             │
+    │                           │◄──[256B sig] 90 00──────────│
+    │◄──[256 bytes signature]───│                             │
 ```
 
 **NOTA**: El chaining `61 XX` → `GET RESPONSE` lo maneja automáticamente el FreeRDP addon (`handlers.rs:557-580`). El minidriver solo ve la respuesta completa.
@@ -225,7 +226,7 @@ Windows                     Minidriver                    Engine
    │   pbData=[256B cipher]    │                             │
    │   dwPaddingType=PKCS1     │                             │
    │                           │──DECRYPT APDU──────────────►│
-   │                           │  80 2A 80 86 00 01 00      │
+    │                           │  80 B3 80 86 00 01 00      │
    │                           │  [256 bytes ciphertext]     │
    │                           │  00 00                     │
    │                           │                             │

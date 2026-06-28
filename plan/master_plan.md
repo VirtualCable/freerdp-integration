@@ -7,7 +7,7 @@
 The goal of Project **eUDS** is to build a highly reliable, custom virtual smart card ecosystem for UDS Enterprise. 
 
 Instead of struggling with generic, opaque, and complex standards like GIDS/PIV and fighting Microsoft's inbox minidriver (`msclmd.dll`), we will build:
-1. **eUDS Custom Card**: An emulated smartcard running on the Linux client that responds to a minimal, high-speed custom APDU protocol.
+1. **eUDS Custom Card**: An emulated smartcard running on the multiplatform `uds-client` (Windows/Linux/macOS) that responds to a minimal, high-speed custom APDU protocol.
 2. **eUDS Minidriver**: A 100% custom Windows Smart Card Minidriver DLL (`euds_minidriver.dll`) paired with the eUDS card via a custom ATR.
 
 By doing this, we control both ends of the wire. We keep the APDU protocol extremely thin and delegate card system complexity to the minidriver, guaranteeing 100% stable container enumeration, certificate display, and card enrollment on Windows.
@@ -39,7 +39,7 @@ By doing this, we control both ends of the wire. We keep the APDU protocol extre
 
 ### 2.1 The Division of Labor
 - **The Minidriver (Windows)**: Handles all Windows Smart Card Module API requests. It serves static layout files (such as `cardcf`, `cmapfile`, and public key blobs) directly from memory or configuration, bypassing card-side reads. It manages certificate extraction and decompression.
-- **The Engine (Linux)**: Emulates the eUDS smart card. It registers a custom eUDS ATR. It is responsible for only two actions: **verifying the PIN** and **performing private key cryptographic operations (signing / decryption)**.
+- **The Engine (multiplatform)**: Emulates the eUDS smart card. It registers a custom eUDS ATR. It is responsible for only two actions: **verifying the PIN** and **performing private key cryptographic operations (signing / decryption)**.
 
 ---
 
@@ -84,8 +84,8 @@ To keep communications high-speed and rock-solid, we define a minimal set of APD
 - **Command (C-APDU)**: `00 A4 04 00 09 45 55 44 53 2D 43 61 72 64` (SELECT AID `"eUDS-Card"`)
 - **Response (R-APDU)**: `90 00` (Success)
 
-### 4.2 VERIFY PIN (INS 0x20)
-- **Command (C-APDU)**: `80 20 00 80 [Lc] [PIN_Bytes]`
+### 4.2 VERIFY PIN (INS 0xB1)
+- **Command (C-APDU)**: `80 B1 00 80 [Lc] [PIN_Bytes]`
   - `P1` = `00`
   - `P2` = `80` (Verify User PIN)
 - **Response (R-APDU)**:
@@ -93,20 +93,20 @@ To keep communications high-speed and rock-solid, we define a minimal set of APD
   - `63 CX` = PIN Wrong, X retries remaining (e.g. `63 C2` = 2 left)
   - `69 83` = PIN Blocked
 
-### 4.3 GET CERTIFICATE (INS 0xB0)
+### 4.3 GET CERTIFICATE (INS 0xB4)
 Used once on startup by the minidriver to fetch the X.509 certificate in DER format.
-- **Command (C-APDU)**: `80 B0 00 00 00 00` (Extended APDU case 2: READ BINARY, offset=0, Le=0=max)
+- **Command (C-APDU)**: `80 B4 00 00 00 00 00` (Extended APDU case 2, offset=0, Le=00 00=65536)
 - **Response (R-APDU)**: `[DER_Bytes] 90 00`
-- **Notes**: Uses extended APDU case 2 format (no Lc, Le=2 bytes = 00 00). The FreeRDP addon handles GET RESPONSE chaining automatically if the engine chunks the response.
+- **Notes**: Uses extended APDU case 2 format (no Lc, Le=3 bytes: 00 + 00 00). The FreeRDP addon handles GET RESPONSE chaining automatically if the engine chunks the response.
 
 ### 4.4 GET PUBLIC KEY (INS 0x46) — NEW
 Used by the minidriver to get RSA public key components for `CardGetContainerInfo`.
-- **Command (C-APDU)**: `80 46 00 00`
+- **Command (C-APDU)**: `80 46 00 00 00 01 07` (Extended APDU case 2, Le=263)
 - **Response (R-APDU)**: `[exp_len:2] [exponent] [mod_len:2] [modulus] 90 00`
 - **Notes**: Returns 263 bytes for RSA-2048. Since 263 > 256, the engine uses GET RESPONSE chaining for the last 7 bytes (handled by FreeRDP addon). The minidriver uses these to build a `BCRYPT_RSAKEY_BLOB`.
 
-### 4.5 PERFORM SECURITY OPERATION: SIGN DATA (INS 0x2A)
-- **Command (C-APDU)**: `80 2A 9E 9A [Lc] [DigestInfo_and_Hash_Bytes] 00`
+### 4.5 SIGN DATA (INS 0xB2)
+- **Command (C-APDU)**: `80 B2 9E 9A [Lc] [DigestInfo_and_Hash_Bytes] 00`
   - `P1` = `9E`
   - `P2` = `9A` (Sign hash)
   - `Le` = `00` (expect 256 bytes response)
@@ -114,11 +114,11 @@ Used by the minidriver to get RSA public key components for `CardGetContainerInf
   - `[Raw_RSA_Signature_Bytes] 90 00` (256 bytes for RSA-2048)
   - `69 82` = Security Status Not Satisfied (PIN not verified)
 
-### 4.6 PERFORM SECURITY OPERATION: DECRYPT DATA (INS 0x2A)
-- **Command (C-APDU)**: `80 2A 80 86 00 01 00 [Encrypted_Key_Bytes: 256] 00 00`
+### 4.6 DECRYPT DATA (INS 0xB3)
+- **Command (C-APDU)**: `80 B3 80 86 00 01 00 [Encrypted_Key_Bytes: 256] 00 00`
   - `P1` = `80`
   - `P2` = `86` (Decrypt data)
-  - **CRITICAL**: Uses **extended APDU case 4** because RSA-2048 ciphertext = 256 bytes, which exceeds the short APDU Lc maximum of 255 bytes. Must include `Le_hi Le_lo` (00 00 = max available) at the end per ISO 7816-4.
+  - **CRITICAL**: Uses **extended APDU case 4** because RSA-2048 ciphertext = 256 bytes, which exceeds the short APDU Lc maximum of 255 bytes. Must include `Le_hi Le_lo` (00 00 = 65536) at the end per ISO 7816-4.
 - **Response (R-APDU)**:
   - `[Decrypted_Session_Key] 90 00`
   - `69 82` = Security Status Not Satisfied (PIN not verified)
@@ -129,7 +129,7 @@ Used by the minidriver to get RSA public key components for `CardGetContainerInf
 
 Our development is divided into three sequential phases to ensure perfect testing and avoid regressions.
 
-### Phase 1: eUDS Card Emulation (Linux client)
+### Phase 1: eUDS Card Emulation (multiplatform `uds-client`)
 We will implement the eUDS Card Engine in the `uds-client` project:
 1. Create `euds_engine.rs` implementing the custom APDUs (SELECT, VERIFY PIN, GET CERT, GET PUBLIC KEY, SIGN, DECRYPT).
 2. Register the custom ATR: `3B 89 01 45 55 44 53 2D 43 61 72 64 96`.
@@ -159,15 +159,15 @@ We will create a clean, dedicated minidriver project: `euds-smartcard-minidriver
    - Sends `GET PUBLIC KEY` APDU to engine to retrieve modulus + exponent.
    - Builds `BCRYPT_RSAKEY_BLOB` (283 bytes) and returns it in `CONTAINER_INFO.pbKeyExPublicKey`.
 6. Handle `CardAuthenticateEx`:
-   - Supports `CARD_PIN_SILENT_CONTEXT` flag (advisory, ignored)
-   - Returns `SCARD_E_UNSUPPORTED_FEATURE` for session PIN flags (not supported — PLAINTEXT only)
-   - Sends VERIFY PIN APDU (`80 20 00 80 [Lc] [PIN]`)
-   - Manages per-session PIN state (verified, retries, blocked)
-7. Handle `CardDeauthenticateEx`:
-   - Accepts `PIN_SET` bitmask, ignores `ROLE_EVERYONE`, clears state for `ROLE_USER` (bit 1)
-8. Handle `CardSignData` and `CardRSADecrypt`:
-   - Forwards the request over APDU via `SCardTransmit`
-   - **DECRYPT uses extended APDU case 4** (`80 2A 80 86 00 01 00 [256 bytes] 00 00`)
+    - Supports `CARD_PIN_SILENT_CONTEXT` flag (advisory, ignored)
+    - Returns `SCARD_E_UNSUPPORTED_FEATURE` for session PIN flags (not supported — PLAINTEXT only)
+    - Sends VERIFY PIN APDU (`80 B1 00 80 [Lc] [PIN]`)
+    - Manages per-session PIN state (verified, retries, blocked)
+ 7. Handle `CardDeauthenticateEx`:
+    - Accepts `PIN_SET` bitmask, ignores `ROLE_EVERYONE`, clears state for `ROLE_USER` (bit 1)
+ 8. Handle `CardSignData` and `CardRSADecrypt`:
+    - Forwards the request over APDU via `SCardTransmit`
+    - **DECRYPT uses extended APDU case 4** (`80 B3 80 86 00 01 00 [256 bytes] 00 00`)
 9. **Thread-safe `EudsContext`**: All mutable state protected by `RwLock`/`Mutex`
 10. **Per-session state**: Each `CardAcquireContext` creates fresh `EudsContext` (no shared PIN state across processes)
 11. Register via Calais under the `eUDS Custom Card` ATR.

@@ -54,17 +54,18 @@ crates/channels/src/smartcard/emulated/
 pub const EUDS_CLA: u8 = 0x80;           // Proprietary class
 // APDU Instructions
 pub const EUDS_INS_SELECT: u8 = 0xA4;    // Standard SELECT (CLA=0x00)
-pub const EUDS_INS_VERIFY: u8 = 0x20;    // VERIFY PIN
-pub const EUDS_INS_GET_CERT: u8 = 0xB0;  // READ BINARY (extended)
+pub const EUDS_INS_VERIFY: u8 = 0xB1;    // Proprietary: VERIFY PIN
+pub const EUDS_INS_GET_CERT: u8 = 0xB4;  // Proprietary: GET CERTIFICATE
 pub const EUDS_INS_GET_PUBKEY: u8 = 0x46; // GET PUBLIC KEY (custom)
 pub const EUDS_INS_GET_RESPONSE: u8 = 0xC0; // GET RESPONSE (chaining)
-pub const EUDS_INS_PSO: u8 = 0x2A;       // PERFORM SECURITY OPERATION
+pub const EUDS_INS_SIGN: u8 = 0xB2;      // Proprietary: SIGN DATA
+pub const EUDS_INS_DECRYPT: u8 = 0xB3;   // Proprietary: DECRYPT DATA
 
-// PSO P1/P2
-pub const EUDS_PSO_SIGN_P1: u8 = 0x9E;
-pub const EUDS_PSO_SIGN_P2: u8 = 0x9A;
-pub const EUDS_PSO_DEC_P1: u8 = 0x80;
-pub const EUDS_PSO_DEC_P2: u8 = 0x86;
+// PSO P1/P2 (used with SIGN and DECRYPT)
+pub const EUDS_SIGN_P1: u8 = 0x9E;
+pub const EUDS_SIGN_P2: u8 = 0x9A;
+pub const EUDS_DEC_P1: u8 = 0x80;
+pub const EUDS_DEC_P2: u8 = 0x86;
 
 // eUDS Custom AID
 pub const EUDS_AID: &[u8] = b"eUDS-Card"; // 9 bytes: 65 75 44 53 2D 43 61 72 64
@@ -245,7 +246,26 @@ impl EudsEngine {
             EUDS_INS_GET_CERT => self.get_certificate(conn_id, header.p1, header.p2, le),
             EUDS_INS_GET_PUBKEY => self.get_public_key(conn_id),
             EUDS_INS_GET_RESPONSE => self.get_response(conn_id, le),
-            EUDS_INS_PSO => self.pso(conn_id, header.p1, header.p2, data),
+            EUDS_INS_SIGN => {
+                // PIN check before dispatch (engine needs &self for sessions)
+                if self.pin_mode == PinMode::Required {
+                    let session = self.get_session(conn_id);
+                    if !session.pin_verified {
+                        return make_status(SW_SECURITY_STATUS_NOT_SATISFIED);
+                    }
+                }
+                self.sign(header.p1, header.p2, data)
+            }
+            EUDS_INS_DECRYPT => {
+                // PIN check before dispatch (engine needs &self for sessions)
+                if self.pin_mode == PinMode::Required {
+                    let session = self.get_session(conn_id);
+                    if !session.pin_verified {
+                        return make_status(SW_SECURITY_STATUS_NOT_SATISFIED);
+                    }
+                }
+                self.decrypt(header.p1, header.p2, data)
+            }
             _ => make_status(SW_COMMAND_NOT_ALLOWED),
         }
     }
@@ -263,7 +283,7 @@ impl EudsEngine {
     }
 
     // ---------------------------------------------------------------------
-    // VERIFY PIN (INS=0x20, CLA=0x80)
+    // VERIFY PIN (INS=0xB1, CLA=0x80)
     // ---------------------------------------------------------------------
     fn verify_pin(&mut self, conn_id: ConnectionId, p1: u8, p2: u8, data: &[u8]) -> Vec<u8> {
         // PIN not required mode (EmptyPinType) — always succeed
@@ -297,7 +317,7 @@ impl EudsEngine {
     }
 
     // ---------------------------------------------------------------------
-    // GET CERTIFICATE (INS=0xB0, CLA=0x80) — Extended APDU Case 2
+    // GET CERTIFICATE (INS=0xB4, CLA=0x80) — Extended APDU Case 2
     // ---------------------------------------------------------------------
     fn get_certificate(&mut self, conn_id: ConnectionId, p1: u8, p2: u8, _le: Option<u16>) -> Vec<u8> {
         // Only support offset=0 (p1=0, p2=0)
@@ -307,7 +327,7 @@ impl EudsEngine {
 
         // Return full DER certificate using T=0 chaining
         let cert_der = self.cert_der.clone();
-        self.handle_chaining(conn_id, &cert_der)
+        self.handle_chaining(conn_id, &cert_der, None)
     }
 
 // ---------------------------------------------------------------------
@@ -326,71 +346,62 @@ impl EudsEngine {
         resp.extend_from_slice(&mod_bytes);
 
         // Total: 2 + 3 + 2 + 256 = 263 bytes → may need chaining
-        self.handle_chaining(conn_id, &resp)
+        self.handle_chaining(conn_id, &resp, None)
     }
 
     // Handle T=0 chaining for responses > 256 bytes
-    fn handle_chaining(&mut self, conn_id: ConnectionId, data: &[u8]) -> Vec<u8> {
-        if data.len() <= 256 && self.get_session(conn_id).chaining_buffer.is_none() {
+    // `le` parameter limits chunk size for GET RESPONSE (ISO 7816-4 §7.6.1)
+    fn handle_chaining(&mut self, conn_id: ConnectionId, data: &[u8], le: Option<u16>) -> Vec<u8> {
+        let max_chunk = le.unwrap_or(256) as usize;
+        
+        if data.len() <= max_chunk && self.get_session(conn_id).chaining_buffer.is_none() {
             return make_response(data, SW_SUCCESS);
         }
 
         let session = self.get_session(conn_id);
         
-        // Check if we're in the middle of a chaining sequence
+        // Check if we're in the middle of a chaining sequence (GET RESPONSE)
         if let Some(buffer) = session.chaining_buffer.take() {
-            // This is a GET RESPONSE APDU - return next chunk
-            let remaining = &buffer[256..];
-            if remaining.len() <= 256 {
-                make_response(remaining, SW_SUCCESS)
+            // Return next chunk, limited by Le from GET RESPONSE
+            let take = buffer.len().min(max_chunk);
+            let chunk = &buffer[..take];
+            let remaining = &buffer[take..];
+            if remaining.is_empty() {
+                make_response(chunk, SW_SUCCESS)
             } else {
-                // More chunks needed
-                let chunk = &remaining[..256];
                 session.chaining_buffer = Some(remaining.to_vec());
-                make_response(chunk, SW_MORE_DATA_BASE | ((remaining.len() - 256) as u16 & 0xFF))
+                make_response(chunk, SW_MORE_DATA_BASE | (remaining.len().min(0xFF) as u16))
             }
         } else {
             // First call - store full response in buffer, return first chunk + 61 XX
             session.chaining_buffer = Some(data.to_vec());
-            let chunk = &data[..256];
-            let remaining = data.len() - 256;
-            make_response(chunk, SW_MORE_DATA_BASE | (remaining as u16 & 0xFF))
+            let chunk = &data[..max_chunk];
+            let remaining = data.len() - max_chunk;
+            make_response(chunk, SW_MORE_DATA_BASE | (remaining.min(0xFF) as u16))
         }
     }
 
     // ---------------------------------------------------------------------
-    // GET RESPONSE (INS=0xC0, CLA=0x00/0x80)
+    // GET RESPONSE (INS=0xC0, CLA=0x80 — must match original command's CLA per ISO 7816-4 §7.6.1)
     // ---------------------------------------------------------------------
-    fn get_response(&mut self, conn_id: ConnectionId, _le: Option<u16>) -> Vec<u8> {
-        self.handle_chaining(conn_id, &[])
+    fn get_response(&mut self, conn_id: ConnectionId, le: Option<u16>) -> Vec<u8> {
+        self.handle_chaining(conn_id, &[], le)
     }
 
     // ---------------------------------------------------------------------
-    // PERFORM SECURITY OPERATION (INS=0x2A, CLA=0x80)
+    // SIGN DATA (INS=0xB2, CLA=0x80)
     // ---------------------------------------------------------------------
-    fn pso(&mut self, conn_id: ConnectionId, p1: u8, p2: u8, data: &[u8]) -> Vec<u8> {
+    fn sign(&self, p1: u8, p2: u8, data: &[u8]) -> Vec<u8> {
+        if p1 != EUDS_SIGN_P1 || p2 != EUDS_SIGN_P2 {
+            return make_status(SW_INVALID_P1P2);
+        }
         // Check PIN if required
         if self.pin_mode == PinMode::Required {
-            let session = self.get_session(conn_id);
-            if !session.pin_verified {
-                return make_status(SW_SECURITY_STATUS_NOT_SATISFIED);
-            }
+            // PIN check handled in process_apdu before dispatch
         }
-
-        match (p1, p2) {
-            (EUDS_PSO_SIGN_P1, EUDS_PSO_SIGN_P2) => self.sign(data),
-            (EUDS_PSO_DEC_P1, EUDS_PSO_DEC_P2) => self.decrypt(data),
-            _ => make_status(SW_INVALID_P1P2),
-        }
-    }
-
-    // ---------------------------------------------------------------------
-    // SIGN (PSO with P1=0x9E, P2=0x9A)
-    // ---------------------------------------------------------------------
-    fn sign(&self, digest_info: &[u8]) -> Vec<u8> {
         // Input: DigestInfo structure (e.g., SHA-256 = 51 bytes)
         // Output: Raw RSA signature (256 bytes for RSA-2048)
-        match self.rsa_pkcs1_sign(digest_info) {
+        match self.rsa_pkcs1_sign(data) {
             Ok(sig) => make_response(&sig, SW_SUCCESS),
             Err(e) => {
                 log::error!("eUDS: RSA sign failed: {}", e);
@@ -400,11 +411,14 @@ impl EudsEngine {
     }
 
     // ---------------------------------------------------------------------
-    // DECRYPT (PSO with P1=0x80, P2=0x86) — Extended APDU Case 4
+    // DECRYPT DATA (INS=0xB3, CLA=0x80) — Extended APDU Case 4
     // ---------------------------------------------------------------------
-    fn decrypt(&self, ciphertext: &[u8]) -> Vec<u8> {
+    fn decrypt(&self, p1: u8, p2: u8, ciphertext: &[u8]) -> Vec<u8> {
+        if p1 != EUDS_DEC_P1 || p2 != EUDS_DEC_P2 {
+            return make_status(SW_INVALID_P1P2);
+        }
         // Input: 256 bytes (RSA-2048 block) — sent via Extended APDU Case 4
-        // C-APDU: 80 2A 80 86 00 01 00 [256 bytes] 00 00
+        // C-APDU: 80 B3 80 86 00 01 00 [256 bytes] 00 00
 
         // Default to PKCS#1 v1.5 unpad (minidriver should send padding info via separate mechanism if OAEP needed)
         match self.rsa_decrypt_pkcs1(ciphertext) {
@@ -868,6 +882,7 @@ mod tests {
         let mut engine = test_engine(PinMode::NotRequired);
         let mut apdu = vec![0x00, 0xA4, 0x04, 0x00, 0x09];
         apdu.extend(EUDS_AID);
+        apdu.push(0x00); // Le = 00 (expect FCI response per ISO 7816-4 §7.1.1)
         let resp = engine.process_apdu(1, &apdu);
         assert_eq!(resp, vec![0x90, 0x00]);
     }
@@ -875,7 +890,7 @@ mod tests {
     #[test]
     fn test_select_wrong_aid() {
         let mut engine = test_engine(PinMode::NotRequired);
-        let apdu = vec![0x00, 0xA4, 0x04, 0x00, 0x05, 0x00, 0x01, 0x02, 0x03, 0x04];
+        let apdu = vec![0x00, 0xA4, 0x04, 0x00, 0x05, 0x00, 0x01, 0x02, 0x03, 0x04, 0x00];
         let resp = engine.process_apdu(1, &apdu);
         assert_eq!(resp[0], 0x6A); // SW_FILE_NOT_FOUND
     }
@@ -883,7 +898,7 @@ mod tests {
     #[test]
     fn test_verify_pin_not_required() {
         let mut engine = test_engine(PinMode::NotRequired);
-        let apdu = vec![0x80, 0x20, 0x00, 0x80, 0x04, 0x31, 0x32, 0x33, 0x34];
+        let apdu = vec![0x80, 0xB1, 0x00, 0x80, 0x04, 0x31, 0x32, 0x33, 0x34];
         let resp = engine.process_apdu(1, &apdu);
         assert_eq!(resp, vec![0x90, 0x00]); // Always success
     }
@@ -891,7 +906,7 @@ mod tests {
     #[test]
     fn test_verify_pin_correct() {
         let mut engine = test_engine(PinMode::Required);
-        let apdu = vec![0x80, 0x20, 0x00, 0x80, 0x04, 0x74, 0x65, 0x73, 0x74];
+        let apdu = vec![0x80, 0xB1, 0x00, 0x80, 0x04, 0x74, 0x65, 0x73, 0x74];
         let resp = engine.process_apdu(1, &apdu);
         assert_eq!(resp, vec![0x90, 0x00]);
     }
@@ -899,7 +914,7 @@ mod tests {
     #[test]
     fn test_verify_pin_wrong() {
         let mut engine = test_engine(PinMode::Required);
-        let apdu = vec![0x80, 0x20, 0x00, 0x80, 0x05, 0x77, 0x72, 0x6F, 0x6E, 0x67];
+        let apdu = vec![0x80, 0xB1, 0x00, 0x80, 0x05, 0x77, 0x72, 0x6F, 0x6E, 0x67];
         let resp = engine.process_apdu(1, &apdu);
         assert_eq!(resp[0], 0x63); // SW_VERIFY_FAILED
         assert_eq!(resp[1], 0xC2); // 2 retries left
@@ -908,8 +923,8 @@ mod tests {
     #[test]
     fn test_get_certificate() {
         let mut engine = test_engine(PinMode::NotRequired);
-        // Extended APDU Case 2: 80 B0 00 00 00 00
-        let apdu = vec![0x80, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x00];
+        // Extended APDU Case 2: 80 B4 00 00 00 00
+        let apdu = vec![0x80, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x00];
         let resp = engine.process_apdu(1, &apdu);
         assert!(resp.ends_with(&[0x90, 0x00]));
         assert_eq!(resp.len(), 2 + 2); // 2 bytes cert + 2 bytes SW
@@ -922,7 +937,7 @@ mod tests {
         let mut engine = EudsEngine::new(large_cert_der, private_key, "".to_string(), PinMode::NotRequired);
 
         // Extended APDU Case 2
-        let apdu = vec![0x80, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let apdu = vec![0x80, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x00];
         let resp = engine.process_apdu(1, &apdu);
 
         // First chunk: 256 bytes + 61 2C (44 bytes remaining)
@@ -930,8 +945,8 @@ mod tests {
         assert_eq!(resp[256], 0x61);
         assert_eq!(resp[257], 44);
 
-        // Fetch remaining 44 bytes via GET RESPONSE: 00 C0 00 00 2C
-        let get_resp_apdu = vec![0x00, 0xC0, 0x00, 0x00, 44];
+        // Fetch remaining 44 bytes via GET RESPONSE: 80 C0 00 00 2C (CLA=0x80 matches original command)
+        let get_resp_apdu = vec![0x80, 0xC0, 0x00, 0x00, 44];
         let resp2 = engine.process_apdu(1, &get_resp_apdu);
         assert_eq!(resp2.len(), 44 + 2);
         assert!(resp2.ends_with(&[0x90, 0x00]));
@@ -940,7 +955,8 @@ mod tests {
     #[test]
     fn test_get_public_key() {
         let mut engine = test_engine(PinMode::NotRequired);
-        let apdu = vec![0x80, 0x46, 0x00, 0x00];
+        // Extended APDU Case 2: 80 46 00 00 00 01 07 (Le=263)
+        let apdu = vec![0x80, 0x46, 0x00, 0x00, 0x00, 0x01, 0x07];
         let resp = engine.process_apdu(1, &apdu);
         
         // Response > 256 bytes, so first chunk must return 256 bytes of data + 61 07 (7 bytes remaining)
@@ -948,8 +964,8 @@ mod tests {
         assert_eq!(resp[256], 0x61);
         assert_eq!(resp[257], 0x07);
 
-        // Fetch remaining 7 bytes via GET RESPONSE APDU: 00 C0 00 00 07
-        let get_resp_apdu = vec![0x00, 0xC0, 0x00, 0x00, 0x07];
+        // Fetch remaining 7 bytes via GET RESPONSE APDU: 80 C0 00 00 07 (CLA=0x80 matches original)
+        let get_resp_apdu = vec![0x80, 0xC0, 0x00, 0x00, 0x07];
         let resp2 = engine.process_apdu(1, &get_resp_apdu);
         assert_eq!(resp2.len(), 7 + 2);
         assert!(resp2.ends_with(&[0x90, 0x00]));
@@ -958,8 +974,8 @@ mod tests {
     #[test]
     fn test_sign_without_pin_fails() {
         let mut engine = test_engine(PinMode::Required);
-        // PSO SIGN without PIN verified
-        let apdu = vec![0x80, 0x2A, 0x9E, 0x9A, 0x00]; // no data
+        // SIGN without PIN verified — valid APDU with Lc=1, 1 dummy byte, Le=00
+        let apdu = vec![0x80, 0xB2, 0x9E, 0x9A, 0x01, 0x00, 0x00];
         let resp = engine.process_apdu(1, &apdu);
         assert_eq!(resp, vec![0x69, 0x82]); // SW_SECURITY_STATUS_NOT_SATISFIED
     }
@@ -968,10 +984,10 @@ mod tests {
     fn test_sign_with_pin() {
         let mut engine = test_engine(PinMode::Required);
         // Verify PIN first
-        let verify = vec![0x80, 0x20, 0x00, 0x80, 0x04, 0x74, 0x65, 0x73, 0x74];
+        let verify = vec![0x80, 0xB1, 0x00, 0x80, 0x04, 0x74, 0x65, 0x73, 0x74];
         engine.process_apdu(1, &verify);
-        // PSO SIGN with dummy digest info
-        let mut sign = vec![0x80, 0x2A, 0x9E, 0x9A, 0x20]; // Lc=32
+        // SIGN with dummy digest info
+        let mut sign = vec![0x80, 0xB2, 0x9E, 0x9A, 0x20]; // Lc=32
         sign.extend_from_slice(&[0x30; 32]); // dummy DigestInfo
         sign.push(0x00); // Le=00 (expect 256 bytes response)
         let resp = engine.process_apdu(1, &sign);
@@ -986,7 +1002,7 @@ mod tests {
         let cert_der = vec![0x30, 0x82];
         let mut engine = EudsEngine::new(cert_der, private_key.clone(), "testpin".to_string(), PinMode::Required);
         // Verify PIN
-        let verify = vec![0x80, 0x20, 0x00, 0x80, 0x04, 0x74, 0x65, 0x73, 0x74];
+        let verify = vec![0x80, 0xB1, 0x00, 0x80, 0x04, 0x74, 0x65, 0x73, 0x74];
         engine.process_apdu(1, &verify);
 
         // Encrypt a known plaintext with the public key
@@ -995,8 +1011,8 @@ mod tests {
         let ciphertext = pub_key.encrypt(&mut rand::thread_rng(), Pkcs1v15Encrypt, plaintext).unwrap();
         assert_eq!(ciphertext.len(), 256); // RSA-2048
 
-        // DECRYPT Extended APDU Case 4: 80 2A 80 86 00 01 00 [256B] 00 00
-        let mut decrypt = vec![0x80, 0x2A, 0x80, 0x86, 0x00, 0x01, 0x00];
+        // DECRYPT Extended APDU Case 4: 80 B3 80 86 00 01 00 [256B] 00 00
+        let mut decrypt = vec![0x80, 0xB3, 0x80, 0x86, 0x00, 0x01, 0x00];
         decrypt.extend(&ciphertext);
         decrypt.extend([0x00, 0x00]); // Le = 2 bytes (extended, 0 = max)
         let resp = engine.process_apdu(1, &decrypt);
@@ -1010,7 +1026,7 @@ mod tests {
     fn test_empty_pin_mode_no_pin_needed_for_sign() {
         let mut engine = test_engine(PinMode::NotRequired);
         // Sign directly without PIN
-        let mut sign = vec![0x80, 0x2A, 0x9E, 0x9A, 0x20];
+        let mut sign = vec![0x80, 0xB2, 0x9E, 0x9A, 0x20];
         sign.extend(vec![0x30; 32]);
         sign.push(0x00); // Le=00
         let resp = engine.process_apdu(1, &sign);
@@ -1032,10 +1048,10 @@ mod tests {
     fn test_per_connection_state() {
         let mut engine = test_engine(PinMode::Required);
         // Connection 1: verify PIN
-        let verify = vec![0x80, 0x20, 0x00, 0x80, 0x04, 0x74, 0x65, 0x73, 0x74];
+        let verify = vec![0x80, 0xB1, 0x00, 0x80, 0x04, 0x74, 0x65, 0x73, 0x74];
         engine.process_apdu(1, &verify);
         // Connection 2: should NOT have PIN verified
-        let sign = vec![0x80, 0x2A, 0x9E, 0x9A, 0x00];
+        let sign = vec![0x80, 0xB2, 0x9E, 0x9A, 0x01, 0x00, 0x00];
         let resp = engine.process_apdu(2, &sign);
         assert_eq!(resp, vec![0x69, 0x82]); // Not verified on conn 2
     }
