@@ -1056,16 +1056,14 @@ fn generate_cache_entry(
     let ctx = contexts.lock().unwrap().get(&ctx_id)?.context;
 
     if name_str.starts_with("Cached_ContainerInfo_") {
+        // The public key DO (7F49) comes back in a single >258-byte response that
+        // msclmd cannot receive over the wire, so it must come from the cache.
         let index = name_str
             .rsplit('_')
             .next()
             .and_then(|s| s.parse::<u8>().ok())
             .unwrap_or(0);
         integration.get_container_info(&ctx, index).ok()
-    } else if name_str.starts_with("Cached_GeneralFile/mscp/kxc00")
-        || name_str.starts_with("Cached_GeneralFile/mscp/ksc00")
-    {
-        integration.get_certificate(&ctx).ok()
     } else {
         None
     }
