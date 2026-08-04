@@ -62,11 +62,16 @@ pub struct RdpRedirections {
     pub audio: bool,
     pub mic: bool,
     pub printing: bool,
+    pub smartcard: bool,
     pub drives: Vec<String>,
     pub webcam: Option<WebcamSettings>,
     pub sound_latency_threshold: Option<u16>,
 }
 ```
+
+> `smartcard`: enables Smart Card redirection using FreeRDP's native channel
+> (winscard on Windows, pcsc-lite on Linux/macOS). Requires the reader to be
+> present on the client machine.
 
 ### `RailSettings` & `RailBehavior`
 Enables RemoteApp mode and sets the rendering behavior strategy.
