@@ -79,13 +79,16 @@ pub(crate) fn dispatch_ioctl(
         SCARD_IOCTL_GETTRANSMITCOUNT => handle_get_transmit_count(operation, out),
         SCARD_IOCTL_GETDEVICETYPEID => handle_get_device_type_id(operation, out),
         SCARD_IOCTL_READCACHEA | SCARD_IOCTL_READCACHEW => {
-            handle_read_cache(operation, out, ioctl == SCARD_IOCTL_READCACHEW)
+            handle_read_cache(integration, operation, out, ioctl == SCARD_IOCTL_READCACHEW)
         }
         SCARD_IOCTL_WRITECACHEA | SCARD_IOCTL_WRITECACHEW => {
             handle_write_cache(operation, ioctl == SCARD_IOCTL_WRITECACHEW)
         }
-        SCARD_IOCTL_GETREADERICON => SCARD_S_SUCCESS,
-        _ => SCARD_E_UNSUPPORTED_FEATURE,
+        SCARD_IOCTL_GETREADERICON => handle_get_reader_icon(operation, out),
+        _ => {
+            log::warn!("smartcard: !!! unhandled IOCTL 0x{:X} !!!", ioctl);
+            SCARD_E_UNSUPPORTED_FEATURE
+        }
     }
 }
 
@@ -911,13 +914,32 @@ fn handle_get_device_type_id(
     out: *mut freerdp_sys::wStream,
 ) -> u32 {
     // RDPDR_DTYP_SMARTCARD = 0x0020
+    // The NDR body is just dwDeviceId (4 bytes); the ReturnCode goes in the
+    // response header Result field (matching smartcard_pack_device_type_id_return).
     log::debug!("smartcard: GET_DEVICE_TYPE_ID — returning 0x0020");
     unsafe {
         use crate::addins::smartcard::device::stream_write_u32;
-        stream_write_u32(out, SCARD_S_SUCCESS);
         stream_write_u32(out, 0x0020);
     }
     SCARD_S_SUCCESS
+}
+
+fn handle_get_reader_icon(
+    _operation: &freerdp_sys::SMARTCARD_OPERATION,
+    out: *mut freerdp_sys::wStream,
+) -> u32 {
+    // No icon available. Matching FreeRDP: body is cbDataLen(0) + null pointer,
+    // ReturnCode in the header Result field.
+    log::debug!("smartcard: GET_READER_ICON — no icon, returning UNSUPPORTED_FEATURE");
+    unsafe {
+        let ret = freerdp_sys::GetReaderIcon_Return {
+            ReturnCode: SCARD_E_UNSUPPORTED_FEATURE as i32,
+            cbDataLen: 0,
+            pbData: std::ptr::null_mut(),
+        };
+        freerdp_sys::smartcard_pack_get_reader_icon_return(out, &ret);
+    }
+    SCARD_E_UNSUPPORTED_FEATURE
 }
 
 // ===========================================================================
@@ -937,6 +959,20 @@ unsafe fn widestr_to_vec(ptr: *const u16) -> Vec<u16> {
         len += 1;
     }
     unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+}
+
+fn widestr_debug(v: &[u16]) -> String {
+    let as_string: String = v
+        .iter()
+        .map(|&c| if (32..=126).contains(&c) { c as u8 as char } else { '.' })
+        .collect();
+    let hex: String = v
+        .iter()
+        .take(16)
+        .map(|c| format!("{:04X}", c))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("\"{}\" [{}]", as_string, hex)
 }
 
 fn handle_write_cache(operation: &freerdp_sys::SMARTCARD_OPERATION, _is_wide: bool) -> u32 {
@@ -959,20 +995,99 @@ fn handle_write_cache(operation: &freerdp_sys::SMARTCARD_OPERATION, _is_wide: bo
 }
 
 fn handle_read_cache(
+    integration: &Arc<dyn SmartcardIntegration>,
     operation: &freerdp_sys::SMARTCARD_OPERATION,
     out: *mut freerdp_sys::wStream,
     _is_wide: bool,
 ) -> u32 {
     let call = unsafe { &operation.call.readCacheW };
     let name = unsafe { widestr_to_vec(call.szLookupName) };
-    log::debug!("smartcard: READ_CACHE — NOT_FOUND (key len={})", name.len());
-    unsafe {
-        let ret = freerdp_sys::ReadCache_Return {
-            ReturnCode: 0x80100070u32 as i32,
-            cbDataLen: 0,
-            pbData: std::ptr::null_mut(),
+    let name_str: String = name.iter().map(|&c| c as u8 as char).collect();
+
+    // Container info cannot be delivered over the wire (pubkey response exceeds
+    // the caller's 258-byte buffer and msclmd does not retry), so generate it from
+    // the card on demand, replicating what the Windows OS cache provides.
+    if name_str.starts_with("Cached_ContainerInfo_") {
+        let cached = CARD_CACHE.lock().unwrap().get(&name).cloned();
+        let data = match cached {
+            Some(d) => d,
+            None => {
+                let card_handle = unsafe { get_card_handle(&call.Common.handles.hCard) };
+                let index = name_str
+                    .rsplit('_')
+                    .next()
+                    .and_then(|s| s.parse::<u8>().ok())
+                    .unwrap_or(0);
+                match integration
+                    .get_container_info(&card_handle, index)
+                    .map(|mut d| {
+                        CARD_CACHE.lock().unwrap().insert(name.clone(), d.clone());
+                        d
+                    }) {
+                    Ok(d) => d,
+                    Err(code) => {
+                        log::debug!(
+                            "smartcard: READ_CACHE — ContainerInfo generation failed (0x{:X})",
+                            code
+                        );
+                        unsafe {
+                            let ret = freerdp_sys::ReadCache_Return {
+                                ReturnCode: 0x80100070u32 as i32,
+                                cbDataLen: 0,
+                                pbData: std::ptr::null_mut(),
+                            };
+                            freerdp_sys::smartcard_pack_read_cache_return(out, &ret);
+                        }
+                        return 0x80100070u32;
+                    }
+                }
+            }
         };
-        freerdp_sys::smartcard_pack_read_cache_return(out, &ret);
+        log::debug!(
+            "smartcard: READ_CACHE — ContainerInfo HIT ({} bytes, key={})",
+            data.len(),
+            widestr_debug(&name)
+        );
+        unsafe {
+            let ret = freerdp_sys::ReadCache_Return {
+                ReturnCode: 0,
+                cbDataLen: data.len() as u32,
+                pbData: data.as_ptr() as *mut _,
+            };
+            freerdp_sys::smartcard_pack_read_cache_return(out, &ret);
+        }
+        return 0;
     }
-    0x80100070u32
+
+    let cache = CARD_CACHE.lock().unwrap();
+    if let Some(data) = cache.get(&name) {
+        log::debug!(
+            "smartcard: READ_CACHE — HIT {} bytes (key={})",
+            data.len(),
+            widestr_debug(&name)
+        );
+        unsafe {
+            let ret = freerdp_sys::ReadCache_Return {
+                ReturnCode: 0,
+                cbDataLen: data.len() as u32,
+                pbData: data.as_ptr() as *mut _,
+            };
+            freerdp_sys::smartcard_pack_read_cache_return(out, &ret);
+        }
+        0
+    } else {
+        log::debug!(
+            "smartcard: READ_CACHE — MISS (key={})",
+            widestr_debug(&name)
+        );
+        unsafe {
+            let ret = freerdp_sys::ReadCache_Return {
+                ReturnCode: 0x80100070u32 as i32,
+                cbDataLen: 0,
+                pbData: std::ptr::null_mut(),
+            };
+            freerdp_sys::smartcard_pack_read_cache_return(out, &ret);
+        }
+        0x80100070u32
+    }
 }

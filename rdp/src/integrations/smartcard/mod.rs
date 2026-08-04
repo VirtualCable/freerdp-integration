@@ -158,6 +158,18 @@ pub trait SmartcardIntegration: Send + Sync + std::fmt::Debug {
     /// Set an attribute of the card or reader.
     fn set_attrib(&self, handle: &ScardHandle, attr_id: u32, data: &[u8]) -> Result<(), u32>;
 
+    // === Container Info (cache emulation) ===
+
+    /// Build the `Cached_ContainerInfo_XX` cache value for a container.
+    ///
+    /// msclmd cannot receive a >258-byte public-key response over the RDPSC wire
+    /// (its receive buffer is fixed and it does not retry), so the container info
+    /// MUST come from the card cache. This method reads the public key from the
+    /// card internally (with a large buffer) and returns the value in the same
+    /// format the Windows OS cache uses (16-byte CSP header + CONTAINER_INFO +
+    /// RSA PUBLICKEYBLOB). `None` when unavailable.
+    fn get_container_info(&self, handle: &ScardHandle, container_index: u8) -> Result<Vec<u8>, u32>;
+
     // === ATR Matching ===
 
     /// Locate cards by ATR pattern matching.

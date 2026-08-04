@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use super::SmartcardIntegration;
 use super::consts::{
-    SCARD_E_INVALID_HANDLE, SCARD_E_UNKNOWN_READER, SCARD_PROTOCOL_T0, SCARD_S_SUCCESS,
-    SCARD_STATE_CHANGED, SCARD_STATE_EMPTY, SCARD_STATE_PRESENT,
+    SCARD_E_INVALID_HANDLE, SCARD_E_UNKNOWN_READER, SCARD_E_UNSUPPORTED_FEATURE,
+    SCARD_PROTOCOL_T0, SCARD_S_SUCCESS, SCARD_STATE_CHANGED, SCARD_STATE_EMPTY,
+    SCARD_STATE_PRESENT,
 };
 use super::types::*;
 
@@ -236,6 +237,10 @@ pub mod dummy {
             _data: &[u8],
         ) -> Result<(), u32> {
             Ok(())
+        }
+
+        fn get_container_info(&self, _handle: &ScardHandle, _container_index: u8) -> Result<Vec<u8>, u32> {
+            Err(SCARD_E_UNSUPPORTED_FEATURE)
         }
 
         fn is_available(&self) -> bool {
