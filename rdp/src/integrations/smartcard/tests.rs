@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use super::SmartcardIntegration;
 use super::consts::{
-    SCARD_E_INVALID_HANDLE, SCARD_E_UNKNOWN_READER, SCARD_PROTOCOL_T0, SCARD_STATE_CHANGED,
-    SCARD_STATE_EMPTY, SCARD_STATE_PRESENT,
+    SCARD_E_INVALID_HANDLE, SCARD_E_UNKNOWN_READER, SCARD_PROTOCOL_T0, SCARD_S_SUCCESS,
+    SCARD_STATE_CHANGED, SCARD_STATE_EMPTY, SCARD_STATE_PRESENT,
 };
 use super::types::*;
 
@@ -192,9 +192,9 @@ pub mod dummy {
             _ctx: &ScardContext,
             _timeout: Duration,
             reader_states: &[ReaderStateIn],
-        ) -> Result<Vec<ReaderStateOut>, u32> {
+        ) -> Result<(Vec<ReaderStateOut>, u32), u32> {
             let cards = self.cards.read().unwrap();
-            Ok(reader_states
+            let states = reader_states
                 .iter()
                 .map(|rs| {
                     let present = cards.iter().any(|c| c.reader == rs.reader_name);
@@ -213,7 +213,8 @@ pub mod dummy {
                             .unwrap_or_default(),
                     }
                 })
-                .collect())
+                .collect();
+            Ok((states, SCARD_S_SUCCESS))
         }
 
         fn begin_transaction(&self, _handle: &ScardHandle) -> Result<(), u32> {

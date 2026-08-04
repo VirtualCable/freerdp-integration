@@ -768,14 +768,15 @@ fn handle_get_status_change(
     );
 
     match integration.get_status_change(&ctx, timeout, &reader_states_in) {
-        Ok(result_states) => {
+        Ok((result_states, return_code)) => {
             log::trace!(
-                "smartcard: get_status_change success, count={}",
+                "smartcard: get_status_change result code=0x{:X} count={}",
+                return_code,
                 result_states.len()
             );
             let mut returned_states = pack_reader_states_out(&result_states);
             let ret = freerdp_sys::LocateCards_Return {
-                ReturnCode: SCARD_S_SUCCESS as i32,
+                ReturnCode: return_code as i32,
                 cReaders: returned_states.len() as u32,
                 rgReaderStates: returned_states.as_mut_ptr(),
             };
@@ -786,7 +787,7 @@ fn handle_get_status_change(
                     if unicode { 1 } else { 0 },
                 );
             }
-            SCARD_S_SUCCESS
+            return_code
         }
         Err(code) => code,
     }

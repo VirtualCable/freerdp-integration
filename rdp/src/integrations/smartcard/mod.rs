@@ -130,12 +130,17 @@ pub trait SmartcardIntegration: Send + Sync + std::fmt::Debug {
     /// Block until one of the readers changes state or the timeout expires.
     ///
     /// This is the most complex operation — see hallazgo E17 in the plan.
+    ///
+    /// Returns the resulting reader states plus the SCard return code
+    /// (`SCARD_S_SUCCESS` when a state change occurred, `SCARD_E_TIMEOUT`
+    /// when the timeout expired without a change). The states are always
+    /// populated, even on timeout, mirroring `SCardGetStatusChange`.
     fn get_status_change(
         &self,
         ctx: &ScardContext,
         timeout: Duration,
         reader_states: &[ReaderStateIn],
-    ) -> Result<Vec<ReaderStateOut>, u32>;
+    ) -> Result<(Vec<ReaderStateOut>, u32), u32>;
 
     // === Transactions ===
 
