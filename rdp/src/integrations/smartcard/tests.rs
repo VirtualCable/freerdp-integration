@@ -239,7 +239,11 @@ pub mod dummy {
             Ok(())
         }
 
-        fn get_container_info(&self, _handle: &ScardHandle, _container_index: u8) -> Result<Vec<u8>, u32> {
+        fn get_container_info(&self, _ctx: &ScardContext, _container_index: u8) -> Result<Vec<u8>, u32> {
+            Err(SCARD_E_UNSUPPORTED_FEATURE)
+        }
+
+        fn get_certificate(&self, _ctx: &ScardContext) -> Result<Vec<u8>, u32> {
             Err(SCARD_E_UNSUPPORTED_FEATURE)
         }
 

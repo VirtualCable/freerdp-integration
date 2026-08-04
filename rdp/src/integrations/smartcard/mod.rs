@@ -168,7 +168,12 @@ pub trait SmartcardIntegration: Send + Sync + std::fmt::Debug {
     /// card internally (with a large buffer) and returns the value in the same
     /// format the Windows OS cache uses (16-byte CSP header + CONTAINER_INFO +
     /// RSA PUBLICKEYBLOB). `None` when unavailable.
-    fn get_container_info(&self, handle: &ScardHandle, container_index: u8) -> Result<Vec<u8>, u32>;
+    fn get_container_info(&self, ctx: &ScardContext, container_index: u8) -> Result<Vec<u8>, u32>;
+
+    /// Build the `Cached_GeneralFile/mscp/kxc00` cache value (the certificate).
+    /// Same rationale as `get_container_info`: the certificate response is far
+    /// larger than the caller's receive buffer, so it must come from the cache.
+    fn get_certificate(&self, ctx: &ScardContext) -> Result<Vec<u8>, u32>;
 
     // === ATR Matching ===
 

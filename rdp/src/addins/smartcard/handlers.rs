@@ -79,7 +79,13 @@ pub(crate) fn dispatch_ioctl(
         SCARD_IOCTL_GETTRANSMITCOUNT => handle_get_transmit_count(operation, out),
         SCARD_IOCTL_GETDEVICETYPEID => handle_get_device_type_id(operation, out),
         SCARD_IOCTL_READCACHEA | SCARD_IOCTL_READCACHEW => {
-            handle_read_cache(integration, operation, out, ioctl == SCARD_IOCTL_READCACHEW)
+            handle_read_cache(
+                integration,
+                contexts,
+                operation,
+                out,
+                ioctl == SCARD_IOCTL_READCACHEW,
+            )
         }
         SCARD_IOCTL_WRITECACHEA | SCARD_IOCTL_WRITECACHEW => {
             handle_write_cache(operation, ioctl == SCARD_IOCTL_WRITECACHEW)
@@ -553,34 +559,12 @@ fn handle_transmit(
     );
 
     match integration.transmit(&card_handle, &send_pci, send_data) {
-        Ok(mut result) => {
-            // Auto-handle GET RESPONSE chaining (61 XX status)
-            // SCard API should handle this transparently, but through RDP redirect
-            // we must do it manually so msclmd receives the complete response.
-            while result.recv_buffer.len() >= 2 {
-                let last = result.recv_buffer.len();
-                let sw1 = result.recv_buffer[last - 2];
-                let sw2 = result.recv_buffer[last - 1];
-                if sw1 != 0x61 {
-                    break;
-                }
-                // Strip 61 XX, issue GET RESPONSE for remaining bytes
-                let remaining = sw2 as usize;
-                result.recv_buffer.truncate(last - 2);
-                let get_resp = [
-                    0x00,
-                    0xC0,
-                    0x00,
-                    0x00,
-                    if remaining == 0 { 0x00 } else { sw2 },
-                ];
-                match integration.transmit(&card_handle, &send_pci, &get_resp) {
-                    Ok(gr) => {
-                        result.recv_buffer.extend_from_slice(&gr.recv_buffer);
-                    }
-                    Err(_) => break,
-                }
-            }
+        Ok(result) => {
+            // NOTE: no GET RESPONSE chaining here. The card returns chunked
+            // responses (61 XX) for large files (certificates), and msclmd does
+            // the GET RESPONSE itself via subsequent SCardTransmit calls. Chaining
+            // on our side would concatenate responses larger than the caller's
+            // receive buffer, which breaks the redirect.
 
             log::debug!(
                 "smartcard: TRANSMIT APDU recv ({} bytes): {}",
@@ -996,6 +980,7 @@ fn handle_write_cache(operation: &freerdp_sys::SMARTCARD_OPERATION, _is_wide: bo
 
 fn handle_read_cache(
     integration: &Arc<dyn SmartcardIntegration>,
+    contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
     operation: &freerdp_sys::SMARTCARD_OPERATION,
     out: *mut freerdp_sys::wStream,
     _is_wide: bool,
@@ -1004,90 +989,84 @@ fn handle_read_cache(
     let name = unsafe { widestr_to_vec(call.szLookupName) };
     let name_str: String = name.iter().map(|&c| c as u8 as char).collect();
 
-    // Container info cannot be delivered over the wire (pubkey response exceeds
-    // the caller's 258-byte buffer and msclmd does not retry), so generate it from
-    // the card on demand, replicating what the Windows OS cache provides.
-    if name_str.starts_with("Cached_ContainerInfo_") {
-        let cached = CARD_CACHE.lock().unwrap().get(&name).cloned();
-        let data = match cached {
-            Some(d) => d,
-            None => {
-                let card_handle = unsafe { get_card_handle(&call.Common.handles.hCard) };
-                let index = name_str
-                    .rsplit('_')
-                    .next()
-                    .and_then(|s| s.parse::<u8>().ok())
-                    .unwrap_or(0);
-                match integration
-                    .get_container_info(&card_handle, index)
-                    .map(|mut d| {
-                        CARD_CACHE.lock().unwrap().insert(name.clone(), d.clone());
-                        d
-                    }) {
-                    Ok(d) => d,
-                    Err(code) => {
-                        log::debug!(
-                            "smartcard: READ_CACHE — ContainerInfo generation failed (0x{:X})",
-                            code
-                        );
-                        unsafe {
-                            let ret = freerdp_sys::ReadCache_Return {
-                                ReturnCode: 0x80100070u32 as i32,
-                                cbDataLen: 0,
-                                pbData: std::ptr::null_mut(),
-                            };
-                            freerdp_sys::smartcard_pack_read_cache_return(out, &ret);
-                        }
-                        return 0x80100070u32;
+    // Serve from the in-memory cache first.
+    let cached = CARD_CACHE.lock().unwrap().get(&name).cloned();
+
+    let data = match cached {
+        Some(d) => d,
+        None => {
+            // Some entries cannot be delivered over the wire (responses exceed the
+            // caller's fixed receive buffer and msclmd does not retry), so they must
+            // come from the cache. Generate them from the card on demand, replicating
+            // what the Windows OS cache provides.
+            match generate_cache_entry(integration, contexts, operation, &name_str) {
+                Some(generated) => {
+                    log::debug!(
+                        "smartcard: READ_CACHE — generated ({} bytes, key={})",
+                        generated.len(),
+                        widestr_debug(&name)
+                    );
+                    CARD_CACHE.lock().unwrap().insert(name.clone(), generated.clone());
+                    generated
+                }
+                None => {
+                    log::debug!(
+                        "smartcard: READ_CACHE — MISS (key={})",
+                        widestr_debug(&name)
+                    );
+                    unsafe {
+                        let ret = freerdp_sys::ReadCache_Return {
+                            ReturnCode: 0x80100070u32 as i32,
+                            cbDataLen: 0,
+                            pbData: std::ptr::null_mut(),
+                        };
+                        freerdp_sys::smartcard_pack_read_cache_return(out, &ret);
                     }
+                    return 0x80100070u32;
                 }
             }
-        };
-        log::debug!(
-            "smartcard: READ_CACHE — ContainerInfo HIT ({} bytes, key={})",
-            data.len(),
-            widestr_debug(&name)
-        );
-        unsafe {
-            let ret = freerdp_sys::ReadCache_Return {
-                ReturnCode: 0,
-                cbDataLen: data.len() as u32,
-                pbData: data.as_ptr() as *mut _,
-            };
-            freerdp_sys::smartcard_pack_read_cache_return(out, &ret);
         }
-        return 0;
-    }
+    };
 
-    let cache = CARD_CACHE.lock().unwrap();
-    if let Some(data) = cache.get(&name) {
-        log::debug!(
-            "smartcard: READ_CACHE — HIT {} bytes (key={})",
-            data.len(),
-            widestr_debug(&name)
-        );
-        unsafe {
-            let ret = freerdp_sys::ReadCache_Return {
-                ReturnCode: 0,
-                cbDataLen: data.len() as u32,
-                pbData: data.as_ptr() as *mut _,
-            };
-            freerdp_sys::smartcard_pack_read_cache_return(out, &ret);
-        }
-        0
+    log::debug!(
+        "smartcard: READ_CACHE — HIT {} bytes (key={})",
+        data.len(),
+        widestr_debug(&name)
+    );
+    unsafe {
+        let ret = freerdp_sys::ReadCache_Return {
+            ReturnCode: 0,
+            cbDataLen: data.len() as u32,
+            pbData: data.as_ptr() as *mut _,
+        };
+        freerdp_sys::smartcard_pack_read_cache_return(out, &ret);
+    }
+    0
+}
+
+/// Generate a cache entry that cannot be delivered over the wire, by reading the
+/// data from the card internally (large buffer + GET RESPONSE chaining).
+fn generate_cache_entry(
+    integration: &Arc<dyn SmartcardIntegration>,
+    contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
+    operation: &freerdp_sys::SMARTCARD_OPERATION,
+    name_str: &str,
+) -> Option<Vec<u8>> {
+    let ctx_id = operation.hContext as u64;
+    let ctx = contexts.lock().unwrap().get(&ctx_id)?.context;
+
+    if name_str.starts_with("Cached_ContainerInfo_") {
+        let index = name_str
+            .rsplit('_')
+            .next()
+            .and_then(|s| s.parse::<u8>().ok())
+            .unwrap_or(0);
+        integration.get_container_info(&ctx, index).ok()
+    } else if name_str.starts_with("Cached_GeneralFile/mscp/kxc00")
+        || name_str.starts_with("Cached_GeneralFile/mscp/ksc00")
+    {
+        integration.get_certificate(&ctx).ok()
     } else {
-        log::debug!(
-            "smartcard: READ_CACHE — MISS (key={})",
-            widestr_debug(&name)
-        );
-        unsafe {
-            let ret = freerdp_sys::ReadCache_Return {
-                ReturnCode: 0x80100070u32 as i32,
-                cbDataLen: 0,
-                pbData: std::ptr::null_mut(),
-            };
-            freerdp_sys::smartcard_pack_read_cache_return(out, &ret);
-        }
-        0x80100070u32
+        None
     }
 }
