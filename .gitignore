@@ -4,3 +4,6 @@ Cargo.lock
 .vscode/
 .idea/
 graphify*
+backup_thoughts/
+docs/ISO*
+/local_dlls

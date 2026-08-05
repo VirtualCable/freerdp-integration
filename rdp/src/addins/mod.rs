@@ -6,6 +6,7 @@
 pub(crate) mod addin;
 pub(crate) mod audio_input;
 pub(crate) mod audio_output;
+pub(crate) mod smartcard;
 pub(crate) mod webcam;
 
 pub const RDPSND_SUBSYSTEM_CUSTOM: &str = "bmsnd";
