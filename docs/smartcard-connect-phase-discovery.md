@@ -126,8 +126,43 @@ respuesta única > buffer del caller), pero en esta tarjeta/flujo **nunca se dis
 3. **`get_container_info` del backend native (lectura OS cache + fallback 7F49) quedó en desuso**:
    con el canal devolviendo `MISS`, msclmd lo hace todo vía TRANSMIT/WRITE_CACHE.
 4. **Para la tarjeta emulada**: el diseño es el mismo. msclmd descubrirá la tarjeta emulada con la
-   misma secuencia de APDUs (SELECT, GET DATA 7F49, GET RESPONSE...); nuestro backend emulado debe
-   responderlos. ContainerInfo_00 lo construye msclmd (no nosotros).
+   misma secuencia de APDUs (SELECT, GET DATA 7F49, GET RESPONSE...); el backend emulado las
+   responde. ContainerInfo_00 lo construye msclmd (no nosotros).
+
+---
+
+## Tarjeta emulada (GIDS)
+
+Emula la tarjeta GIDS de referencia (mismo ATR, AID, cardid y GUID de contenedor) con la clave
+pública/certificado del usuario. El backend vive en `uds-client/crates/channels/src/smartcard/emulated/`
+(`GidsEngine`).
+
+### Activación
+
+- **Opción** (`uds-client`): `smartcard_emulated` con un spec (JS/launcher):
+  - `file:<path>` → fichero PEM local (puede contener cert + key).
+  - `pem:<cert_pem>,<key_pem>` → cert y key como PEM directos.
+  - `userdefined:` → reservado (futuro; usar un cert del navegador en el cliente HTML5).
+  - Si el spec es inválido → warning y **sin smartcard** (el canal no se registra).
+- **Entorno (dev/tests)**: `UDS_SMARTCARD_EMULATED=1` + `UDS_SMARTCARD_KEYS="cert.pem;key.pem"`.
+- Si no hay smartcard real (spec inválido o PC/SC no disponible) → `SmartcardHandle::new()` devuelve
+  `None` y la redirección no se activa (ya no hay backend dummy).
+
+### Formato del certificado
+
+El `Cached_GeneralFile/mscp/kxcXX` debe servirse **comprimido**: `01 00` + longitud sin comprimir
+(2 bytes **little-endian**) + DER comprimido con **zlib**. El BaseCSP lo descomprime (el flag
+`fCertificateCompression` de CARD_CAPABILITIES está a FALSE en la tarjeta de referencia).
+
+### PIN = password de la clave privada
+
+- El cert (público) se muestra **sin PIN**.
+- Al cargar la key en `GidsEngine::new()`:
+  - Si la key **no tiene password** → el PIN no es necesario (se firma sin pedirlo).
+  - Si la key **está cifrada** → el PIN es su password: `VERIFY` intenta **descifrar la key** con el
+    PIN introducido; si abre, correcto (se guarda la `d`); si no, `63 CX`. La parte pública (7F49)
+    se sirve desde el **SPKI del certificado** (disponible sin PIN).
+- El PIN solo se pide cuando msclmd necesita operar con la clave privada (firmar/descifrar).
 
 ---
 
@@ -144,7 +179,9 @@ respuesta única > buffer del caller), pero en esta tarjeta/flujo **nunca se dis
 
 ## Trabajo pendiente
 
-- Decidir si el addin debe mantener la generación de `ContainerInfo_00` (código muerto hoy) o
-  eliminar `get_container_info` del backend y dejar que msclmd lo resuelva siempre.
-- Emular la tarjeta: implementar el backend que responda la secuencia de descubrimiento
-  (SELECT GIDS, GET DATA DF1F/DF20/DF22/7F73, GET DATA 7F49 + GET RESPONSE, etc.).
+- Revisar si el addin debe mantener la generación de `ContainerInfo_00` (código muerto hoy, con
+  `get_container_info` devolviendo Err) o eliminarla del todo.
+- Emulador: soportar más formatos de entrada (p.e. DER / PKCS#12) si se necesitan, y el caso
+  `userdefined:` (cert del navegador en el cliente HTML5).
+- Decidir el manejo del `smartcard_emulated` en el cliente HTML5 (cómo exponer un certificado del
+  navegador como tarjeta emulada).
