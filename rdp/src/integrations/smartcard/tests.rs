@@ -319,9 +319,10 @@ pub mod dummy {
                     current_state: 0,
                 },
             ];
-            let out = dummy
+            let (out, return_code) = dummy
                 .get_status_change(&ctx, Duration::from_millis(100), &states)
                 .unwrap();
+            assert_eq!(return_code, SCARD_S_SUCCESS);
             assert_eq!(out.len(), 2);
             assert_ne!(out[0].event_state & SCARD_STATE_PRESENT, 0);
             assert_eq!(out[1].event_state & SCARD_STATE_PRESENT, 0);
