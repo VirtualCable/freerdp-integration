@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use crate::integrations::SmartcardIntegration;
 use crate::integrations::smartcard::{
-    SCARD_E_INVALID_HANDLE, SCARD_E_NO_READERS_AVAILABLE, SCARD_E_UNSUPPORTED_FEATURE,
-    SCARD_S_SUCCESS, SCARD_STATE_ATRMATCH,
+    SCARD_E_INSUFFICIENT_BUFFER, SCARD_E_INVALID_HANDLE, SCARD_E_NO_READERS_AVAILABLE,
+    SCARD_E_UNSUPPORTED_FEATURE, SCARD_S_SUCCESS, SCARD_STATE_ATRMATCH,
 };
 use crate::utils::log;
 
@@ -589,8 +589,30 @@ fn handle_transmit(
             };
 
             let mut recv_buf = result.recv_buffer;
+
+            // FINDING (2026-08-05): msclmd reads large DOs (e.g. the container
+            // public key `7F 49`) in CHUNKS — it asks with Le=0x00 (≤256 + SW, 258
+            // bytes) and pulls the rest with GET RESPONSE — so the response never
+            // exceeds the caller's receive buffer and this branch never fires.
+            // It is kept as a defensive guard mirroring Windows SCardTransmit:
+            // if a single response ever exceeds the caller's buffer, return
+            // SCARD_E_INSUFFICIENT_BUFFER with the required size so the caller can
+            // retry. Serving the full response with SUCCESS while the caller
+            // requested a smaller buffer is rejected by msclmd.
+            let caller_len = call.cbRecvLength;
+            let return_code = if caller_len > 0 && (recv_buf.len() as u32) > caller_len {
+                log::debug!(
+                    "smartcard: TRANSMIT recv {} bytes > caller buffer {} -> INSUFFICIENT_BUFFER (msclmd should retry)",
+                    recv_buf.len(),
+                    caller_len
+                );
+                SCARD_E_INSUFFICIENT_BUFFER
+            } else {
+                SCARD_S_SUCCESS
+            };
+
             let ret = freerdp_sys::Transmit_Return {
-                ReturnCode: SCARD_S_SUCCESS as i32,
+                ReturnCode: return_code as i32,
                 pioRecvPci: pio_recv_pci
                     .as_ref()
                     .map(|b| b.as_ptr() as freerdp_sys::LPSCARD_IO_REQUEST)
@@ -1056,8 +1078,12 @@ fn generate_cache_entry(
     let ctx = contexts.lock().unwrap().get(&ctx_id)?.context;
 
     if name_str.starts_with("Cached_ContainerInfo_") {
-        // The public key DO (7F49) comes back in a single >258-byte response that
-        // msclmd cannot receive over the wire, so it must come from the cache.
+        // FINDING (2026-08-05): for the physical card, `get_container_info` returns
+        // Err (see native backend), so this MISSes and msclmd reads the container
+        // public key from the card itself via TRANSMIT (7F49 + GET RESPONSE, chunked,
+        // no PIN) and WRITE_CACHEs it. See docs/smartcard-connect-phase-discovery.md.
+        // For the emulated card, `get_container_info` will return the container data
+        // (correct little-endian modulus) and this will serve it instead of missing.
         let index = name_str
             .rsplit('_')
             .next()

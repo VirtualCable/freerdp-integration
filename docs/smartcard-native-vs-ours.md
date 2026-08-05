@@ -1,5 +1,14 @@
 # Smartcard: Canal Nativo FreeRDP vs. Nuestro Addin Rust — Diferencias
 
+> ⚠️ **ACTUALIZACIÓN (2026-08-05):** varias conclusiones de este documento quedaron obsoletas.
+> Ver **`smartcard-connect-phase-discovery.md`** para los hallazgos que las corrigen:
+> - el pubkey del contenedor SÍ se puede leer de la tarjeta por TRANSMIT (en trozos, sin PIN);
+> - `4D11...` y `82E2...` son la misma clave (byte-order), no keyexchange vs certificado;
+> - `INSUFFICIENT_BUFFER` no es necesario (msclmd trocea con GET RESPONSE);
+> - el flujo es autónomo sin OS cache.
+>
+> Referencias (históricas):
+
 > Documento de análisis comparativo. Referencias:
 > - Nativo: `Z:\projects\FreeRDP\channels\smartcard\client\smartcard_main.c`, `libfreerdp\utils\smartcard_call.c`, `smartcard_pack.c`, `smartcard_operations.c`
 > - Nuestro: `rdp/src/addins/smartcard/` (mod.rs, device.rs, handlers.rs, consts.rs) + `rdp/src/integrations/smartcard/` (trait)
