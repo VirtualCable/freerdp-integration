@@ -279,7 +279,7 @@ impl Rdp {
                 freerdp_settings_set_bool(
                     settings,
                     FreeRDP_Settings_Keys_Bool_FreeRDP_RedirectSmartCards,
-                    self.config.settings.redirections.smartcard.into(),
+                    self.config.settings.redirections.smartcard.enabled.into(),
                 );
 
                 if self.config.settings.redirections.printing {
@@ -289,12 +289,6 @@ impl Rdp {
                         true.into(),
                     );
                 }
-
-                freerdp_settings_set_bool(
-                    settings,
-                    FreeRDP_Settings_Keys_Bool_FreeRDP_RedirectSmartCards,
-                    self.config.settings.redirections.smartcard.into(),
-                );
 
                 freerdp_settings_set_bool(
                     settings,
