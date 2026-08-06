@@ -85,18 +85,10 @@ pub struct RdpRedirections {
     pub audio: bool,
     pub mic: bool,
     pub printing: bool,
-    pub smartcard: SmartcardSettings,
+    pub smartcard: bool,
     pub drives: Vec<String>,
     pub webcam: Option<WebcamSettings>,
     pub sound_latency_threshold: Option<u16>,
-}
-
-/// Smartcard redirection settings: whether it is enabled and, optionally, the
-/// emulated card spec (`file:...` / `pem:...` / `userdefined:`).
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize, Zeroize)]
-pub struct SmartcardSettings {
-    pub enabled: bool,
-    pub emulated: Option<String>,
 }
 
 #[derive(
@@ -159,7 +151,7 @@ impl Default for RdpSettings {
                 audio: true,
                 mic: false,
                 printing: false,
-                smartcard: SmartcardSettings::default(),
+                smartcard: false,
                 drives: vec!["all".to_string()],
                 webcam: None,
                 sound_latency_threshold: None,
