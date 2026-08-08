@@ -166,6 +166,50 @@ El `Cached_GeneralFile/mscp/kxcXX` debe servirse **comprimido**: `01 00` + longi
 
 ---
 
+## Soporte ECDSA (2026-08-08)
+
+El emulador (`GidsEngine`) detecta automáticamente el tipo de clave al cargarla:
+
+- **RSA** (PKCS#1 v1.5): `7F49` con tags `81` (módulo) + `82` (exponente); PSO devuelve la
+  firma cruda de `key_size` bytes.
+- **ECDSA P-256 / P-384 / P-521** (mech ref GIDS `0C`/`0D`/`0E`):
+  - `7F49` = tag **`86`** con el punto **`04 ‖ X ‖ Y`** (uncompressed).
+  - PSO (`2A 9E 9A`) firma el **hash precomputado** enviado por msclmd y devuelve
+    `EC Signature ::= SEQUENCE { r INTEGER, s INTEGER }` (DER), tal como define GIDS v2.0.
+  - El PIN sigue siendo la password de la key: si la key EC está cifrada, `VERIFY` la descifra
+    (PBES2) y guarda el SigningKey; la parte pública se sirve desde el SPKI del certificado.
+
+Detalle de implementación: p521 0.13.x tiene el wrapper `SigningKey` roto (sin
+`DecodePrivateKey` ni feature `verifying`), por lo que P-521 parsea el PKCS#8 a mano y
+descifra el PEM cifrado vía `pkcs8::EncryptedPrivateKeyInfo` (PBES2).
+
+### BLOQUEADO: descubrimiento del contenedor ECDSA en Windows (2026-08-09)
+
+La **firma** ECDSA del emulador es spec-correcta y está verificada (tests unitarios P-256/384/521,
+cifrados y sin cifrar). Pero **msclmd no descubre el contenedor ECDSA**:
+
+- msclmd lee el `7F49` y **solo construye contenedores RSA** (tags `81/82`). El tag `86` (punto ECC)
+  lo **ignora** → no crea contenedor. Sirviendo `81=X, 82=Y` msclmd construye un blob **RSA-256
+  roto** (trata X como módulo) → `CryptExportPublicKeyInfo` falla.
+- Se probó servir `ContainerInfo_00` directamente por el hook `get_container_info`
+  (handlers.rs:1080) con varios formatos (BCRYPT_ECCKEY_BLOB puro, X/Y big/little-endian, wrapper
+  CAPI BLOBHEADER + CALG_ECDSA_P256, en cbSig/cbKeyEx): el mejor llegó a mostrar el GUID del
+  contenedor y a llegar a `CryptExportPublicKeyInfo`, pero **ninguno consigue que el KSP importe la
+  clave** (`NTE_BAD_KEYSET` / `RPC_X_NULL_REF_POINTER`).
+- **El formato exacto del blob ECC del contenedor no está documentado** (msclmd es código cerrado
+  de Microsoft; el spec GIDS no lo cubre). Sin una tarjeta GIDS real que soporte ECDSA para capturar
+  la referencia, es adivinar.
+
+**Qué necesitamos para desbloquearlo:** una **tarjeta GIDS/Javacard con soporte ECDSA** real
+(parecen poco comunes; la mayoría, incluida la FNMT, usan RSA) para capturar el flujo de referencia
+(7F49 ECC + ContainerInfo_XX que msclmd escribe).
+
+**Estado actual:** el emulador cubre el caso **RSA completo** (descubrimiento + cert + firma con
+PIN, verificado con certutil). ECDSA queda **parcial**: firma OK, descubrimiento en Windows
+pendiente de tarjeta real.
+
+---
+
 ## Evidencia
 
 - Runs 17:11, 17:27 (certutil completo, funciona: "coincidencia de clave pública correcta") y
@@ -185,3 +229,4 @@ El `Cached_GeneralFile/mscp/kxcXX` debe servirse **comprimido**: `01 00` + longi
   `userdefined:` (cert del navegador en el cliente HTML5).
 - Decidir el manejo del `smartcard_emulated` en el cliente HTML5 (cómo exponer un certificado del
   navegador como tarjeta emulada).
+- Probar ECDSA de punta a punta con certutil en la VM (`ecdsa256/384/521.crt`, PIN `testpass`).
