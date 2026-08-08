@@ -164,6 +164,18 @@ El `Cached_GeneralFile/mscp/kxcXX` debe servirse **comprimido**: `01 00` + longi
     se sirve desde el **SPKI del certificado** (disponible sin PIN).
 - El PIN solo se pide cuando msclmd necesita operar con la clave privada (firmar/descifrar).
 
+### VERIFY como consulta de estado (2026-08-09)
+
+msclmd envía `00 20 00 80` **sin datos** (Lc=0) como **consulta del estado del PIN** antes de
+mostrar el diálogo. Debe responder con el contador de intentos **sin decrementar** (`63 CX` con el
+valor actual). Un bug inicial lo trataba como intento fallido (password vacía) y bloqueaba la tarjeta
+tras unas pocas consultas. Fijado: `data.is_empty()` → reporta `63 CX` actual (o `9000` si ya
+verificado) sin tocar el contador.
+
+Al agotar los intentos (`63 C0`), la tarjeta responde `69 83` (auth method blocked) a VERIFY y
+PSO devuelve `69 82`; **solo se bloquea la clave privada** — lo público (cert DF24, pubkey 7F49,
+propiedades) sigue con `90 00`.
+
 ---
 
 ## Soporte ECDSA (2026-08-08)
