@@ -220,6 +220,47 @@ cifrados y sin cifrar). Pero **msclmd no descubre el contenedor ECDSA**:
 PIN, verificado con certutil). ECDSA queda **parcial**: firma OK, descubrimiento en Windows
 pendiente de tarjeta real.
 
+### CONCLUSIÓN: el ecosistema GIDS es RSA-only (2026-08-09)
+
+Confirmado de forma **definitiva y empírica** que las GIDS no hacen ECDSA:
+
+1. **El applet de referencia** (`vletoux/GidsApplet`, el de MySmartLogon, el mismo de la N99)
+   solo genera claves **RSA** (`KeyPair.ALG_RSA_CRT`, 1024-4096); sin rastro de ECDSA en su código.
+   Los forks (JavaCardOS/GidsApp) también son solo RSA.
+2. **Una GIDS real** (J3R180 de JavacardOS + GidsApplet 1.3 inicializada, registrada en Calais con
+   el minidriver `msclmd.dll`) **rechaza crear un contenedor ECDSA** (`SCARD_E_UNSUPPORTED_FEATURE`
+   en `certreq -new` con ECDSA_P384).
+3. **msclmd solo construye contenedores RSA** desde el `7F49` (ignora el tag `86`).
+
+Conclusión: el bloqueo del contenedor ECDSA **no es de nuestro emulador** — es que el perfil GIDS
+completo (applet + msclmd) es RSA-only por diseño. La firma ECDSA del emulador queda como base
+spec-correcta, pero el descubrimiento en Windows es un callejón sin salida.
+
+---
+
+## Secuencia de ENROLL real (GIDS física J3R180, capturada 2026-08-09)
+
+`certreq -new` (RSA 2048, PIN `1234`) a través de **nuestro redirector** con la tarjeta física
+(msclmd en la VM, tarjeta en el host). Orden real de los APDUs:
+
+| Paso | APDU | Qué hace |
+|------|------|----------|
+| 1 | `00 20 00 80 04 31 32 33 34` | VERIFY PIN `1234` |
+| 2 | `00 20 00 82` | VERIFY slot 2 (sin uso) |
+| 3 | `00 DB A0 10 59 DF 23 56 <GUID utf16> 00 00 03 00 00 00 00 10` | PUT DATA **cmapfile**: crea el `CONTAINERMAPRECORD` con GUID nuevo `tq-...` y tamaño de clave |
+| 4 | `00 DB A0 10 09 DF 22 06 00 00 01 00 03 00` (y variantes) | PUT DATA **cardcf**: actualiza config/freshness |
+| 5 | `00 DB A0 00 10 DF 20 0D 01 01 00 ...` | PUT DATA **cardid** (PIN info) |
+| 6 | `00 47 00 00 08 AC 06 80 01 07 83 01 81` | **GENERATE ASYMMETRIC KEY PAIR**: mech `80 01 07` (RSA 2048), key ref `83 01 81` |
+| 7 | `00 CB 3F FF 0A 70 08 84 01 81 A5 03 7F 49 80 00` + `00 C0 00 00 0E` | GET DATA **7F49** + GET RESPONSE: lee el pubkey generado |
+| 8 | `00 22 41 B6 06 80 01 57 84 01 81` | **MSE SET** (DST CRT: mech `57`=PKCS1 v1.5 RSA 2048, key ref `81`) |
+| 9 | `00 2A 9E 9A 33 30 31 30 ...` | **PSO sign** (SHA-256 DigestInfo) → **258 bytes** (firma RSA) |
+
+Log de referencia: `smartcard-baseline/j3r180-enroll-rsa2048.log`. Útil para soportar la **escritura**
+(creación de contenedores/claves) en el emulador si se necesita a futuro.
+
+Nota: **RSA 4096 falla** con `SCARD_E_UNSUPPORTED_FEATURE` en esta J3R180 (el applet 1.3 lo soporta,
+pero la tarjeta no genera 4096 on-card / el minidriver lo limita). 2048 y 3072 funcionan.
+
 ---
 
 ## Evidencia
