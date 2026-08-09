@@ -261,6 +261,24 @@ Log de referencia: `smartcard-baseline/j3r180-enroll-rsa2048.log`. Útil para so
 Nota: **RSA 4096 falla** con `SCARD_E_UNSUPPORTED_FEATURE` en esta J3R180 (el applet 1.3 lo soporta,
 pero la tarjeta no genera 4096 on-card / el minidriver lo limita). 2048 y 3072 funcionan.
 
+### Secuencia de INSTALACIÓN del cert (`certreq -accept`, capturada 2026-08-09)
+
+`certreq -accept request-rsa.cer` (el cert firmado por nuestra TestRootCA) → msclmd escribe el
+certificado en la tarjeta. Orden real:
+
+| Paso | APDU | Qué hace |
+|------|------|----------|
+| 1 | `00 20 00 80 04 31 32 33 34` | VERIFY PIN `1234` |
+| 2 | `00 E0 00 00 49 62 47 82 01 18 83 02 B0 81 8C 05 8F 10 10 10 00 A5 37 B8 09 80 01 07 83 01 81 95 01 40 ...` | **CREATE FILE**: crea el EF de clave (FCP `82 01 18` = key EF, `8C` = security attrs, `A5` = lista de CRTs: mech `07`/`87`/`47` (RSA) y `17`/`57` (firma), key ref `81`) |
+| 3 | `00 DB A0 10 78 7E AE 68 ...` | PUT DATA del EF de clave (tag `78`, escribe la clave) |
+| 4 | `10 DB A0 10 F0 DF 24 82 04 33 01 00 33 04 78 DA 33 ...` (chaining, CLA=0x10) | PUT DATA del **cert (DF 24)**: `01 00` + longitud sin comprimir (2 bytes LE) + **zlib** — **el mismo formato que usa nuestro emulador** |
+| 5 | `00 DB A0 10 59 DF 23 ...` / `00 DB A0 10 09 DF 22 ...` | Actualiza cmapfile + cardcf (estado final) |
+
+Log de referencia: `smartcard-baseline/j3r180-accept-rsa2048.log`.
+
+**Validación clave:** el formato del cert en la tarjeta real (`01 00 <lenLE> <zlib>`) **coincide con el
+que sirve nuestro emulador** (DF24) — la emulación del cert es fiel a la física.
+
 ---
 
 ## Evidencia
