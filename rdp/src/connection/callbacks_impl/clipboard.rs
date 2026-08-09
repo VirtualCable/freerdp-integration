@@ -37,10 +37,17 @@ impl ClipboardHandler for Rdp {
                 clipboard_integration.start(Arc::new(RdpClipboardCallback {
                     rdp_clipboard: context.clone(),
                 }));
+                // Always announce our formats (even with no text — e.g. an image on
+                // the local clipboard). The server only starts pushing its own format
+                // list once the client has sent an initial one, so otherwise
+                // remote→local clipboard stops working until the local clipboard has
+                // text (observed with an image in the local clipboard, 2026-08-09).
                 if let Ok(text) = clipboard_integration.get_text()
                     && !text.is_empty()
                 {
                     context.send_text_is_available(&text);
+                } else {
+                    context.send_client_format_list(&[RdpClipboardFormat::TextUnicode]);
                 }
             }
 
