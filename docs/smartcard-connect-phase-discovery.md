@@ -231,6 +231,11 @@ Confirmado de forma **definitiva y empírica** que las GIDS no hacen ECDSA:
    el minidriver `msclmd.dll`) **rechaza crear un contenedor ECDSA** (`SCARD_E_UNSUPPORTED_FEATURE`
    en `certreq -new` con ECDSA_P384).
 3. **msclmd solo construye contenedores RSA** desde el `7F49` (ignora el tag `86`).
+4. **El KSP rechaza ECDSA a nivel de capacidades** (2026-08-09): `certreq -new` con ECDSA_P384
+   contra la GIDS real **no envía ningún APDU de creación** — solo descubrimiento y `RELEASE_CONTEXT`.
+   El KSP pregunta al minidriver por las keysizes de `AT_ECDSA_P384`, el minidriver GIDS solo
+   anuncia RSA, y devuelve `SCARD_E_UNSUPPORTED_FEATURE` **sin tocar la tarjeta**. No hay nada que
+   el emulador pueda servir en el `7F49` para desbloquearlo.
 
 Conclusión: el bloqueo del contenedor ECDSA **no es de nuestro emulador** — es que el perfil GIDS
 completo (applet + msclmd) es RSA-only por diseño. La firma ECDSA del emulador queda como base
