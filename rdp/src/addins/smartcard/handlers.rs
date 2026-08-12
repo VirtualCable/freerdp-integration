@@ -78,15 +78,16 @@ pub(crate) fn dispatch_ioctl(
         }
         SCARD_IOCTL_GETTRANSMITCOUNT => handle_get_transmit_count(operation, out),
         SCARD_IOCTL_GETDEVICETYPEID => handle_get_device_type_id(operation, out),
-        SCARD_IOCTL_READCACHEA | SCARD_IOCTL_READCACHEW => {
-            handle_read_cache(
-                integration,
-                contexts,
-                operation,
-                out,
-                ioctl == SCARD_IOCTL_READCACHEW,
-            )
-        }
+        // The Windows smartcard client currently uses the W variants in the
+        // supported flow. Keep the A codes recognized for now, but they share
+        // the W layout until explicit A-string decoding is needed.
+        SCARD_IOCTL_READCACHEA | SCARD_IOCTL_READCACHEW => handle_read_cache(
+            integration,
+            contexts,
+            operation,
+            out,
+            ioctl == SCARD_IOCTL_READCACHEW,
+        ),
         SCARD_IOCTL_WRITECACHEA | SCARD_IOCTL_WRITECACHEW => {
             handle_write_cache(operation, ioctl == SCARD_IOCTL_WRITECACHEW)
         }
@@ -624,7 +625,7 @@ fn handle_transmit(
             unsafe {
                 freerdp_sys::smartcard_pack_transmit_return(out, &ret);
             }
-            SCARD_S_SUCCESS
+            return_code
         }
         Err(code) => code,
     }
@@ -970,7 +971,13 @@ unsafe fn widestr_to_vec(ptr: *const u16) -> Vec<u16> {
 fn widestr_debug(v: &[u16]) -> String {
     let as_string: String = v
         .iter()
-        .map(|&c| if (32..=126).contains(&c) { c as u8 as char } else { '.' })
+        .map(|&c| {
+            if (32..=126).contains(&c) {
+                c as u8 as char
+            } else {
+                '.'
+            }
+        })
         .collect();
     let hex: String = v
         .iter()
@@ -1028,7 +1035,10 @@ fn handle_read_cache(
                         generated.len(),
                         widestr_debug(&name)
                     );
-                    CARD_CACHE.lock().unwrap().insert(name.clone(), generated.clone());
+                    CARD_CACHE
+                        .lock()
+                        .unwrap()
+                        .insert(name.clone(), generated.clone());
                     generated
                 }
                 None => {
