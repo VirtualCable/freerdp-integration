@@ -502,6 +502,26 @@ pub(crate) unsafe extern "C" fn free_handler(device: *mut DEVICE) -> UINT {
 
     let mut scard = unsafe { Box::from_raw(device as *mut SmartcardDevice) };
 
+    // Un in-flight GET_STATUS_CHANGE may be blocked inside the integration. Take
+    // a snapshot first so backend cancellation does not run while holding the
+    // contexts mutex, then wait for the device thread to finish safely.
+    let contexts_to_cancel = {
+        let contexts = scard.contexts.lock().unwrap();
+        contexts
+            .values()
+            .map(|entry| entry.context)
+            .collect::<Vec<_>>()
+    };
+    for context in contexts_to_cancel {
+        if let Err(code) = scard.integration.cancel(&context) {
+            log::warn!(
+                "smartcard: failed to cancel context 0x{:X} during teardown: 0x{:08X}",
+                context.raw(),
+                code
+            );
+        }
+    }
+
     scard.outstanding.cancel_all();
 
     let _ = scard.irp_tx.send(IrpWork::Shutdown);
