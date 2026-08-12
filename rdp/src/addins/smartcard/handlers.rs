@@ -1016,7 +1016,6 @@ fn handle_read_cache(
 ) -> u32 {
     let call = unsafe { &operation.call.readCacheW };
     let name = unsafe { widestr_to_vec(call.szLookupName) };
-    let name_str: String = name.iter().map(|&c| c as u8 as char).collect();
 
     // Serve from the in-memory cache first.
     let cached = CARD_CACHE.lock().unwrap().get(&name).cloned();
@@ -1028,7 +1027,7 @@ fn handle_read_cache(
             // caller's fixed receive buffer and msclmd does not retry), so they must
             // come from the cache. Generate them from the card on demand, replicating
             // what the Windows OS cache provides.
-            match generate_cache_entry(integration, contexts, operation, &name_str) {
+            match generate_cache_entry(integration, contexts, operation, &name) {
                 Some(generated) => {
                     log::debug!(
                         "smartcard: READ_CACHE — generated ({} bytes, key={})",
@@ -1082,25 +1081,60 @@ fn generate_cache_entry(
     integration: &Arc<dyn SmartcardIntegration>,
     contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
     operation: &freerdp_sys::SMARTCARD_OPERATION,
-    name_str: &str,
+    name: &[u16],
 ) -> Option<Vec<u8>> {
     let ctx_id = operation.hContext as u64;
     let ctx = contexts.lock().unwrap().get(&ctx_id)?.context;
 
-    if name_str.starts_with("Cached_ContainerInfo_") {
+    if let Some(index) = cached_container_info_index(name) {
         // FINDING (2026-08-05): for the physical card, `get_container_info` returns
         // Err (see native backend), so this MISSes and msclmd reads the container
         // public key from the card itself via TRANSMIT (7F49 + GET RESPONSE, chunked,
         // no PIN) and WRITE_CACHEs it. See docs/smartcard-connect-phase-discovery.md.
         // For the emulated card, `get_container_info` will return the container data
         // (correct little-endian modulus) and this will serve it instead of missing.
-        let index = name_str
-            .rsplit('_')
-            .next()
-            .and_then(|s| s.parse::<u8>().ok())
-            .unwrap_or(0);
         integration.get_container_info(&ctx, index).ok()
     } else {
         None
+    }
+}
+
+fn cached_container_info_index(name: &[u16]) -> Option<u8> {
+    let prefix: Vec<u16> = "Cached_ContainerInfo_".encode_utf16().collect();
+    let suffix = name.strip_prefix(prefix.as_slice())?;
+    if suffix.is_empty() {
+        return None;
+    }
+
+    suffix.iter().try_fold(0u8, |index, unit| {
+        let digit = unit.checked_sub(u16::from(b'0'))?;
+        if digit > 9 {
+            return None;
+        }
+        index.checked_mul(10)?.checked_add(digit as u8)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cached_container_info_index;
+
+    #[test]
+    fn parses_cached_container_info_index_as_utf16() {
+        let name: Vec<u16> = "Cached_ContainerInfo_12".encode_utf16().collect();
+        assert_eq!(cached_container_info_index(&name), Some(12));
+    }
+
+    #[test]
+    fn rejects_invalid_cached_container_info_names() {
+        let name: Vec<u16> = "Cached_ContainerInfo_x".encode_utf16().collect();
+        assert_eq!(cached_container_info_index(&name), None);
+    }
+
+    #[test]
+    fn parses_unicode_names_without_narrowing() {
+        let mut name: Vec<u16> = "Cached_ContainerInfo_".encode_utf16().collect();
+        name.extend("１２".encode_utf16());
+        assert_eq!(cached_container_info_index(&name), None);
     }
 }
