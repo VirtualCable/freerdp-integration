@@ -544,48 +544,59 @@ impl Rdp {
     // * Freerdp will close the fd on disconnect (it takes ownership)
 
     pub fn connection_error(&self) -> Option<String> {
-        let code = if let Some(instance) = self.instance {
+        let code = {
+            let instance = self.instance?;
             unsafe {
                 if instance.context.is_null() {
                     return None;
                 }
                 freerdp_get_last_error(instance.context)
             }
-        } else {
-            return None;
         };
+        // FreeRDP stores ERRCONNECT_* values in the lower 16 bits of the error code.
+        let error_code = code & 0x0000_FFFF;
+
         // Maps FreeRDP ERRCONNECT_* codes to actionable, operator-facing hints for logging.
         // Returns `None` for unknown codes so the caller can fall back to the raw FreeRDP string.
-        let hint = match code {
-            0x00020001 => Some("Pre-connect failed (check RDP target host/port)"),
-            0x00020004 | 0x00020005 => Some("DNS resolution failed for RDP target host"),
-            0x00020006 => {
+        let hint = match error_code {
+            ERRCONNECT_PRE_CONNECT_FAILED => {
+                Some("Pre-connect failed (check RDP target host/port)")
+            }
+            ERRCONNECT_DNS_ERROR | ERRCONNECT_DNS_NAME_NOT_FOUND => {
+                Some("DNS resolution failed for RDP target host")
+            }
+            ERRCONNECT_CONNECT_FAILED => {
                 Some("Could not reach RDP target (host down, port blocked, or wrong port)")
             }
-            0x00020008 => {
+            ERRCONNECT_TLS_CONNECT_FAILED => {
                 Some("TLS handshake with RDP target failed (certificate or protocol mismatch)")
             }
-            0x00020009 => Some("NLA authentication failed (invalid credentials or domain)"),
-            0x0002000A => Some("Insufficient privileges to log on to RDP target"),
-            0x0002000B => Some("Connection cancelled"),
-            0x0002000C => Some("Security negotiation failed (NLA/TLS/RDP-Security mismatch)"),
-            0x0002000D => Some("Transport error during connection"),
-            0x0002000E => Some("Account password has expired"),
-            0x0002000F => Some("Client certificate has been revoked"),
-            0x00020010 => Some("Kerberos KDC unreachable"),
-            0x00020011 => Some("Account is disabled"),
-            0x00020012 => Some("Password has expired"),
-            0x00020013 => Some("Password must be changed before logon"),
-            0x00020014 => {
+            ERRCONNECT_AUTHENTICATION_FAILED => {
+                Some("NLA authentication failed (invalid credentials or domain)")
+            }
+            ERRCONNECT_INSUFFICIENT_PRIVILEGES => {
+                Some("Insufficient privileges to log on to RDP target")
+            }
+            ERRCONNECT_CONNECT_CANCELLED => Some("Connection cancelled"),
+            ERRCONNECT_SECURITY_NEGO_CONNECT_FAILED => {
+                Some("Security negotiation failed (NLA/TLS/RDP-Security mismatch)")
+            }
+            ERRCONNECT_CONNECT_TRANSPORT_FAILED => Some("Transport error during connection"),
+            ERRCONNECT_PASSWORD_EXPIRED => Some("Account password has expired"),
+            ERRCONNECT_CLIENT_REVOKED => Some("Client certificate has been revoked"),
+            ERRCONNECT_KDC_UNREACHABLE => Some("Kerberos KDC unreachable"),
+            ERRCONNECT_ACCOUNT_DISABLED => Some("Account is disabled"),
+            ERRCONNECT_PASSWORD_MUST_CHANGE => Some("Password has expired"),
+            ERRCONNECT_LOGON_FAILURE => {
                 Some("Invalid credentials (logon failure) — check username, password, or domain")
             }
-            0x00020015 => Some("Wrong password"),
-            0x00020016 => Some("Access denied by RDP target"),
-            0x00020017 => {
+            ERRCONNECT_WRONG_PASSWORD => Some("Wrong password"),
+            ERRCONNECT_ACCESS_DENIED => Some("Access denied by RDP target"),
+            ERRCONNECT_ACCOUNT_RESTRICTION => {
                 Some("Account restricted (logon hours, workstation restriction, or policy)")
             }
-            0x00020018 => Some("Account is locked out"),
-            0x00020019 => Some("Account has expired"),
+            ERRCONNECT_ACCOUNT_LOCKED_OUT => Some("Account is locked out"),
+            ERRCONNECT_ACCOUNT_EXPIRED => Some("Account has expired"),
             _ => None,
         };
 
