@@ -110,12 +110,12 @@ fn handle_establish_context(
     out: *mut freerdp_sys::wStream,
 ) -> u32 {
     let scope = unsafe { operation.call.establishContext.dwScope };
-    log::debug!("smartcard: ESTABLISH_CONTEXT scope={}", scope);
+    log::trace!("smartcard: ESTABLISH_CONTEXT scope={}", scope);
 
     match integration.establish_context(scope) {
         Ok(ctx) => {
             let ctx_id = ctx.raw();
-            log::info!("smartcard: established context 0x{:X}", ctx_id);
+            log::trace!("smartcard: established context 0x{:X}", ctx_id);
 
             let mut ctx_map = contexts.lock().unwrap();
             ctx_map.insert(ctx_id, ContextEntry { context: ctx });
@@ -148,13 +148,13 @@ fn handle_release_context(
     operation: &freerdp_sys::SMARTCARD_OPERATION,
 ) -> u32 {
     let ctx_id = operation.hContext as u64;
-    log::debug!("smartcard: RELEASE_CONTEXT 0x{:X}", ctx_id);
+    log::trace!("smartcard: RELEASE_CONTEXT 0x{:X}", ctx_id);
 
     let mut ctx_map = contexts.lock().unwrap();
     if let Some(entry) = ctx_map.remove(&ctx_id) {
         match integration.release_context(&entry.context) {
             Ok(()) => {
-                log::info!("smartcard: released context 0x{:X}", ctx_id);
+                log::trace!("smartcard: released context 0x{:X}", ctx_id);
                 SCARD_S_SUCCESS
             }
             Err(code) => {
@@ -194,7 +194,7 @@ fn handle_cancel(
     operation: &freerdp_sys::SMARTCARD_OPERATION,
 ) -> u32 {
     let ctx_id = operation.hContext as u64;
-    log::debug!("smartcard: CANCEL for context 0x{:X}", ctx_id);
+    log::trace!("smartcard: CANCEL for context 0x{:X}", ctx_id);
 
     let ctx_map = contexts.lock().unwrap();
     if let Some(entry) = ctx_map.get(&ctx_id) {
@@ -208,12 +208,12 @@ fn handle_cancel(
 }
 
 fn handle_access_started_event(_operation: &freerdp_sys::SMARTCARD_OPERATION) -> u32 {
-    log::debug!("smartcard: ACCESS_STARTED_EVENT — responding success");
+    log::trace!("smartcard: ACCESS_STARTED_EVENT — responding success");
     SCARD_S_SUCCESS
 }
 
 fn handle_release_started_event(_operation: &freerdp_sys::SMARTCARD_OPERATION) -> u32 {
-    log::debug!("smartcard: RELEASE_STARTED_EVENT — responding success");
+    log::trace!("smartcard: RELEASE_STARTED_EVENT — responding success");
     SCARD_S_SUCCESS
 }
 
@@ -226,7 +226,7 @@ fn handle_list_readers(
 ) -> u32 {
     let ctx_id = operation.hContext as u64;
     let ioctl = operation.ioControlCode;
-    log::debug!("smartcard: LIST_READERS/GROUPS for context 0x{:X}", ctx_id);
+    log::trace!("smartcard: LIST_READERS/GROUPS for context 0x{:X}", ctx_id);
 
     let ctx = {
         let ctx_map = contexts.lock().unwrap();
@@ -238,7 +238,7 @@ fn handle_list_readers(
 
     match integration.list_readers(&ctx, None) {
         Ok(readers) => {
-            log::debug!(
+            log::trace!(
                 "smartcard: found {} reader(s): {:?}",
                 readers.len(),
                 readers
@@ -293,7 +293,7 @@ fn handle_connect(
     unicode: bool,
 ) -> u32 {
     let ctx_id = operation.hContext as u64;
-    log::debug!("smartcard: CONNECT for context 0x{:X}", ctx_id);
+    log::trace!("smartcard: CONNECT for context 0x{:X}", ctx_id);
 
     let ctx = {
         let ctx_map = contexts.lock().unwrap();
@@ -330,7 +330,7 @@ fn handle_connect(
 
     match integration.connect(&ctx, &reader_name, share_mode, preferred_protocols) {
         Ok(result) => {
-            log::info!(
+            log::trace!(
                 "smartcard: connected to '{}', handle=0x{:X}, protocol=0x{:X}",
                 reader_name,
                 result.handle.raw(),
@@ -378,7 +378,7 @@ fn handle_reconnect(
     let share_mode = call.dwShareMode;
     let preferred_protocols = call.dwPreferredProtocols;
     let initialization = call.dwInitialization;
-    log::debug!(
+    log::trace!(
         "smartcard: RECONNECT card=0x{:X} share_mode={} preferred_protocols={} initialization={}",
         card_handle.raw(),
         share_mode,
@@ -413,7 +413,7 @@ fn handle_disconnect(
     let call = unsafe { &operation.call.hCardAndDisposition };
     let card_handle = get_card_handle(&call.handles.hCard);
     let disposition = call.dwDisposition;
-    log::debug!(
+    log::trace!(
         "smartcard: DISCONNECT card=0x{:X} disposition={}",
         card_handle.raw(),
         disposition
@@ -431,7 +431,7 @@ fn handle_begin_transaction(
 ) -> u32 {
     let call = unsafe { &operation.call.hCardAndDisposition };
     let card_handle = get_card_handle(&call.handles.hCard);
-    log::debug!(
+    log::trace!(
         "smartcard: BEGIN_TRANSACTION card=0x{:X}",
         card_handle.raw()
     );
@@ -449,7 +449,7 @@ fn handle_end_transaction(
     let call = unsafe { &operation.call.hCardAndDisposition };
     let card_handle = get_card_handle(&call.handles.hCard);
     let disposition = call.dwDisposition;
-    log::debug!(
+    log::trace!(
         "smartcard: END_TRANSACTION card=0x{:X} disposition={}",
         card_handle.raw(),
         disposition
@@ -468,7 +468,7 @@ fn handle_state(
 ) -> u32 {
     let call = unsafe { &operation.call.state };
     let card_handle = get_card_handle(&call.handles.hCard);
-    log::debug!("smartcard: STATE card=0x{:X}", card_handle.raw());
+    log::trace!("smartcard: STATE card=0x{:X}", card_handle.raw());
 
     match integration.status(&card_handle) {
         Ok(status_info) => {
@@ -500,7 +500,7 @@ fn handle_status(
 ) -> u32 {
     let call = unsafe { &operation.call.status };
     let card_handle = get_card_handle(&call.handles.hCard);
-    log::debug!("smartcard: STATUS card=0x{:X}", card_handle.raw());
+    log::trace!("smartcard: STATUS card=0x{:X}", card_handle.raw());
 
     match integration.status(&card_handle) {
         Ok(status_info) => {
@@ -539,7 +539,7 @@ fn handle_transmit(
 ) -> u32 {
     let call = unsafe { &operation.call.transmit };
     let card_handle = get_card_handle(&call.handles.hCard);
-    log::debug!(
+    log::trace!(
         "smartcard: TRANSMIT card=0x{:X} send_len={}",
         card_handle.raw(),
         call.cbSendLength
@@ -549,7 +549,7 @@ fn handle_transmit(
     let send_data =
         unsafe { std::slice::from_raw_parts(call.pbSendBuffer, call.cbSendLength as usize) };
 
-    log::debug!(
+    log::trace!(
         "smartcard: TRANSMIT APDU send ({} bytes): {}",
         send_data.len(),
         send_data
@@ -567,7 +567,7 @@ fn handle_transmit(
             // on our side would concatenate responses larger than the caller's
             // receive buffer, which breaks the redirect.
 
-            log::debug!(
+            log::trace!(
                 "smartcard: TRANSMIT APDU recv ({} bytes): {}",
                 result.recv_buffer.len(),
                 result
@@ -602,7 +602,7 @@ fn handle_transmit(
             // requested a smaller buffer is rejected by msclmd.
             let caller_len = call.cbRecvLength;
             let return_code = if caller_len > 0 && (recv_buf.len() as u32) > caller_len {
-                log::debug!(
+                log::trace!(
                     "smartcard: TRANSMIT recv {} bytes > caller buffer {} -> INSUFFICIENT_BUFFER (msclmd should retry)",
                     recv_buf.len(),
                     caller_len
@@ -639,7 +639,7 @@ fn handle_control(
     let call = unsafe { &operation.call.control };
     let card_handle = get_card_handle(&call.handles.hCard);
     let control_code = call.dwControlCode;
-    log::debug!(
+    log::trace!(
         "smartcard: CONTROL card=0x{:X} code=0x{:X} len={}",
         card_handle.raw(),
         control_code,
@@ -654,7 +654,7 @@ fn handle_control(
 
     match integration.control(&card_handle, control_code, in_data) {
         Ok(mut out_data) => {
-            log::debug!(
+            log::trace!(
                 "smartcard: control success, response_len={}",
                 out_data.len()
             );
@@ -680,7 +680,7 @@ fn handle_get_attrib(
     let call = unsafe { &operation.call.getAttrib };
     let card_handle = get_card_handle(&call.handles.hCard);
     let attr_id = call.dwAttrId;
-    log::debug!(
+    log::trace!(
         "smartcard: GET_ATTRIB card=0x{:X} attr_id=0x{:X}",
         card_handle.raw(),
         attr_id
@@ -688,7 +688,7 @@ fn handle_get_attrib(
 
     match integration.get_attrib(&card_handle, attr_id) {
         Ok(mut attr_data) => {
-            log::debug!(
+            log::trace!(
                 "smartcard: get_attrib success, response_len={}",
                 attr_data.len()
             );
@@ -713,7 +713,7 @@ fn handle_set_attrib(
     let call = unsafe { &operation.call.setAttrib };
     let card_handle = get_card_handle(&call.handles.hCard);
     let attr_id = call.dwAttrId;
-    log::debug!(
+    log::trace!(
         "smartcard: SET_ATTRIB card=0x{:X} attr_id=0x{:X} len={}",
         card_handle.raw(),
         attr_id,
@@ -808,7 +808,7 @@ fn handle_locate_cards(
     _out: *mut freerdp_sys::wStream,
     _unicode: bool,
 ) -> u32 {
-    log::debug!("smartcard: LOCATE_CARDS not supported");
+    log::trace!("smartcard: LOCATE_CARDS not supported");
     SCARD_E_UNSUPPORTED_FEATURE
 }
 
@@ -844,7 +844,7 @@ fn handle_locate_cards_by_atr(
         }
     };
 
-    log::debug!(
+    log::trace!(
         "smartcard: LOCATE_CARDS_BY_ATR context=0x{:X} atrs_count={} count={}",
         ctx_id,
         atrs.len(),
@@ -853,7 +853,7 @@ fn handle_locate_cards_by_atr(
 
     match integration.locate_cards_by_atr(&ctx, &atrs, &reader_states_in) {
         Ok(results) => {
-            log::debug!(
+            log::trace!(
                 "smartcard: locate_cards_by_atr success, count={}",
                 results.len()
             );
@@ -901,7 +901,7 @@ fn handle_get_transmit_count(
     _operation: &freerdp_sys::SMARTCARD_OPERATION,
     out: *mut freerdp_sys::wStream,
 ) -> u32 {
-    log::debug!("smartcard: GET_TRANSMIT_COUNT — returning 0");
+    log::trace!("smartcard: GET_TRANSMIT_COUNT — returning 0");
     unsafe {
         let ret = freerdp_sys::GetTransmitCount_Return {
             ReturnCode: SCARD_S_SUCCESS as i32,
@@ -923,7 +923,7 @@ fn handle_get_device_type_id(
     // RDPDR_DTYP_SMARTCARD = 0x0020
     // The NDR body is just dwDeviceId (4 bytes); the ReturnCode goes in the
     // response header Result field (matching smartcard_pack_device_type_id_return).
-    log::debug!("smartcard: GET_DEVICE_TYPE_ID — returning 0x0020");
+    log::trace!("smartcard: GET_DEVICE_TYPE_ID — returning 0x0020");
     unsafe {
         use crate::addins::smartcard::device::stream_write_u32;
         stream_write_u32(out, 0x0020);
@@ -937,7 +937,7 @@ fn handle_get_reader_icon(
 ) -> u32 {
     // No icon available. Matching FreeRDP: body is cbDataLen(0) + null pointer,
     // ReturnCode in the header Result field.
-    log::debug!("smartcard: GET_READER_ICON — no icon, returning UNSUPPORTED_FEATURE");
+    log::trace!("smartcard: GET_READER_ICON — no icon, returning UNSUPPORTED_FEATURE");
     unsafe {
         let ret = freerdp_sys::GetReaderIcon_Return {
             ReturnCode: SCARD_E_UNSUPPORTED_FEATURE as i32,
@@ -994,11 +994,11 @@ fn handle_write_cache(operation: &freerdp_sys::SMARTCARD_OPERATION, _is_wide: bo
     let pb = call.Common.pbData;
     let cb = call.Common.cbDataLen;
     if pb.is_null() || cb == 0 {
-        log::debug!("smartcard: WRITE_CACHE — empty");
+        log::trace!("smartcard: WRITE_CACHE — empty");
         return SCARD_S_SUCCESS;
     }
     let data = unsafe { std::slice::from_raw_parts(pb, cb as usize) };
-    log::debug!(
+    log::trace!(
         "smartcard: WRITE_CACHE — storing {} bytes (key len={})",
         data.len(),
         name.len()
@@ -1029,7 +1029,7 @@ fn handle_read_cache(
             // what the Windows OS cache provides.
             match generate_cache_entry(integration, contexts, operation, &name) {
                 Some(generated) => {
-                    log::debug!(
+                    log::trace!(
                         "smartcard: READ_CACHE — generated ({} bytes, key={})",
                         generated.len(),
                         widestr_debug(&name)
@@ -1041,7 +1041,7 @@ fn handle_read_cache(
                     generated
                 }
                 None => {
-                    log::debug!(
+                    log::trace!(
                         "smartcard: READ_CACHE — MISS (key={})",
                         widestr_debug(&name)
                     );
@@ -1059,7 +1059,7 @@ fn handle_read_cache(
         }
     };
 
-    log::debug!(
+    log::trace!(
         "smartcard: READ_CACHE — HIT {} bytes (key={})",
         data.len(),
         widestr_debug(&name)

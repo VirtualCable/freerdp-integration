@@ -88,6 +88,12 @@ pub fn setup_freerdp_logger(level: WLogLevel) {
         );
 
         set_wlog_level(None, level);
+        // The drive redirection channel on Windows maps unknown errors (e.g.
+        // ERROR_INVALID_PARAMETER=87) to STATUS_UNSUCCESSFUL and logs them at ERROR
+        // ("Error code not found: 87"), which is pure noise (the drives work). The
+        // channel is shared and works on other platforms, so only silence this
+        // module's log level here.
+        set_wlog_level(Some("com.freerdp.channels.drive.client"), WLogLevel::Fatal);
         // set_wlog_level(Some("com.freerdp.utils.ringbuffer"), WLogLevel::Info);
         // set_wlog_level(Some("com.freerdp.primitives"), WLogLevel::Trace);
     }

@@ -435,7 +435,7 @@ unsafe fn process_irp(
             completion_id
         );
     } else {
-        log::debug!(
+        log::trace!(
             "smartcard: IRP ioctl=0x{:08X} ({}) completion_id={}",
             ioctl,
             ioctl_name(ioctl),
@@ -480,7 +480,7 @@ pub(crate) unsafe extern "C" fn init_handler(device: *mut DEVICE) -> UINT {
     if device.is_null() {
         return freerdp_sys::ERROR_INVALID_PARAMETER;
     }
-    log::info!("smartcard: init_handler called");
+    log::debug!("smartcard: init_handler called");
     let scard = unsafe { &mut *(device as *mut SmartcardDevice) };
     let mut ctx_map = scard.contexts.lock().unwrap();
     for (_, entry) in ctx_map.drain() {
@@ -527,7 +527,7 @@ pub(crate) unsafe extern "C" fn free_handler(device: *mut DEVICE) -> UINT {
     let _ = scard.irp_tx.send(IrpWork::Shutdown);
 
     if let Some(handle) = scard.device_thread.take() {
-        log::debug!("smartcard: waiting for device thread to finish");
+        log::trace!("smartcard: waiting for device thread to finish");
         if handle.join().is_err() {
             log::error!("smartcard: device thread panicked during shutdown");
         }
@@ -536,7 +536,7 @@ pub(crate) unsafe extern "C" fn free_handler(device: *mut DEVICE) -> UINT {
     {
         let mut contexts = scard.contexts.lock().unwrap();
         for (ctx_id, entry) in contexts.drain() {
-            log::debug!(
+            log::trace!(
                 "smartcard: releasing context 0x{:X} during teardown",
                 ctx_id
             );
