@@ -20,11 +20,7 @@ unsafe fn stream_remaining(stream: *mut wStream) -> usize {
     }
     let s = unsafe { &*stream };
     let used = s.pointer as usize - s.buffer as usize;
-    if s.length >= used {
-        s.length - used
-    } else {
-        0
-    }
+    s.length.saturating_sub(used)
 }
 
 pub(crate) unsafe fn stream_write_u8(stream: *mut wStream, val: u8) {

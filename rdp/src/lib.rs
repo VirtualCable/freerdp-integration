@@ -1,3 +1,4 @@
+#![allow(clippy::chunks_exact_to_as_chunks)]
 // BSD 3-Clause License
 // Copyright (c) 2026, Virtual Cable S.L.
 // All rights reserved.
