@@ -2,6 +2,7 @@
 // Copyright (c) 2026, Virtual Cable S.L.
 // All rights reserved.
 // Authors: Adolfo Gómez, dkmaster at dkmon dot com
+// Author: Andres Schumann, aschumann at virtualcable dot es
 
 //! Device struct, threading, and IRP processing infrastructure.
 
@@ -14,13 +15,14 @@ use freerdp_sys::{CHANNEL_RC_OK, DEVICE, IRP, UINT};
 
 use crate::integrations::SmartcardIntegration;
 use crate::integrations::smartcard::{
-    IRP_MJ_DEVICE_CONTROL, SCARD_S_SUCCESS, STATUS_BUFFER_TOO_SMALL, STATUS_NOT_SUPPORTED,
-    STATUS_UNSUCCESSFUL, ScardContext,
+    IRP_MJ_DEVICE_CONTROL, SCARD_E_CANCELLED, SCARD_S_SUCCESS, STATUS_BUFFER_TOO_SMALL,
+    STATUS_NOT_SUPPORTED, STATUS_UNSUCCESSFUL, ScardContext,
 };
 use crate::utils::log;
 
-use super::consts::ioctl_name;
+use super::consts::{SCARD_IOCTL_RELEASECONTEXT, ioctl_name};
 use super::handlers::dispatch_ioctl;
+use super::transactions::TransactionGate;
 
 // ---------------------------------------------------------------------------
 // Threading Structures
@@ -370,6 +372,8 @@ pub(crate) fn device_thread_main(
 ) {
     log::info!("smartcard: device thread started");
 
+    let mut gate = TransactionGate::new();
+
     while let Ok(work) = irp_rx.recv() {
         match work {
             IrpWork::Shutdown => {
@@ -377,20 +381,83 @@ pub(crate) fn device_thread_main(
                 break;
             }
             IrpWork::Process(irp) => {
-                unsafe { process_irp(irp, &integration, &contexts, &outstanding) };
+                if let Some(request) = unsafe { decode_irp(irp) } {
+                    unsafe {
+                        handle_request(request, &mut gate, &integration, &contexts, &outstanding)
+                    };
+                }
             }
         }
+    }
+
+    // The channel is going away: like FreeRDP's own smartcard channel, drop the
+    // parked IRPs instead of answering them.
+    for request in gate.take_all() {
+        unsafe { discard_request(request) };
     }
 
     log::info!("smartcard: device thread exiting");
 }
 
-unsafe fn process_irp(
+/// A decoded IRP, ready to run now or to be parked until the card is free.
+struct Request {
     irp: *mut IRP,
+    operation: freerdp_sys::SMARTCARD_OPERATION,
+}
+
+impl Request {
+    fn ioctl(&self) -> u32 {
+        self.operation.ioControlCode
+    }
+
+    fn card(&self) -> u64 {
+        get_card_handle(unsafe { &self.operation.call.handles.hCard }).raw()
+    }
+
+    fn context(&self) -> u64 {
+        self.operation.hContext as u64
+    }
+}
+
+unsafe fn handle_request(
+    request: Request,
+    gate: &mut TransactionGate<Request>,
     integration: &Arc<dyn SmartcardIntegration>,
     contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
     outstanding: &Arc<OutstandingIrpTracker>,
 ) {
+    let (ioctl, card, context) = (request.ioctl(), request.card(), request.context());
+
+    if gate.must_wait(ioctl, card) {
+        log::trace!(
+            "smartcard: {} card=0x{:X} parked, card held by 0x{:X}",
+            ioctl_name(ioctl),
+            card,
+            gate.owner_card().unwrap_or_default()
+        );
+        gate.park(ioctl, card, context, request);
+        return;
+    }
+
+    let result = unsafe { execute_request(request, integration, contexts, outstanding) };
+    gate.on_completed(ioctl, card, context, result);
+
+    // SCardCancel only interrupts blocking status waits, so a CANCEL leaves parked
+    // requests alone; once the context is gone they can never run.
+    if ioctl == SCARD_IOCTL_RELEASECONTEXT && result == SCARD_S_SUCCESS {
+        for parked in gate.take_context(context) {
+            unsafe { complete_without_running(parked, SCARD_E_CANCELLED) };
+        }
+    }
+
+    while let Some((ioctl, card, context, parked)) = gate.next_runnable() {
+        log::trace!("smartcard: {} card=0x{:X} resumed", ioctl_name(ioctl), card);
+        let result = unsafe { execute_request(parked, integration, contexts, outstanding) };
+        gate.on_completed(ioctl, card, context, result);
+    }
+}
+
+unsafe fn decode_irp(irp: *mut IRP) -> Option<Request> {
     let mut operation: freerdp_sys::SMARTCARD_OPERATION = unsafe { std::mem::zeroed() };
     let decode_status = unsafe {
         freerdp_sys::smartcard_irp_device_control_decode(
@@ -418,9 +485,56 @@ unsafe fn process_irp(
                 complete_fn(irp);
             }
         }
-        return;
+        return None;
     }
 
+    Some(Request { irp, operation })
+}
+
+/// Completes a parked request with `return_code` without calling the integration.
+unsafe fn complete_without_running(request: Request, return_code: u32) {
+    let Request { irp, mut operation } = request;
+    log::trace!(
+        "smartcard: {} card=0x{:X} completed without running: 0x{:08X}",
+        ioctl_name(operation.ioControlCode),
+        get_card_handle(unsafe { &operation.call.handles.hCard }).raw(),
+        return_code
+    );
+    unsafe {
+        let mut io_status = crate::integrations::smartcard::STATUS_SUCCESS as i32;
+        let body_pos = begin_response((*irp).output);
+        end_response(
+            (*irp).output,
+            body_pos,
+            return_code as i32,
+            operation.outputBufferLength,
+            &mut io_status,
+        );
+        (*irp).IoStatus = io_status;
+        if let Some(complete_fn) = (*irp).Complete {
+            complete_fn(irp);
+        }
+        freerdp_sys::smartcard_operation_free(&mut operation, 0);
+    }
+}
+
+unsafe fn discard_request(request: Request) {
+    let Request { irp, mut operation } = request;
+    unsafe {
+        freerdp_sys::smartcard_operation_free(&mut operation, 0);
+        if let Some(discard_fn) = (*irp).Discard {
+            discard_fn(irp);
+        }
+    }
+}
+
+unsafe fn execute_request(
+    request: Request,
+    integration: &Arc<dyn SmartcardIntegration>,
+    contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
+    outstanding: &Arc<OutstandingIrpTracker>,
+) -> u32 {
+    let Request { irp, mut operation } = request;
     let ioctl = operation.ioControlCode;
     let completion_id = operation.completionID;
 
@@ -470,6 +584,7 @@ unsafe fn process_irp(
     }
 
     outstanding.complete(completion_id);
+    return_code
 }
 
 // ---------------------------------------------------------------------------
