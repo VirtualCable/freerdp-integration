@@ -70,6 +70,7 @@ fn main() {
         .opaque_type("SHELLSTATEA")
         .opaque_type("SHELLSTATEW")
         .opaque_type("SHELLFLAGSTATE")
+        .layout_tests(false)
         .generate()
         .expect("Bindings could not be generated");
 

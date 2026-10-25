@@ -6,12 +6,14 @@
 pub mod audio_input;
 pub mod audio_output;
 pub mod clipboard;
+pub mod printer;
 pub mod smartcard;
 pub mod webcam;
 
 pub use audio_input::AudioInputIntegration;
 pub use audio_output::AudioOutputIntegration;
 pub use clipboard::{ClipboardCallback, ClipboardIntegration};
+pub use printer::{DummyPrinterHandle, PrinterDeviceInfo, PrinterIntegration};
 pub use smartcard::SmartcardIntegration;
 pub use webcam::{WebcamFrame, WebcamIntegration, WebcamMode};
 
@@ -24,4 +26,5 @@ pub struct RdpIntegrations {
     pub webcam: Option<Arc<dyn WebcamIntegration>>,
     pub clipboard: Option<Arc<dyn ClipboardIntegration>>,
     pub smartcard: Option<Arc<dyn SmartcardIntegration>>,
+    pub printer: Option<Arc<dyn PrinterIntegration>>,
 }

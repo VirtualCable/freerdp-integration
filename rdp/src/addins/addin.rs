@@ -11,7 +11,7 @@ use freerdp_sys::{
     freerdp_get_current_addin_provider, freerdp_register_addin_provider,
 };
 
-use super::{audio_input, audio_output, smartcard, webcam};
+use super::{audio_input, audio_output, printer, smartcard, webcam};
 use crate::utils::log;
 
 static FREERDP_ADDIN_PROVIDER: OnceLock<FREERDP_LOAD_CHANNEL_ADDIN_ENTRY_FN> = OnceLock::new();
@@ -76,6 +76,14 @@ unsafe extern "C" fn custom_addin_provider(
                     unsafe extern "C" fn(PDEVICE_SERVICE_ENTRY_POINTS) -> UINT,
                     unsafe extern "C" fn(*mut freerdp_sys::tagCHANNEL_ENTRY_POINTS) -> BOOL,
                 >(smartcard::device_service_entry))
+            } else if name == "printer"
+                && secure_cstr_from_lpcstr(psz_type) == "DeviceServiceEntry"
+            {
+                log::info!("printer DeviceServiceEntry intercepted via custom_addin_provider.");
+                Some(std::mem::transmute::<
+                    unsafe extern "C" fn(PDEVICE_SERVICE_ENTRY_POINTS) -> UINT,
+                    unsafe extern "C" fn(*mut freerdp_sys::tagCHANNEL_ENTRY_POINTS) -> BOOL,
+                >(printer::device_service_entry))
             } else {
                 log::debug!("Delegating to underlying addin provider");
                 freerdp_addin_provider(psz_name, psz_subsystem, psz_type, dw_flags)
@@ -86,25 +94,6 @@ unsafe extern "C" fn custom_addin_provider(
         }
     }
 }
-
-// #[allow(clippy::missing_transmute_annotations)]
-// pub fn load_addin(context: *mut freerdp_sys::rdpContext, name: &str) {
-//     let cname = std::ffi::CString::new(name).unwrap();
-//     unsafe {
-//         let entry_ex = freerdp_sys::freerdp_load_channel_addin_entry(
-//             cname.as_ptr(),
-//             std::ptr::null(),
-//             std::ptr::null(),
-//             FREERDP_ADDIN_CHANNEL_DYNAMIC | FREERDP_ADDIN_CHANNEL_ENTRYEX,
-//         );
-//         freerdp_sys::freerdp_channels_client_load_ex(
-//             (*context).channels,
-//             (*context).settings,
-//             std::mem::transmute(entry_ex),
-//             (*context).settings as *mut std::ffi::c_void,
-//         );
-//     }
-// }
 
 pub fn register_channel_addin_loader() {
     FREERDP_ADDIN_PROVIDER
