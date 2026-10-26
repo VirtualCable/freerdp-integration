@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use freerdp_sys::{CHANNEL_RC_OK, DEVICE, IRP, UINT};
 
@@ -20,7 +20,10 @@ use crate::integrations::smartcard::{
 };
 use crate::utils::log;
 
-use super::consts::{SCARD_IOCTL_RELEASECONTEXT, ioctl_name};
+use super::consts::{
+    SCARD_IOCTL_GETSTATUSCHANGEA, SCARD_IOCTL_GETSTATUSCHANGEW, SCARD_IOCTL_RELEASECONTEXT,
+    ioctl_name,
+};
 use super::handlers::dispatch_ioctl;
 use super::transactions::{TRANSACTION_IDLE_TIMEOUT, TransactionGate};
 
@@ -80,6 +83,18 @@ impl OutstandingIrpTracker {
         for irp in map.values() {
             irp.cancelled.store(true, Ordering::SeqCst);
         }
+    }
+
+    /// Waits until no IRP is outstanding; returns false if `timeout` expires first.
+    pub(crate) fn wait_idle(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while !self.irps.lock().unwrap().is_empty() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
     }
 }
 
@@ -429,6 +444,10 @@ struct Request {
     operation: freerdp_sys::SMARTCARD_OPERATION,
 }
 
+// SAFETY: like `IrpWork`, the raw pointers belong to FreeRDP, which allows an IRP to be
+// completed from any thread.
+unsafe impl Send for Request {}
+
 impl Request {
     fn ioctl(&self) -> u32 {
         self.operation.ioControlCode
@@ -451,6 +470,11 @@ unsafe fn handle_request(
     outstanding: &Arc<OutstandingIrpTracker>,
 ) {
     let (ioctl, card, context) = (request.ioctl(), request.card(), request.context());
+
+    if is_status_change(ioctl) {
+        unsafe { run_detached(request, integration, contexts, outstanding) };
+        return;
+    }
 
     if gate.must_wait(ioctl, card) {
         log::trace!(
@@ -475,6 +499,48 @@ unsafe fn handle_request(
     }
 
     unsafe { run_parked(gate, integration, contexts, outstanding) };
+}
+
+fn is_status_change(ioctl: u32) -> bool {
+    ioctl == SCARD_IOCTL_GETSTATUSCHANGEA || ioctl == SCARD_IOCTL_GETSTATUSCHANGEW
+}
+
+/// GET_STATUS_CHANGE waits inside the backend, so it gets its own thread: the device
+/// thread keeps serving the other IRPs instead of queueing them behind the wait.
+unsafe fn run_detached(
+    request: Request,
+    integration: &Arc<dyn SmartcardIntegration>,
+    contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
+    outstanding: &Arc<OutstandingIrpTracker>,
+) {
+    outstanding.register(request.operation.completionID);
+
+    let slot = Arc::new(Mutex::new(Some(request)));
+    let worker_slot = slot.clone();
+    let (worker_integration, worker_contexts, worker_outstanding) =
+        (integration.clone(), contexts.clone(), outstanding.clone());
+
+    let spawned = std::thread::Builder::new()
+        .name("scard-status".into())
+        .spawn(move || {
+            if let Some(request) = worker_slot.lock().unwrap().take() {
+                unsafe {
+                    execute_request(
+                        request,
+                        &worker_integration,
+                        &worker_contexts,
+                        &worker_outstanding,
+                    )
+                };
+            }
+        });
+
+    if let Err(error) = spawned {
+        log::error!("smartcard: cannot start the status thread ({error}), running inline");
+        if let Some(request) = slot.lock().unwrap().take() {
+            unsafe { execute_request(request, integration, contexts, outstanding) };
+        }
+    }
 }
 
 /// Runs the parked requests that no longer have to wait, in arrival order.
@@ -682,6 +748,10 @@ pub(crate) unsafe extern "C" fn free_handler(device: *mut DEVICE) -> UINT {
         }
     }
 
+    if !scard.outstanding.wait_idle(Duration::from_secs(2)) {
+        log::warn!("smartcard: status threads still running at teardown");
+    }
+
     {
         let mut contexts = scard.contexts.lock().unwrap();
         for (ctx_id, entry) in contexts.drain() {
@@ -803,6 +873,39 @@ mod tests {
     fn outstanding_tracker_cancel_empty_is_noop() {
         let tracker = OutstandingIrpTracker::new();
         tracker.cancel_all();
+    }
+
+    #[test]
+    fn wait_idle_returns_once_everything_completed() {
+        let tracker = Arc::new(OutstandingIrpTracker::new());
+        tracker.register(7);
+
+        let completer = tracker.clone();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            completer.complete(7);
+        });
+
+        assert!(tracker.wait_idle(Duration::from_secs(2)));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn wait_idle_gives_up_while_an_irp_is_outstanding() {
+        let tracker = OutstandingIrpTracker::new();
+        tracker.register(7);
+
+        assert!(!tracker.wait_idle(Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn only_get_status_change_runs_detached() {
+        use super::super::consts::{SCARD_IOCTL_ESTABLISHCONTEXT, SCARD_IOCTL_TRANSMIT};
+
+        assert!(is_status_change(SCARD_IOCTL_GETSTATUSCHANGEA));
+        assert!(is_status_change(SCARD_IOCTL_GETSTATUSCHANGEW));
+        assert!(!is_status_change(SCARD_IOCTL_TRANSMIT));
+        assert!(!is_status_change(SCARD_IOCTL_ESTABLISHCONTEXT));
     }
 
     #[test]
