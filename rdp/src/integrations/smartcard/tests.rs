@@ -2,18 +2,20 @@
 // Copyright (c) 2026, Virtual Cable S.L.
 // All rights reserved.
 // Authors: Adolfo Gómez, dkmaster at dkmon dot com
+//          Janier Rodríguez, jrodriguez at virtualcable dot es
 
 //! Tests for smartcard types, helpers, and the dummy integration handle.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Condvar, Mutex, RwLock};
 use std::time::Duration;
 
 use super::SmartcardIntegration;
 use super::consts::{
-    SCARD_E_INVALID_HANDLE, SCARD_E_UNKNOWN_READER, SCARD_E_UNSUPPORTED_FEATURE,
-    SCARD_PROTOCOL_T0, SCARD_S_SUCCESS, SCARD_STATE_CHANGED, SCARD_STATE_EMPTY,
-    SCARD_STATE_PRESENT,
+    SCARD_E_CANCELLED, SCARD_E_INVALID_HANDLE, SCARD_E_TIMEOUT, SCARD_E_UNKNOWN_READER,
+    SCARD_E_UNSUPPORTED_FEATURE, SCARD_PROTOCOL_T0, SCARD_S_SUCCESS, SCARD_STATE_CHANGED,
+    SCARD_STATE_EMPTY, SCARD_STATE_PRESENT,
 };
 use super::types::*;
 
@@ -35,6 +37,12 @@ pub mod dummy {
     pub struct DummySmartcardHandle {
         cards: RwLock<Vec<DummyCard>>,
         contexts: RwLock<HashMap<u64, ScardContext>>,
+        transaction_holder: Mutex<Option<u64>>,
+        transaction_released: Condvar,
+        transmit_response: Mutex<Vec<u8>>,
+        status_change_timeouts: AtomicU32,
+        status_change_calls: AtomicU32,
+        cancel_requested: AtomicBool,
     }
 
     impl Default for DummySmartcardHandle {
@@ -48,6 +56,12 @@ pub mod dummy {
             DummySmartcardHandle {
                 cards: RwLock::new(Vec::new()),
                 contexts: RwLock::new(HashMap::new()),
+                transaction_holder: Mutex::new(None),
+                transaction_released: Condvar::new(),
+                transmit_response: Mutex::new(vec![0x90, 0x00]),
+                status_change_timeouts: AtomicU32::new(0),
+                status_change_calls: AtomicU32::new(0),
+                cancel_requested: AtomicBool::new(false),
             }
         }
 
@@ -58,6 +72,39 @@ pub mod dummy {
                 atr,
                 handle: None,
             });
+        }
+
+        pub fn set_transmit_response(&self, response: Vec<u8>) {
+            *self.transmit_response.lock().unwrap() = response;
+        }
+
+        /// `get_status_change` answers `SCARD_E_TIMEOUT` this many times before
+        /// reporting the change.
+        pub fn set_status_change_timeouts(&self, count: u32) {
+            self.status_change_timeouts.store(count, Ordering::SeqCst);
+        }
+
+        pub fn status_change_calls(&self) -> u32 {
+            self.status_change_calls.load(Ordering::SeqCst)
+        }
+
+        fn has_handle(&self, handle: &ScardHandle) -> bool {
+            let cards = self.cards.read().unwrap();
+            cards
+                .iter()
+                .any(|card| card.handle.is_some_and(|h| h.raw() == handle.raw()))
+        }
+
+        /// Blocks while another handle holds the transaction, like pcsc-lite.
+        fn wait_for_transaction(
+            &self,
+            handle: &ScardHandle,
+        ) -> std::sync::MutexGuard<'_, Option<u64>> {
+            let mut holder = self.transaction_holder.lock().unwrap();
+            while holder.is_some_and(|h| h != handle.raw()) {
+                holder = self.transaction_released.wait(holder).unwrap();
+            }
+            holder
         }
     }
 
@@ -148,18 +195,14 @@ pub mod dummy {
             _send_pci: &ScardIORequest,
             _data: &[u8],
         ) -> Result<TransmitResult, u32> {
-            let cards = self.cards.read().unwrap();
-            for card in cards.iter() {
-                if let Some(h) = &card.handle
-                    && h.raw() == handle.raw()
-                {
-                    return Ok(TransmitResult {
-                        recv_pci: None,
-                        recv_buffer: vec![0x90, 0x00],
-                    });
-                }
+            if !self.has_handle(handle) {
+                return Err(SCARD_E_INVALID_HANDLE);
             }
-            Err(SCARD_E_INVALID_HANDLE)
+            let _holder = self.wait_for_transaction(handle);
+            Ok(TransmitResult {
+                recv_pci: None,
+                recv_buffer: self.transmit_response.lock().unwrap().clone(),
+            })
         }
 
         fn control(
@@ -191,9 +234,22 @@ pub mod dummy {
         fn get_status_change(
             &self,
             _ctx: &ScardContext,
-            _timeout: Duration,
+            timeout: Duration,
             reader_states: &[ReaderStateIn],
         ) -> Result<(Vec<ReaderStateOut>, u32), u32> {
+            self.status_change_calls.fetch_add(1, Ordering::SeqCst);
+            let return_code = if self.cancel_requested.swap(false, Ordering::SeqCst) {
+                SCARD_E_CANCELLED
+            } else if self
+                .status_change_timeouts
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                std::thread::sleep(timeout.min(Duration::from_millis(100)));
+                SCARD_E_TIMEOUT
+            } else {
+                SCARD_S_SUCCESS
+            };
             let cards = self.cards.read().unwrap();
             let states = reader_states
                 .iter()
@@ -215,18 +271,32 @@ pub mod dummy {
                     }
                 })
                 .collect();
-            Ok((states, SCARD_S_SUCCESS))
+            Ok((states, return_code))
         }
 
-        fn begin_transaction(&self, _handle: &ScardHandle) -> Result<(), u32> {
+        fn begin_transaction(&self, handle: &ScardHandle) -> Result<(), u32> {
+            if !self.has_handle(handle) {
+                return Err(SCARD_E_INVALID_HANDLE);
+            }
+            let mut holder = self.wait_for_transaction(handle);
+            *holder = Some(handle.raw());
             Ok(())
         }
 
-        fn end_transaction(&self, _handle: &ScardHandle, _disposition: u32) -> Result<(), u32> {
+        fn end_transaction(&self, handle: &ScardHandle, _disposition: u32) -> Result<(), u32> {
+            let mut holder = self.transaction_holder.lock().unwrap();
+            if *holder != Some(handle.raw()) {
+                return Err(SCARD_E_INVALID_HANDLE);
+            }
+            *holder = None;
+            self.transaction_released.notify_all();
             Ok(())
         }
 
-        fn get_attrib(&self, _handle: &ScardHandle, _attr_id: u32) -> Result<Vec<u8>, u32> {
+        fn get_attrib(&self, handle: &ScardHandle, _attr_id: u32) -> Result<Vec<u8>, u32> {
+            if !self.has_handle(handle) {
+                return Err(SCARD_E_INVALID_HANDLE);
+            }
             Ok(vec![0x00])
         }
 
@@ -239,12 +309,21 @@ pub mod dummy {
             Ok(())
         }
 
-        fn get_container_info(&self, _ctx: &ScardContext, _container_index: u8) -> Result<Vec<u8>, u32> {
+        fn get_container_info(
+            &self,
+            _ctx: &ScardContext,
+            _container_index: u8,
+        ) -> Result<Vec<u8>, u32> {
             Err(SCARD_E_UNSUPPORTED_FEATURE)
         }
 
         fn get_certificate(&self, _ctx: &ScardContext) -> Result<Vec<u8>, u32> {
             Err(SCARD_E_UNSUPPORTED_FEATURE)
+        }
+
+        fn cancel(&self, _ctx: &ScardContext) -> Result<(), u32> {
+            self.cancel_requested.store(true, Ordering::SeqCst);
+            Ok(())
         }
 
         fn is_available(&self) -> bool {
