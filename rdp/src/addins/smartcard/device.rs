@@ -88,7 +88,10 @@ impl ContextEntry {
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker = std::thread::Builder::new()
             .name(format!("smartcard-ctx-{:x}", context.raw()))
-            .spawn(move || context_thread_main(work_rx, integration, contexts))
+            .spawn({
+                let cancelled = cancelled.clone();
+                move || context_thread_main(work_rx, integration, contexts, cancelled)
+            })
             .ok();
         ContextEntry {
             context,
@@ -398,13 +401,16 @@ fn context_thread_main(
     work_rx: flume::Receiver<ContextWork>,
     integration: Arc<dyn SmartcardIntegration>,
     contexts: Arc<Mutex<HashMap<u64, ContextEntry>>>,
+    cancelled: Arc<AtomicBool>,
 ) {
+    // recv keeps delivering what was queued before the sender dropped, so the
+    // flag is what tells a released context's leftovers apart from live work.
     while let Ok(work) = work_rx.recv() {
-        unsafe { run_operation(work, &integration, &contexts) };
-    }
-    // Sender dropped: the context is gone, so whatever is still queued cannot be served.
-    for work in work_rx.drain() {
-        unsafe { discard_operation(work) };
+        if cancelled.load(Ordering::SeqCst) {
+            unsafe { discard_operation(work) };
+        } else {
+            unsafe { run_operation(work, &integration, &contexts) };
+        }
     }
 }
 

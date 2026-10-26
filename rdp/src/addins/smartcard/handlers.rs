@@ -14,9 +14,9 @@ use std::time::Duration;
 
 use crate::integrations::SmartcardIntegration;
 use crate::integrations::smartcard::{
-    SCARD_E_INSUFFICIENT_BUFFER, SCARD_E_INVALID_HANDLE, SCARD_E_NO_READERS_AVAILABLE,
-    SCARD_E_TIMEOUT, SCARD_E_UNSUPPORTED_FEATURE, SCARD_S_SUCCESS, SCARD_STATE_ATRMATCH,
-    SCARD_TRANSMIT_MAX,
+    SCARD_E_CANCELLED, SCARD_E_INSUFFICIENT_BUFFER, SCARD_E_INVALID_HANDLE,
+    SCARD_E_NO_READERS_AVAILABLE, SCARD_E_TIMEOUT, SCARD_E_UNSUPPORTED_FEATURE, SCARD_S_SUCCESS,
+    SCARD_STATE_ATRMATCH, SCARD_TRANSMIT_MAX,
 };
 use crate::utils::log;
 
@@ -988,8 +988,11 @@ fn handle_get_status_change(
     let mut elapsed = Duration::ZERO;
     let outcome = loop {
         let outcome = integration.get_status_change(&ctx, timeout.min(step), &reader_states_in);
-        if !matches!(outcome, Ok((_, SCARD_E_TIMEOUT))) || cancelled.load(Ordering::SeqCst) {
+        if !matches!(outcome, Ok((_, SCARD_E_TIMEOUT))) {
             break outcome;
+        }
+        if cancelled.load(Ordering::SeqCst) {
+            break outcome.map(|(states, _)| (states, SCARD_E_CANCELLED));
         }
         if !infinite {
             elapsed += step;
