@@ -8,13 +8,14 @@
 //! IOCTL dispatch and handler functions for smartcard IRPs.
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::integrations::SmartcardIntegration;
 use crate::integrations::smartcard::{
     SCARD_E_INSUFFICIENT_BUFFER, SCARD_E_INVALID_HANDLE, SCARD_E_NO_READERS_AVAILABLE,
-    SCARD_E_UNSUPPORTED_FEATURE, SCARD_S_SUCCESS, SCARD_STATE_ATRMATCH,
+    SCARD_E_TIMEOUT, SCARD_E_UNSUPPORTED_FEATURE, SCARD_S_SUCCESS, SCARD_STATE_ATRMATCH,
 };
 use crate::utils::log;
 
@@ -24,6 +25,9 @@ use super::device::{
     get_card_handle, get_io_request, get_reader_states_in_a, get_reader_states_in_w,
     pack_reader_states_out, u16_ptr_to_string,
 };
+
+const INFINITE: u32 = 0xFFFF_FFFF;
+const GET_STATUS_CHANGE_STEP_MS: u64 = 100;
 
 // ---------------------------------------------------------------------------
 // IOCTL Dispatcher
@@ -935,10 +939,10 @@ fn handle_get_status_change(
     unicode: bool,
 ) -> u32 {
     let ctx_id = operation.hContext as u64;
-    let ctx = {
+    let (ctx, cancelled) = {
         let ctx_map = contexts.lock().unwrap();
         match ctx_map.get(&ctx_id) {
-            Some(entry) => entry.context,
+            Some(entry) => (entry.context, entry.cancelled.clone()),
             None => return SCARD_E_INVALID_HANDLE,
         }
     };
@@ -959,12 +963,6 @@ fn handle_get_status_change(
         }
     };
 
-    let timeout = if timeout_ms == 0xFFFF_FFFF {
-        Duration::from_secs(3600 * 24)
-    } else {
-        Duration::from_millis(timeout_ms as u64)
-    };
-
     log::trace!(
         "smartcard: GET_STATUS_CHANGE context=0x{:X} timeout_ms={} count={}",
         ctx_id,
@@ -972,7 +970,26 @@ fn handle_get_status_change(
         reader_states_in.len()
     );
 
-    match integration.get_status_change(&ctx, timeout, &reader_states_in) {
+    // Polled in short steps, as FreeRDP does, so a released context never
+    // leaves its worker stuck inside the integration for the whole timeout.
+    let step = Duration::from_millis(GET_STATUS_CHANGE_STEP_MS);
+    let infinite = timeout_ms == INFINITE;
+    let timeout = Duration::from_millis(timeout_ms as u64);
+    let mut elapsed = Duration::ZERO;
+    let outcome = loop {
+        let outcome = integration.get_status_change(&ctx, timeout.min(step), &reader_states_in);
+        if !matches!(outcome, Ok((_, SCARD_E_TIMEOUT))) || cancelled.load(Ordering::SeqCst) {
+            break outcome;
+        }
+        if !infinite {
+            elapsed += step;
+            if elapsed >= timeout.max(Duration::from_millis(1)) {
+                break outcome;
+            }
+        }
+    };
+
+    match outcome {
         Ok((result_states, return_code)) => {
             log::trace!(
                 "smartcard: get_status_change result code=0x{:X} count={}",
