@@ -4,6 +4,7 @@
 // Authors: Adolfo Gómez, dkmaster at dkmon dot com
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use freerdp_sys::{
     AUDIN_CHANNEL_NAME, BOOL, DWORD, FREERDP_LOAD_CHANNEL_ADDIN_ENTRY_FN, LPCSTR,
@@ -15,6 +16,30 @@ use super::{audio_input, audio_output, printer, smartcard, webcam};
 use crate::utils::log;
 
 static FREERDP_ADDIN_PROVIDER: OnceLock<FREERDP_LOAD_CHANNEL_ADDIN_ENTRY_FN> = OnceLock::new();
+static SMARTCARD_ADDIN_FLAGS: AtomicU32 = AtomicU32::new(0);
+
+/// FreeRDP's own smartcard `DeviceServiceEntry`, bypassing our interception.
+#[cfg(windows)]
+pub(super) fn stock_smartcard_device_entry()
+-> Option<unsafe extern "C" fn(PDEVICE_SERVICE_ENTRY_POINTS) -> UINT> {
+    let provider = (*FREERDP_ADDIN_PROVIDER.get()?)?;
+    let name = std::ffi::CString::new("smartcard").ok()?;
+    let entry_type = std::ffi::CString::new("DeviceServiceEntry").ok()?;
+    let entry = unsafe {
+        provider(
+            name.as_ptr(),
+            std::ptr::null(),
+            entry_type.as_ptr(),
+            SMARTCARD_ADDIN_FLAGS.load(Ordering::Relaxed),
+        )
+    }?;
+    Some(unsafe {
+        std::mem::transmute::<
+            unsafe extern "C" fn(*mut freerdp_sys::tagCHANNEL_ENTRY_POINTS) -> BOOL,
+            unsafe extern "C" fn(PDEVICE_SERVICE_ENTRY_POINTS) -> UINT,
+        >(entry)
+    })
+}
 
 fn secure_cstr_from_lpcstr(psz: LPCSTR) -> String {
     if psz.is_null() {
@@ -72,6 +97,7 @@ unsafe extern "C" fn custom_addin_provider(
                 && secure_cstr_from_lpcstr(psz_type) == "DeviceServiceEntry"
             {
                 log::info!("smartcard DeviceServiceEntry intercepted via custom_addin_provider.");
+                SMARTCARD_ADDIN_FLAGS.store(dw_flags, Ordering::Relaxed);
                 Some(std::mem::transmute::<
                     unsafe extern "C" fn(PDEVICE_SERVICE_ENTRY_POINTS) -> UINT,
                     unsafe extern "C" fn(*mut freerdp_sys::tagCHANNEL_ENTRY_POINTS) -> BOOL,

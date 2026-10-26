@@ -52,6 +52,15 @@ pub unsafe extern "C" fn device_service_entry(
         }
     };
 
+    #[cfg(windows)]
+    if rdp.config.settings.redirections.smartcard.emulated.is_none() {
+        if let Some(stock_entry) = super::addin::stock_smartcard_device_entry() {
+            log::info!("smartcard: physical reader, delegating to FreeRDP smartcard channel");
+            return unsafe { stock_entry(p_entry_points) };
+        }
+        log::warn!("smartcard: FreeRDP smartcard channel not available, using ours");
+    }
+
     let integration = match &rdp.config.integrations.smartcard {
         Some(integration) => integration.clone(),
         None => {
