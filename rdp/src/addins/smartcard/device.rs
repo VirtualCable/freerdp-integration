@@ -2,20 +2,20 @@
 // Copyright (c) 2026, Virtual Cable S.L.
 // All rights reserved.
 // Authors: Adolfo Gómez, dkmaster at dkmon dot com
+//          Janier Rodríguez, jrodriguez at virtualcable dot es
 
 //! Device struct, threading, and IRP processing infrastructure.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use freerdp_sys::{CHANNEL_RC_OK, DEVICE, IRP, UINT};
 
 use crate::integrations::SmartcardIntegration;
 use crate::integrations::smartcard::{
-    IRP_MJ_DEVICE_CONTROL, SCARD_S_SUCCESS, STATUS_BUFFER_TOO_SMALL, STATUS_NOT_SUPPORTED,
-    STATUS_UNSUCCESSFUL, ScardContext,
+    IRP_MJ_DEVICE_CONTROL, SCARD_E_INVALID_HANDLE, SCARD_S_SUCCESS, STATUS_BUFFER_TOO_SMALL,
+    STATUS_NOT_SUPPORTED, STATUS_UNSUCCESSFUL, ScardContext,
 };
 use crate::utils::log;
 
@@ -34,52 +34,13 @@ pub(crate) enum IrpWork {
 
 unsafe impl Send for IrpWork {}
 
-/// Tracks outstanding IRPs for cancellation and cleanup
-pub(crate) struct OutstandingIrpTracker {
-    irps: Mutex<HashMap<u32, OutstandingIrp>>,
+/// A decoded operation handed to a context worker thread.
+pub(crate) struct ContextWork {
+    irp: *mut IRP,
+    operation: freerdp_sys::SMARTCARD_OPERATION,
 }
 
-struct OutstandingIrp {
-    #[allow(dead_code)]
-    completion_id: u32,
-    #[allow(dead_code)]
-    started_at: Instant,
-    cancelled: Arc<AtomicBool>,
-}
-
-impl OutstandingIrpTracker {
-    pub(crate) fn new() -> Self {
-        OutstandingIrpTracker {
-            irps: Mutex::new(HashMap::new()),
-        }
-    }
-
-    pub(crate) fn register(&self, completion_id: u32) -> Arc<AtomicBool> {
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let mut map = self.irps.lock().unwrap();
-        map.insert(
-            completion_id,
-            OutstandingIrp {
-                completion_id,
-                started_at: Instant::now(),
-                cancelled: cancelled.clone(),
-            },
-        );
-        cancelled
-    }
-
-    pub(crate) fn complete(&self, completion_id: u32) {
-        let mut map = self.irps.lock().unwrap();
-        map.remove(&completion_id);
-    }
-
-    pub(crate) fn cancel_all(&self) {
-        let map = self.irps.lock().unwrap();
-        for irp in map.values() {
-            irp.cancelled.store(true, Ordering::SeqCst);
-        }
-    }
-}
+unsafe impl Send for ContextWork {}
 
 // ---------------------------------------------------------------------------
 // Device Structure
@@ -101,9 +62,6 @@ pub(crate) struct SmartcardDevice {
 
     /// Handle to the device thread (for join on teardown)
     pub(crate) device_thread: Option<std::thread::JoinHandle<()>>,
-
-    /// Tracker for outstanding IRPs
-    pub(crate) outstanding: Arc<OutstandingIrpTracker>,
 }
 
 // SAFETY: SmartcardDevice is only accessed from FreeRDP callback threads
@@ -111,8 +69,56 @@ pub(crate) struct SmartcardDevice {
 unsafe impl Send for SmartcardDevice {}
 unsafe impl Sync for SmartcardDevice {}
 
+/// One worker thread per context, as in FreeRDP's `smartcard_context_thread`:
+/// a blocking BEGIN_TRANSACTION must not stall operations of other contexts.
 pub(crate) struct ContextEntry {
     pub(crate) context: ScardContext,
+    pub(crate) work_tx: flume::Sender<ContextWork>,
+    pub(crate) worker: Option<std::thread::JoinHandle<()>>,
+    pub(crate) cancelled: Arc<AtomicBool>,
+}
+
+impl ContextEntry {
+    pub(crate) fn spawn(
+        context: ScardContext,
+        integration: Arc<dyn SmartcardIntegration>,
+        contexts: Arc<Mutex<HashMap<u64, ContextEntry>>>,
+    ) -> Self {
+        let (work_tx, work_rx) = flume::unbounded::<ContextWork>();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker = std::thread::Builder::new()
+            .name(format!("smartcard-ctx-{:x}", context.raw()))
+            .spawn(move || context_thread_main(work_rx, integration, contexts))
+            .ok();
+        ContextEntry {
+            context,
+            work_tx,
+            worker,
+            cancelled,
+        }
+    }
+
+    /// Stops the worker: pending IRPs are discarded, the in-flight one is
+    /// cancelled through the integration and awaited.
+    pub(crate) fn shutdown(mut self, integration: &Arc<dyn SmartcardIntegration>) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        if let Err(code) = integration.cancel(&self.context) {
+            log::warn!(
+                "smartcard: failed to cancel context 0x{:X}: 0x{:08X}",
+                self.context.raw(),
+                code
+            );
+        }
+        drop(self.work_tx);
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            log::error!(
+                "smartcard: worker of context 0x{:X} panicked",
+                self.context.raw()
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -366,7 +372,6 @@ pub(crate) fn device_thread_main(
     irp_rx: flume::Receiver<IrpWork>,
     integration: Arc<dyn SmartcardIntegration>,
     contexts: Arc<Mutex<HashMap<u64, ContextEntry>>>,
-    outstanding: Arc<OutstandingIrpTracker>,
 ) {
     log::info!("smartcard: device thread started");
 
@@ -377,7 +382,7 @@ pub(crate) fn device_thread_main(
                 break;
             }
             IrpWork::Process(irp) => {
-                unsafe { process_irp(irp, &integration, &contexts, &outstanding) };
+                unsafe { process_irp(irp, &integration, &contexts) };
             }
         }
     }
@@ -385,11 +390,37 @@ pub(crate) fn device_thread_main(
     log::info!("smartcard: device thread exiting");
 }
 
+fn context_thread_main(
+    work_rx: flume::Receiver<ContextWork>,
+    integration: Arc<dyn SmartcardIntegration>,
+    contexts: Arc<Mutex<HashMap<u64, ContextEntry>>>,
+) {
+    while let Ok(work) = work_rx.recv() {
+        unsafe { run_operation(work, &integration, &contexts) };
+    }
+    // Sender dropped: the context is gone, so whatever is still queued cannot be served.
+    for work in work_rx.drain() {
+        unsafe { discard_operation(work) };
+    }
+}
+
+fn runs_on_device_thread(ioctl: u32) -> bool {
+    use crate::addins::smartcard::consts::*;
+    matches!(
+        ioctl,
+        SCARD_IOCTL_ESTABLISHCONTEXT
+            | SCARD_IOCTL_RELEASECONTEXT
+            | SCARD_IOCTL_ISVALIDCONTEXT
+            | SCARD_IOCTL_CANCEL
+            | SCARD_IOCTL_ACCESSSTARTEDEVENT
+            | SCARD_IOCTL_RELEASETARTEDEVENT
+    )
+}
+
 unsafe fn process_irp(
     irp: *mut IRP,
     integration: &Arc<dyn SmartcardIntegration>,
     contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
-    outstanding: &Arc<OutstandingIrpTracker>,
 ) {
     let mut operation: freerdp_sys::SMARTCARD_OPERATION = unsafe { std::mem::zeroed() };
     let decode_status = unsafe {
@@ -443,7 +474,33 @@ unsafe fn process_irp(
         );
     }
 
-    let _cancel_token = outstanding.register(completion_id);
+    let work = ContextWork { irp, operation };
+
+    if runs_on_device_thread(ioctl) {
+        unsafe { run_operation(work, integration, contexts) };
+        return;
+    }
+
+    let posted = {
+        let ctx_map = contexts.lock().unwrap();
+        match ctx_map.get(&(work.operation.hContext as u64)) {
+            Some(entry) => entry.work_tx.send(work).map_err(|e| e.into_inner()),
+            None => Err(work),
+        }
+    };
+    if let Err(work) = posted {
+        // Unknown context: nothing can serve it, answer inline (FreeRDP does the same).
+        unsafe { run_operation(work, integration, contexts) };
+    }
+}
+
+unsafe fn run_operation(
+    work: ContextWork,
+    integration: &Arc<dyn SmartcardIntegration>,
+    contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
+) {
+    let ContextWork { irp, mut operation } = work;
+    let ioctl = operation.ioControlCode;
 
     let mut io_status = crate::integrations::smartcard::STATUS_SUCCESS as i32;
     let body_pos = unsafe { begin_response((*irp).output) };
@@ -468,8 +525,38 @@ unsafe fn process_irp(
         }
         freerdp_sys::smartcard_operation_free(&mut operation, 0);
     }
+}
 
-    outstanding.complete(completion_id);
+unsafe fn discard_operation(work: ContextWork) {
+    let ContextWork { irp, mut operation } = work;
+    log::debug!(
+        "smartcard: discarding queued {} for released context 0x{:X}",
+        ioctl_name(operation.ioControlCode),
+        operation.hContext
+    );
+    unsafe {
+        match (*irp).Discard {
+            Some(discard_fn) => {
+                discard_fn(irp);
+            }
+            None => {
+                let mut io_status = crate::integrations::smartcard::STATUS_SUCCESS as i32;
+                let body_pos = begin_response((*irp).output);
+                end_response(
+                    (*irp).output,
+                    body_pos,
+                    SCARD_E_INVALID_HANDLE as i32,
+                    operation.outputBufferLength,
+                    &mut io_status,
+                );
+                (*irp).IoStatus = io_status;
+                if let Some(complete_fn) = (*irp).Complete {
+                    complete_fn(irp);
+                }
+            }
+        }
+        freerdp_sys::smartcard_operation_free(&mut operation, 0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -482,10 +569,7 @@ pub(crate) unsafe extern "C" fn init_handler(device: *mut DEVICE) -> UINT {
     }
     log::debug!("smartcard: init_handler called");
     let scard = unsafe { &mut *(device as *mut SmartcardDevice) };
-    let mut ctx_map = scard.contexts.lock().unwrap();
-    for (_, entry) in ctx_map.drain() {
-        let _ = scard.integration.release_context(&entry.context);
-    }
+    shutdown_all_contexts(&scard.integration, &scard.contexts);
     freerdp_sys::CHANNEL_RC_OK
 }
 
@@ -505,24 +589,7 @@ pub(crate) unsafe extern "C" fn free_handler(device: *mut DEVICE) -> UINT {
     // Un in-flight GET_STATUS_CHANGE may be blocked inside the integration. Take
     // a snapshot first so backend cancellation does not run while holding the
     // contexts mutex, then wait for the device thread to finish safely.
-    let contexts_to_cancel = {
-        let contexts = scard.contexts.lock().unwrap();
-        contexts
-            .values()
-            .map(|entry| entry.context)
-            .collect::<Vec<_>>()
-    };
-    for context in contexts_to_cancel {
-        if let Err(code) = scard.integration.cancel(&context) {
-            log::warn!(
-                "smartcard: failed to cancel context 0x{:X} during teardown: 0x{:08X}",
-                context.raw(),
-                code
-            );
-        }
-    }
-
-    scard.outstanding.cancel_all();
+    shutdown_all_contexts(&scard.integration, &scard.contexts);
 
     let _ = scard.irp_tx.send(IrpWork::Shutdown);
 
@@ -530,17 +597,6 @@ pub(crate) unsafe extern "C" fn free_handler(device: *mut DEVICE) -> UINT {
         log::trace!("smartcard: waiting for device thread to finish");
         if handle.join().is_err() {
             log::error!("smartcard: device thread panicked during shutdown");
-        }
-    }
-
-    {
-        let mut contexts = scard.contexts.lock().unwrap();
-        for (ctx_id, entry) in contexts.drain() {
-            log::trace!(
-                "smartcard: releasing context 0x{:X} during teardown",
-                ctx_id
-            );
-            let _ = scard.integration.release_context(&entry.context);
         }
     }
 
@@ -560,6 +616,25 @@ pub(crate) unsafe extern "C" fn free_handler(device: *mut DEVICE) -> UINT {
 
     log::info!("smartcard: device teardown complete");
     CHANNEL_RC_OK
+}
+
+pub(crate) fn shutdown_all_contexts(
+    integration: &Arc<dyn SmartcardIntegration>,
+    contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
+) {
+    let entries = {
+        let mut ctx_map = contexts.lock().unwrap();
+        ctx_map.drain().map(|(_, entry)| entry).collect::<Vec<_>>()
+    };
+    for entry in entries {
+        log::trace!(
+            "smartcard: releasing context 0x{:X} during teardown",
+            entry.context.raw()
+        );
+        let context = entry.context;
+        entry.shutdown(integration);
+        let _ = integration.release_context(&context);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -611,64 +686,16 @@ mod tests {
     use crate::integrations::smartcard::tests::dummy::DummySmartcardHandle;
 
     #[test]
-    fn outstanding_tracker_register_and_complete() {
-        let tracker = OutstandingIrpTracker::new();
-
-        let token1 = tracker.register(1);
-        let token2 = tracker.register(2);
-
-        assert!(!token1.load(Ordering::SeqCst));
-        assert!(!token2.load(Ordering::SeqCst));
-
-        tracker.complete(1);
-        tracker.complete(2);
-    }
-
-    #[test]
-    fn outstanding_tracker_cancel_all() {
-        let tracker = OutstandingIrpTracker::new();
-
-        let token1 = tracker.register(10);
-        let token2 = tracker.register(20);
-        let token3 = tracker.register(30);
-
-        tracker.cancel_all();
-
-        assert!(token1.load(Ordering::SeqCst));
-        assert!(token2.load(Ordering::SeqCst));
-        assert!(token3.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn outstanding_tracker_complete_removes_entry() {
-        let tracker = OutstandingIrpTracker::new();
-
-        let _token = tracker.register(42);
-        tracker.complete(42);
-
-        let map = tracker.irps.lock().unwrap();
-        assert!(!map.contains_key(&42));
-    }
-
-    #[test]
-    fn outstanding_tracker_cancel_empty_is_noop() {
-        let tracker = OutstandingIrpTracker::new();
-        tracker.cancel_all();
-    }
-
-    #[test]
     fn device_thread_processes_work() {
         let (tx, rx) = flume::unbounded::<IrpWork>();
         let integration: Arc<dyn SmartcardIntegration> = Arc::new(DummySmartcardHandle::new());
         let contexts = Arc::new(Mutex::new(HashMap::<u64, ContextEntry>::new()));
-        let outstanding = Arc::new(OutstandingIrpTracker::new());
 
         let integration_clone = integration.clone();
         let contexts_clone = contexts.clone();
-        let outstanding_clone = outstanding.clone();
 
         let handle = std::thread::spawn(move || {
-            device_thread_main(rx, integration_clone, contexts_clone, outstanding_clone);
+            device_thread_main(rx, integration_clone, contexts_clone);
         });
 
         tx.send(IrpWork::Shutdown).unwrap();
@@ -680,14 +707,12 @@ mod tests {
         let (tx, rx) = flume::unbounded::<IrpWork>();
         let integration: Arc<dyn SmartcardIntegration> = Arc::new(DummySmartcardHandle::new());
         let contexts = Arc::new(Mutex::new(HashMap::<u64, ContextEntry>::new()));
-        let outstanding = Arc::new(OutstandingIrpTracker::new());
 
         let integration_clone = integration.clone();
         let contexts_clone = contexts.clone();
-        let outstanding_clone = outstanding.clone();
 
         let handle = std::thread::spawn(move || {
-            device_thread_main(rx, integration_clone, contexts_clone, outstanding_clone);
+            device_thread_main(rx, integration_clone, contexts_clone);
         });
 
         std::thread::sleep(std::time::Duration::from_millis(10));

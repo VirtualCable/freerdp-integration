@@ -3,6 +3,7 @@
 // Copyright (c) 2026, Virtual Cable S.L.
 // All rights reserved.
 // Authors: Adolfo Gómez, dkmaster at dkmon dot com
+//          Janier Rodríguez, jrodriguez at virtualcable dot es
 
 //! IOCTL dispatch and handler functions for smartcard IRPs.
 
@@ -118,8 +119,8 @@ fn handle_establish_context(
             let ctx_id = ctx.raw();
             log::trace!("smartcard: established context 0x{:X}", ctx_id);
 
-            let mut ctx_map = contexts.lock().unwrap();
-            ctx_map.insert(ctx_id, ContextEntry { context: ctx });
+            let entry = ContextEntry::spawn(ctx, integration.clone(), contexts.clone());
+            contexts.lock().unwrap().insert(ctx_id, entry);
 
             unsafe {
                 let mut pb_context = [0u8; 8];
@@ -151,9 +152,11 @@ fn handle_release_context(
     let ctx_id = operation.hContext as u64;
     log::trace!("smartcard: RELEASE_CONTEXT 0x{:X}", ctx_id);
 
-    let mut ctx_map = contexts.lock().unwrap();
-    if let Some(entry) = ctx_map.remove(&ctx_id) {
-        match integration.release_context(&entry.context) {
+    let removed = contexts.lock().unwrap().remove(&ctx_id);
+    if let Some(entry) = removed {
+        let context = entry.context;
+        entry.shutdown(integration);
+        match integration.release_context(&context) {
             Ok(()) => {
                 log::trace!("smartcard: released context 0x{:X}", ctx_id);
                 SCARD_S_SUCCESS
