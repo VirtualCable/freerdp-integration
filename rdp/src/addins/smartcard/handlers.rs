@@ -703,7 +703,15 @@ fn handle_get_attrib(
             }
             SCARD_S_SUCCESS
         }
-        Err(code) => code,
+        Err(code) => {
+            log::trace!(
+                "smartcard: get_attrib card=0x{:X} attr_id=0x{:X} failed: 0x{:08X}",
+                card_handle.raw(),
+                attr_id,
+                code
+            );
+            code
+        }
     }
 }
 
