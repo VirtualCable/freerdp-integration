@@ -8,8 +8,17 @@
 //! The remote side opens the same card from several handles and wraps each
 //! multi-APDU exchange in BEGIN/END_TRANSACTION. Requests from other handles
 //! are parked until the transaction ends, so their APDUs never interleave.
+//!
+//! A transaction left idle for more than five seconds is dropped, the same limit
+//! WinSCard applies (SCardBeginTransaction: "If a transaction is held on the card
+//! for more than five seconds with no operations happening on that card, then
+//! the card is reset"). Without it, a caller that gives up while its BEGIN is
+//! parked keeps the card forever and every other handle waits behind it. Only
+//! the gate is released: the card is not reset, since the transaction exists
+//! here and not in the local PC/SC layer.
 
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use crate::integrations::smartcard::{SCARD_E_INVALID_HANDLE, SCARD_S_SUCCESS};
 
@@ -19,10 +28,13 @@ use super::consts::{
     SCARD_IOCTL_TRANSMIT,
 };
 
+pub(crate) const TRANSACTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
 struct Owner {
     card: u64,
     context: u64,
     depth: u32,
+    last_activity: Instant,
 }
 
 struct Parked<T> {
@@ -88,7 +100,19 @@ impl<T> TransactionGate<T> {
     }
 
     /// Updates the owner after a request has run.
-    pub(crate) fn on_completed(&mut self, ioctl: u32, card: u64, context: u64, result: u32) {
+    pub(crate) fn on_completed(
+        &mut self,
+        ioctl: u32,
+        card: u64,
+        context: u64,
+        result: u32,
+        now: Instant,
+    ) {
+        if let Some(owner) = &mut self.owner
+            && owner.card == card
+        {
+            owner.last_activity = now;
+        }
         match ioctl {
             SCARD_IOCTL_BEGINTRANSACTION if result == SCARD_S_SUCCESS => match &mut self.owner {
                 Some(owner) if owner.card == card => owner.depth += 1,
@@ -98,6 +122,7 @@ impl<T> TransactionGate<T> {
                         card,
                         context,
                         depth: 1,
+                        last_activity: now,
                     })
                 }
             },
@@ -127,6 +152,28 @@ impl<T> TransactionGate<T> {
         }
     }
 
+    /// Drops the owner's transaction if it has been idle for longer than
+    /// `TRANSACTION_IDLE_TIMEOUT`. Returns the card whose transaction expired.
+    pub(crate) fn expire_idle(&mut self, now: Instant) -> Option<u64> {
+        let owner = self.owner.as_ref()?;
+        if now.saturating_duration_since(owner.last_activity) <= TRANSACTION_IDLE_TIMEOUT {
+            return None;
+        }
+        let card = owner.card;
+        self.owner = None;
+        Some(card)
+    }
+
+    /// How long until the owner's transaction expires, if there is one.
+    pub(crate) fn time_to_expiry(&self, now: Instant) -> Option<Duration> {
+        let owner = self.owner.as_ref()?;
+        Some(
+            (owner.last_activity + TRANSACTION_IDLE_TIMEOUT)
+                .saturating_duration_since(now)
+                .max(Duration::from_millis(10)),
+        )
+    }
+
     /// Removes the parked requests of a released context.
     pub(crate) fn take_context(&mut self, context: u64) -> Vec<T> {
         let (taken, kept): (VecDeque<_>, VecDeque<_>) =
@@ -143,6 +190,10 @@ impl<T> TransactionGate<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn now() -> Instant {
+        Instant::now()
+    }
     use crate::addins::smartcard::consts::{
         SCARD_IOCTL_CANCEL, SCARD_IOCTL_GETATTRIB, SCARD_IOCTL_GETSTATUSCHANGEW,
         SCARD_IOCTL_STATUSW,
@@ -156,7 +207,7 @@ mod tests {
 
     fn begin(gate: &mut TransactionGate<u32>, card: u64, context: u64) {
         assert!(!gate.must_wait(SCARD_IOCTL_BEGINTRANSACTION, card));
-        gate.on_completed(SCARD_IOCTL_BEGINTRANSACTION, card, context, OK);
+        gate.on_completed(SCARD_IOCTL_BEGINTRANSACTION, card, context, OK, now());
     }
 
     #[test]
@@ -172,7 +223,7 @@ mod tests {
         gate.park(SCARD_IOCTL_BEGINTRANSACTION, CARD_B, CTX_B, 1);
         assert!(gate.next_runnable().is_none());
 
-        gate.on_completed(SCARD_IOCTL_ENDTRANSACTION, CARD_A, CTX_A, OK);
+        gate.on_completed(SCARD_IOCTL_ENDTRANSACTION, CARD_A, CTX_A, OK, now());
 
         let (ioctl, card, _, item) = gate.next_runnable().unwrap();
         assert_eq!(
@@ -187,9 +238,9 @@ mod tests {
         begin(&mut gate, CARD_A, CTX_A);
         begin(&mut gate, CARD_A, CTX_A);
 
-        gate.on_completed(SCARD_IOCTL_ENDTRANSACTION, CARD_A, CTX_A, OK);
+        gate.on_completed(SCARD_IOCTL_ENDTRANSACTION, CARD_A, CTX_A, OK, now());
         assert_eq!(gate.owner_card(), Some(CARD_A));
-        gate.on_completed(SCARD_IOCTL_ENDTRANSACTION, CARD_A, CTX_A, OK);
+        gate.on_completed(SCARD_IOCTL_ENDTRANSACTION, CARD_A, CTX_A, OK, now());
         assert_eq!(gate.owner_card(), None);
     }
 
@@ -197,7 +248,7 @@ mod tests {
     fn end_from_another_handle_keeps_owner() {
         let mut gate: TransactionGate<u32> = TransactionGate::new();
         begin(&mut gate, CARD_A, CTX_A);
-        gate.on_completed(SCARD_IOCTL_ENDTRANSACTION, CARD_B, CTX_B, OK);
+        gate.on_completed(SCARD_IOCTL_ENDTRANSACTION, CARD_B, CTX_B, OK, now());
         assert_eq!(gate.owner_card(), Some(CARD_A));
     }
 
@@ -205,7 +256,13 @@ mod tests {
     fn failed_end_keeps_owner() {
         let mut gate: TransactionGate<u32> = TransactionGate::new();
         begin(&mut gate, CARD_A, CTX_A);
-        gate.on_completed(SCARD_IOCTL_ENDTRANSACTION, CARD_A, CTX_A, 0x8010_0001);
+        gate.on_completed(
+            SCARD_IOCTL_ENDTRANSACTION,
+            CARD_A,
+            CTX_A,
+            0x8010_0001,
+            now(),
+        );
         assert_eq!(gate.owner_card(), Some(CARD_A));
     }
 
@@ -219,6 +276,7 @@ mod tests {
             CARD_A,
             CTX_A,
             SCARD_E_INVALID_HANDLE,
+            now(),
         );
         assert_eq!(gate.owner_card(), None);
     }
@@ -227,7 +285,7 @@ mod tests {
     fn disconnect_of_owner_releases() {
         let mut gate: TransactionGate<u32> = TransactionGate::new();
         begin(&mut gate, CARD_A, CTX_A);
-        gate.on_completed(SCARD_IOCTL_DISCONNECT, CARD_A, CTX_A, OK);
+        gate.on_completed(SCARD_IOCTL_DISCONNECT, CARD_A, CTX_A, OK, now());
         assert_eq!(gate.owner_card(), None);
     }
 
@@ -235,11 +293,11 @@ mod tests {
     fn release_context_of_owner_releases() {
         let mut gate: TransactionGate<u32> = TransactionGate::new();
         begin(&mut gate, CARD_A, CTX_A);
-        gate.on_completed(SCARD_IOCTL_RELEASECONTEXT, 0, CTX_B, OK);
+        gate.on_completed(SCARD_IOCTL_RELEASECONTEXT, 0, CTX_B, OK, now());
         assert_eq!(gate.owner_card(), Some(CARD_A));
-        gate.on_completed(SCARD_IOCTL_RELEASECONTEXT, 0, CTX_A, 0x8010_0001);
+        gate.on_completed(SCARD_IOCTL_RELEASECONTEXT, 0, CTX_A, 0x8010_0001, now());
         assert_eq!(gate.owner_card(), Some(CARD_A));
-        gate.on_completed(SCARD_IOCTL_RELEASECONTEXT, 0, CTX_A, OK);
+        gate.on_completed(SCARD_IOCTL_RELEASECONTEXT, 0, CTX_A, OK, now());
         assert_eq!(gate.owner_card(), None);
     }
 
@@ -247,13 +305,14 @@ mod tests {
     fn failed_disconnect_keeps_owner() {
         let mut gate: TransactionGate<u32> = TransactionGate::new();
         begin(&mut gate, CARD_A, CTX_A);
-        gate.on_completed(SCARD_IOCTL_DISCONNECT, CARD_A, CTX_A, 0x8010_0001);
+        gate.on_completed(SCARD_IOCTL_DISCONNECT, CARD_A, CTX_A, 0x8010_0001, now());
         assert_eq!(gate.owner_card(), Some(CARD_A));
         gate.on_completed(
             SCARD_IOCTL_DISCONNECT,
             CARD_A,
             CTX_A,
             SCARD_E_INVALID_HANDLE,
+            now(),
         );
         assert_eq!(gate.owner_card(), None);
     }
@@ -261,7 +320,13 @@ mod tests {
     #[test]
     fn failed_begin_does_not_take_the_card() {
         let mut gate: TransactionGate<u32> = TransactionGate::new();
-        gate.on_completed(SCARD_IOCTL_BEGINTRANSACTION, CARD_A, CTX_A, 0x8010_0002);
+        gate.on_completed(
+            SCARD_IOCTL_BEGINTRANSACTION,
+            CARD_A,
+            CTX_A,
+            0x8010_0002,
+            now(),
+        );
         assert_eq!(gate.owner_card(), None);
     }
 
@@ -283,14 +348,14 @@ mod tests {
         begin(&mut gate, CARD_A, CTX_A);
         gate.park(SCARD_IOCTL_BEGINTRANSACTION, CARD_B, CTX_B, 1);
         gate.park(SCARD_IOCTL_BEGINTRANSACTION, 0xC, 0x3, 2);
-        gate.on_completed(SCARD_IOCTL_ENDTRANSACTION, CARD_A, CTX_A, OK);
+        gate.on_completed(SCARD_IOCTL_ENDTRANSACTION, CARD_A, CTX_A, OK, now());
 
         let (ioctl, card, context, item) = gate.next_runnable().unwrap();
         assert_eq!(item, 1);
-        gate.on_completed(ioctl, card, context, OK);
+        gate.on_completed(ioctl, card, context, OK, now());
         assert!(gate.next_runnable().is_none());
 
-        gate.on_completed(SCARD_IOCTL_ENDTRANSACTION, CARD_B, CTX_B, OK);
+        gate.on_completed(SCARD_IOCTL_ENDTRANSACTION, CARD_B, CTX_B, OK, now());
         assert_eq!(gate.next_runnable().map(|r| r.3), Some(2));
     }
 
@@ -304,5 +369,65 @@ mod tests {
 
         assert_eq!(gate.take_context(CTX_B), vec![1, 3]);
         assert_eq!(gate.take_all(), vec![2]);
+    }
+
+    #[test]
+    fn idle_transaction_expires() {
+        let mut gate = TransactionGate::new();
+        let start = Instant::now();
+        gate.on_completed(SCARD_IOCTL_BEGINTRANSACTION, CARD_A, CTX_A, OK, start);
+        gate.park(SCARD_IOCTL_BEGINTRANSACTION, CARD_B, CTX_B, 1);
+
+        assert_eq!(gate.expire_idle(start + TRANSACTION_IDLE_TIMEOUT), None);
+        assert_eq!(gate.owner_card(), Some(CARD_A));
+
+        let later = start + TRANSACTION_IDLE_TIMEOUT + Duration::from_millis(1);
+        assert_eq!(gate.expire_idle(later), Some(CARD_A));
+        assert_eq!(gate.owner_card(), None);
+        assert_eq!(gate.next_runnable().map(|r| r.3), Some(1));
+    }
+
+    #[test]
+    fn owner_activity_postpones_expiry() {
+        let mut gate: TransactionGate<u32> = TransactionGate::new();
+        let start = Instant::now();
+        gate.on_completed(SCARD_IOCTL_BEGINTRANSACTION, CARD_A, CTX_A, OK, start);
+        let busy = start + Duration::from_secs(4);
+        gate.on_completed(SCARD_IOCTL_TRANSMIT, CARD_A, CTX_A, OK, busy);
+
+        assert_eq!(gate.expire_idle(start + Duration::from_secs(6)), None);
+        assert_eq!(
+            gate.time_to_expiry(start + Duration::from_secs(6)),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(
+            gate.expire_idle(busy + TRANSACTION_IDLE_TIMEOUT + Duration::from_millis(1)),
+            Some(CARD_A)
+        );
+    }
+
+    #[test]
+    fn activity_of_other_handles_does_not_postpone_expiry() {
+        let mut gate: TransactionGate<u32> = TransactionGate::new();
+        let start = Instant::now();
+        gate.on_completed(SCARD_IOCTL_BEGINTRANSACTION, CARD_A, CTX_A, OK, start);
+        gate.on_completed(
+            SCARD_IOCTL_STATUSW,
+            CARD_B,
+            CTX_B,
+            OK,
+            start + Duration::from_secs(4),
+        );
+        assert_eq!(
+            gate.expire_idle(start + TRANSACTION_IDLE_TIMEOUT + Duration::from_millis(1)),
+            Some(CARD_A)
+        );
+    }
+
+    #[test]
+    fn no_owner_means_no_expiry() {
+        let mut gate: TransactionGate<u32> = TransactionGate::new();
+        assert_eq!(gate.time_to_expiry(Instant::now()), None);
+        assert_eq!(gate.expire_idle(Instant::now()), None);
     }
 }

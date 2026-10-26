@@ -22,7 +22,7 @@ use crate::utils::log;
 
 use super::consts::{SCARD_IOCTL_RELEASECONTEXT, ioctl_name};
 use super::handlers::dispatch_ioctl;
-use super::transactions::TransactionGate;
+use super::transactions::{TRANSACTION_IDLE_TIMEOUT, TransactionGate};
 
 // ---------------------------------------------------------------------------
 // Threading Structures
@@ -374,19 +374,43 @@ pub(crate) fn device_thread_main(
 
     let mut gate = TransactionGate::new();
 
-    while let Ok(work) = irp_rx.recv() {
+    loop {
+        let work = match gate.time_to_expiry(Instant::now()) {
+            Some(wait) => match irp_rx.recv_timeout(wait) {
+                Ok(work) => Some(work),
+                Err(flume::RecvTimeoutError::Timeout) => None,
+                Err(flume::RecvTimeoutError::Disconnected) => break,
+            },
+            None => match irp_rx.recv() {
+                Ok(work) => Some(work),
+                Err(_) => break,
+            },
+        };
+
+        // Expire first, so a request that arrives right at the deadline does not
+        // revive a transaction that has already timed out.
+        if let Some(card) = gate.expire_idle(Instant::now()) {
+            log::debug!(
+                "smartcard: transaction of card=0x{:X} idle for more than {:?}, released",
+                card,
+                TRANSACTION_IDLE_TIMEOUT
+            );
+            unsafe { run_parked(&mut gate, &integration, &contexts, &outstanding) };
+        }
+
         match work {
-            IrpWork::Shutdown => {
+            Some(IrpWork::Shutdown) => {
                 log::info!("smartcard: device thread received shutdown signal");
                 break;
             }
-            IrpWork::Process(irp) => {
+            Some(IrpWork::Process(irp)) => {
                 if let Some(request) = unsafe { decode_irp(irp) } {
                     unsafe {
                         handle_request(request, &mut gate, &integration, &contexts, &outstanding)
                     };
                 }
             }
+            None => {}
         }
     }
 
@@ -440,7 +464,7 @@ unsafe fn handle_request(
     }
 
     let result = unsafe { execute_request(request, integration, contexts, outstanding) };
-    gate.on_completed(ioctl, card, context, result);
+    gate.on_completed(ioctl, card, context, result, Instant::now());
 
     // SCardCancel only interrupts blocking status waits, so a CANCEL leaves parked
     // requests alone; once the context is gone they can never run.
@@ -450,10 +474,20 @@ unsafe fn handle_request(
         }
     }
 
+    unsafe { run_parked(gate, integration, contexts, outstanding) };
+}
+
+/// Runs the parked requests that no longer have to wait, in arrival order.
+unsafe fn run_parked(
+    gate: &mut TransactionGate<Request>,
+    integration: &Arc<dyn SmartcardIntegration>,
+    contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
+    outstanding: &Arc<OutstandingIrpTracker>,
+) {
     while let Some((ioctl, card, context, parked)) = gate.next_runnable() {
         log::trace!("smartcard: {} card=0x{:X} resumed", ioctl_name(ioctl), card);
         let result = unsafe { execute_request(parked, integration, contexts, outstanding) };
-        gate.on_completed(ioctl, card, context, result);
+        gate.on_completed(ioctl, card, context, result, Instant::now());
     }
 }
 
