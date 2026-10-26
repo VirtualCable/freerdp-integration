@@ -20,7 +20,7 @@ use crate::integrations::smartcard::{
 use crate::utils::log;
 
 use super::consts::ioctl_name;
-use super::handlers::dispatch_ioctl;
+use super::handlers::{dispatch_ioctl, pack_empty_return};
 
 // ---------------------------------------------------------------------------
 // Threading Structures
@@ -297,6 +297,10 @@ pub(crate) fn get_atr_masks(
 // Header Packing helpers
 // ---------------------------------------------------------------------------
 
+pub(crate) unsafe fn stream_position(stream: *mut freerdp_sys::wStream) -> usize {
+    unsafe { (*stream).pointer.offset_from((*stream).buffer) as usize }
+}
+
 pub(crate) unsafe fn begin_response(out: *mut freerdp_sys::wStream) -> usize {
     unsafe {
         // Write 24 bytes of dummy header
@@ -510,6 +514,9 @@ unsafe fn run_operation(
     });
 
     unsafe {
+        if return_code != SCARD_S_SUCCESS && stream_position((*irp).output) == body_pos {
+            pack_empty_return(ioctl, return_code, &operation, (*irp).output);
+        }
         end_response(
             (*irp).output,
             body_pos,

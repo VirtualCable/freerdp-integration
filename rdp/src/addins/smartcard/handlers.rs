@@ -101,6 +101,171 @@ pub(crate) fn dispatch_ioctl(
     }
 }
 
+/// Packs the `*_Return` a failed handler left out. The server decodes a bare
+/// ReturnCode as RPC_X_BAD_STUB_DATA (0x6F7) instead of the SCard error.
+pub(crate) fn pack_empty_return(
+    ioctl: u32,
+    code: u32,
+    operation: &freerdp_sys::SMARTCARD_OPERATION,
+    out: *mut freerdp_sys::wStream,
+) {
+    let return_code = code as i32;
+    unsafe {
+        match ioctl {
+            SCARD_IOCTL_ESTABLISHCONTEXT => {
+                let ret = freerdp_sys::EstablishContext_Return {
+                    ReturnCode: return_code,
+                    hContext: std::mem::zeroed(),
+                };
+                freerdp_sys::smartcard_pack_establish_context_return(out, &ret);
+            }
+            SCARD_IOCTL_LISTREADERGROUPSA | SCARD_IOCTL_LISTREADERGROUPSW => {
+                let ret = freerdp_sys::ListReaderGroups_Return {
+                    ReturnCode: return_code,
+                    cBytes: 0,
+                    msz: std::ptr::null_mut(),
+                };
+                let unicode = (ioctl == SCARD_IOCTL_LISTREADERGROUPSW) as i32;
+                freerdp_sys::smartcard_pack_list_reader_groups_return(out, &ret, unicode);
+            }
+            SCARD_IOCTL_LISTREADERSA | SCARD_IOCTL_LISTREADERSW => {
+                let ret = freerdp_sys::ListReaders_Return {
+                    ReturnCode: return_code,
+                    cBytes: 0,
+                    msz: std::ptr::null_mut(),
+                };
+                let unicode = (ioctl == SCARD_IOCTL_LISTREADERSW) as i32;
+                freerdp_sys::smartcard_pack_list_readers_return(out, &ret, unicode);
+            }
+            SCARD_IOCTL_LOCATECARDSA | SCARD_IOCTL_LOCATECARDSW => {
+                let ret = freerdp_sys::LocateCards_Return {
+                    ReturnCode: return_code,
+                    cReaders: 0,
+                    rgReaderStates: std::ptr::null_mut(),
+                };
+                freerdp_sys::smartcard_pack_locate_cards_return(out, &ret);
+            }
+            SCARD_IOCTL_GETSTATUSCHANGEA
+            | SCARD_IOCTL_GETSTATUSCHANGEW
+            | SCARD_IOCTL_LOCATECARDSBYATRA
+            | SCARD_IOCTL_LOCATECARDSBYATRW => {
+                let ret = freerdp_sys::GetStatusChange_Return {
+                    ReturnCode: return_code,
+                    cReaders: 0,
+                    rgReaderStates: std::ptr::null_mut(),
+                };
+                let unicode = matches!(
+                    ioctl,
+                    SCARD_IOCTL_GETSTATUSCHANGEW | SCARD_IOCTL_LOCATECARDSBYATRW
+                ) as i32;
+                freerdp_sys::smartcard_pack_get_status_change_return(out, &ret, unicode);
+            }
+            SCARD_IOCTL_CONNECTA | SCARD_IOCTL_CONNECTW => {
+                let ret = freerdp_sys::Connect_Return {
+                    ReturnCode: return_code,
+                    hContext: std::mem::zeroed(),
+                    hCard: std::mem::zeroed(),
+                    dwActiveProtocol: 0,
+                };
+                freerdp_sys::smartcard_pack_connect_return(out, &ret);
+            }
+            SCARD_IOCTL_RECONNECT => {
+                let ret = freerdp_sys::Reconnect_Return {
+                    ReturnCode: return_code,
+                    dwActiveProtocol: 0,
+                };
+                freerdp_sys::smartcard_pack_reconnect_return(out, &ret);
+            }
+            SCARD_IOCTL_STATE => {
+                let ret = freerdp_sys::State_Return {
+                    ReturnCode: return_code,
+                    dwState: 0,
+                    dwProtocol: 0,
+                    cbAtrLen: 0,
+                    rgAtr: [0u8; 36],
+                };
+                freerdp_sys::smartcard_pack_state_return(out, &ret);
+            }
+            SCARD_IOCTL_STATUSA | SCARD_IOCTL_STATUSW => {
+                let ret = freerdp_sys::Status_Return {
+                    ReturnCode: return_code,
+                    cBytes: 0,
+                    mszReaderNames: std::ptr::null_mut(),
+                    dwState: 0,
+                    dwProtocol: 0,
+                    pbAtr: [0u8; 32],
+                    cbAtrLen: 0,
+                };
+                let unicode = (ioctl == SCARD_IOCTL_STATUSW) as i32;
+                freerdp_sys::smartcard_pack_status_return(out, &ret, unicode);
+            }
+            SCARD_IOCTL_TRANSMIT => {
+                let ret = freerdp_sys::Transmit_Return {
+                    ReturnCode: return_code,
+                    pioRecvPci: std::ptr::null_mut(),
+                    cbRecvLength: 0,
+                    pbRecvBuffer: std::ptr::null_mut(),
+                };
+                freerdp_sys::smartcard_pack_transmit_return(out, &ret);
+            }
+            SCARD_IOCTL_CONTROL => {
+                let ret = freerdp_sys::Control_Return {
+                    ReturnCode: return_code,
+                    cbOutBufferSize: 0,
+                    pvOutBuffer: std::ptr::null_mut(),
+                };
+                freerdp_sys::smartcard_pack_control_return(out, &ret);
+            }
+            SCARD_IOCTL_GETATTRIB => {
+                let call = &operation.call.getAttrib;
+                let ret = freerdp_sys::GetAttrib_Return {
+                    ReturnCode: return_code,
+                    cbAttrLen: 0,
+                    pbAttr: std::ptr::null_mut(),
+                };
+                freerdp_sys::smartcard_pack_get_attrib_return(
+                    out,
+                    &ret,
+                    call.dwAttrId,
+                    call.cbAttrLen,
+                );
+            }
+            SCARD_IOCTL_GETTRANSMITCOUNT => {
+                let ret = freerdp_sys::GetTransmitCount_Return {
+                    ReturnCode: return_code,
+                    cTransmitCount: 0,
+                };
+                freerdp_sys::smartcard_pack_get_transmit_count_return(out, &ret);
+            }
+            SCARD_IOCTL_GETREADERICON => {
+                let ret = freerdp_sys::GetReaderIcon_Return {
+                    ReturnCode: return_code,
+                    cbDataLen: 0,
+                    pbData: std::ptr::null_mut(),
+                };
+                freerdp_sys::smartcard_pack_get_reader_icon_return(out, &ret);
+            }
+            SCARD_IOCTL_GETDEVICETYPEID => {
+                let ret = freerdp_sys::GetDeviceTypeId_Return {
+                    ReturnCode: return_code,
+                    dwDeviceId: 0,
+                };
+                freerdp_sys::smartcard_pack_device_type_id_return(out, &ret);
+            }
+            SCARD_IOCTL_READCACHEA | SCARD_IOCTL_READCACHEW => {
+                let ret = freerdp_sys::ReadCache_Return {
+                    ReturnCode: return_code,
+                    cbDataLen: 0,
+                    pbData: std::ptr::null_mut(),
+                };
+                freerdp_sys::smartcard_pack_read_cache_return(out, &ret);
+            }
+            // Long_Return: the ReturnCode written by end_response is the whole body.
+            _ => {}
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // IOCTL Handlers
 // ---------------------------------------------------------------------------
