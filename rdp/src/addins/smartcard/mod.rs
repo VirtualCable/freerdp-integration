@@ -10,6 +10,7 @@
 mod consts;
 mod device;
 mod handlers;
+mod transactions;
 
 use std::collections::HashMap;
 use std::sync::Arc;

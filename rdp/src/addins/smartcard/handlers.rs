@@ -689,21 +689,47 @@ fn handle_get_attrib(
 
     match integration.get_attrib(&card_handle, attr_id) {
         Ok(mut attr_data) => {
+            // A NULL pbAttr is a size query: answer the length with no data, as
+            // SCardGetAttrib does. Packing the data would cut it to cbAttrLen (0).
+            let size_query = call.fpbAttrIsNULL != 0;
             log::trace!(
-                "smartcard: get_attrib success, response_len={}",
-                attr_data.len()
+                "smartcard: get_attrib success, response_len={} size_query={}",
+                attr_data.len(),
+                size_query
             );
             unsafe {
                 let ret = freerdp_sys::GetAttrib_Return {
                     ReturnCode: SCARD_S_SUCCESS as i32,
                     cbAttrLen: attr_data.len() as u32,
-                    pbAttr: attr_data.as_mut_ptr(),
+                    pbAttr: if size_query {
+                        std::ptr::null_mut()
+                    } else {
+                        attr_data.as_mut_ptr()
+                    },
                 };
                 freerdp_sys::smartcard_pack_get_attrib_return(out, &ret, attr_id, call.cbAttrLen);
             }
             SCARD_S_SUCCESS
         }
-        Err(code) => code,
+        Err(code) => {
+            log::trace!(
+                "smartcard: get_attrib card=0x{:X} attr_id=0x{:X} failed: 0x{:08X}",
+                card_handle.raw(),
+                attr_id,
+                code
+            );
+            // The client still expects a GetAttrib_Return; an empty body is
+            // decoded as RPC_X_BAD_STUB_DATA (0x6F7) instead of `code`.
+            unsafe {
+                let ret = freerdp_sys::GetAttrib_Return {
+                    ReturnCode: code as i32,
+                    cbAttrLen: 0,
+                    pbAttr: std::ptr::null_mut(),
+                };
+                freerdp_sys::smartcard_pack_get_attrib_return(out, &ret, attr_id, call.cbAttrLen);
+            }
+            code
+        }
     }
 }
 

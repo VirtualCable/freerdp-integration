@@ -2,25 +2,30 @@
 // Copyright (c) 2026, Virtual Cable S.L.
 // All rights reserved.
 // Authors: Adolfo Gómez, dkmaster at dkmon dot com
+// Author: Andres Schumann, aschumann at virtualcable dot es
 
 //! Device struct, threading, and IRP processing infrastructure.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use freerdp_sys::{CHANNEL_RC_OK, DEVICE, IRP, UINT};
 
 use crate::integrations::SmartcardIntegration;
 use crate::integrations::smartcard::{
-    IRP_MJ_DEVICE_CONTROL, SCARD_S_SUCCESS, STATUS_BUFFER_TOO_SMALL, STATUS_NOT_SUPPORTED,
-    STATUS_UNSUCCESSFUL, ScardContext,
+    IRP_MJ_DEVICE_CONTROL, SCARD_E_CANCELLED, SCARD_S_SUCCESS, STATUS_BUFFER_TOO_SMALL,
+    STATUS_NOT_SUPPORTED, STATUS_UNSUCCESSFUL, ScardContext,
 };
 use crate::utils::log;
 
-use super::consts::ioctl_name;
+use super::consts::{
+    SCARD_IOCTL_GETSTATUSCHANGEA, SCARD_IOCTL_GETSTATUSCHANGEW, SCARD_IOCTL_RELEASECONTEXT,
+    ioctl_name,
+};
 use super::handlers::dispatch_ioctl;
+use super::transactions::{TRANSACTION_IDLE_TIMEOUT, TransactionGate};
 
 // ---------------------------------------------------------------------------
 // Threading Structures
@@ -78,6 +83,18 @@ impl OutstandingIrpTracker {
         for irp in map.values() {
             irp.cancelled.store(true, Ordering::SeqCst);
         }
+    }
+
+    /// Waits until no IRP is outstanding; returns false if `timeout` expires first.
+    pub(crate) fn wait_idle(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while !self.irps.lock().unwrap().is_empty() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
     }
 }
 
@@ -370,27 +387,177 @@ pub(crate) fn device_thread_main(
 ) {
     log::info!("smartcard: device thread started");
 
-    while let Ok(work) = irp_rx.recv() {
+    let mut gate = TransactionGate::new();
+
+    loop {
+        let work = match gate.time_to_expiry(Instant::now()) {
+            Some(wait) => match irp_rx.recv_timeout(wait) {
+                Ok(work) => Some(work),
+                Err(flume::RecvTimeoutError::Timeout) => None,
+                Err(flume::RecvTimeoutError::Disconnected) => break,
+            },
+            None => match irp_rx.recv() {
+                Ok(work) => Some(work),
+                Err(_) => break,
+            },
+        };
+
+        // Expire first, so a request that arrives right at the deadline does not
+        // revive a transaction that has already timed out.
+        if let Some(card) = gate.expire_idle(Instant::now()) {
+            log::debug!(
+                "smartcard: transaction of card=0x{:X} idle for more than {:?}, released",
+                card,
+                TRANSACTION_IDLE_TIMEOUT
+            );
+            unsafe { run_parked(&mut gate, &integration, &contexts, &outstanding) };
+        }
+
         match work {
-            IrpWork::Shutdown => {
+            Some(IrpWork::Shutdown) => {
                 log::info!("smartcard: device thread received shutdown signal");
                 break;
             }
-            IrpWork::Process(irp) => {
-                unsafe { process_irp(irp, &integration, &contexts, &outstanding) };
+            Some(IrpWork::Process(irp)) => {
+                if let Some(request) = unsafe { decode_irp(irp) } {
+                    unsafe {
+                        handle_request(request, &mut gate, &integration, &contexts, &outstanding)
+                    };
+                }
             }
+            None => {}
         }
+    }
+
+    // The channel is going away: like FreeRDP's own smartcard channel, drop the
+    // parked IRPs instead of answering them.
+    for request in gate.take_all() {
+        unsafe { discard_request(request) };
     }
 
     log::info!("smartcard: device thread exiting");
 }
 
-unsafe fn process_irp(
+/// A decoded IRP, ready to run now or to be parked until the card is free.
+struct Request {
     irp: *mut IRP,
+    operation: freerdp_sys::SMARTCARD_OPERATION,
+}
+
+// SAFETY: like `IrpWork`, the raw pointers belong to FreeRDP, which allows an IRP to be
+// completed from any thread.
+unsafe impl Send for Request {}
+
+impl Request {
+    fn ioctl(&self) -> u32 {
+        self.operation.ioControlCode
+    }
+
+    fn card(&self) -> u64 {
+        get_card_handle(unsafe { &self.operation.call.handles.hCard }).raw()
+    }
+
+    fn context(&self) -> u64 {
+        self.operation.hContext as u64
+    }
+}
+
+unsafe fn handle_request(
+    request: Request,
+    gate: &mut TransactionGate<Request>,
     integration: &Arc<dyn SmartcardIntegration>,
     contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
     outstanding: &Arc<OutstandingIrpTracker>,
 ) {
+    let (ioctl, card, context) = (request.ioctl(), request.card(), request.context());
+
+    if is_status_change(ioctl) {
+        unsafe { run_detached(request, integration, contexts, outstanding) };
+        return;
+    }
+
+    if gate.must_wait(ioctl, card) {
+        log::trace!(
+            "smartcard: {} card=0x{:X} parked, card held by 0x{:X}",
+            ioctl_name(ioctl),
+            card,
+            gate.owner_card().unwrap_or_default()
+        );
+        gate.park(ioctl, card, context, request);
+        return;
+    }
+
+    let result = unsafe { execute_request(request, integration, contexts, outstanding) };
+    gate.on_completed(ioctl, card, context, result, Instant::now());
+
+    // SCardCancel only interrupts blocking status waits, so a CANCEL leaves parked
+    // requests alone; once the context is gone they can never run.
+    if ioctl == SCARD_IOCTL_RELEASECONTEXT && result == SCARD_S_SUCCESS {
+        for parked in gate.take_context(context) {
+            unsafe { complete_without_running(parked, SCARD_E_CANCELLED) };
+        }
+    }
+
+    unsafe { run_parked(gate, integration, contexts, outstanding) };
+}
+
+fn is_status_change(ioctl: u32) -> bool {
+    ioctl == SCARD_IOCTL_GETSTATUSCHANGEA || ioctl == SCARD_IOCTL_GETSTATUSCHANGEW
+}
+
+/// GET_STATUS_CHANGE waits inside the backend, so it gets its own thread: the device
+/// thread keeps serving the other IRPs instead of queueing them behind the wait.
+unsafe fn run_detached(
+    request: Request,
+    integration: &Arc<dyn SmartcardIntegration>,
+    contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
+    outstanding: &Arc<OutstandingIrpTracker>,
+) {
+    outstanding.register(request.operation.completionID);
+
+    let slot = Arc::new(Mutex::new(Some(request)));
+    let worker_slot = slot.clone();
+    let (worker_integration, worker_contexts, worker_outstanding) =
+        (integration.clone(), contexts.clone(), outstanding.clone());
+
+    let spawned = std::thread::Builder::new()
+        .name("scard-status".into())
+        .spawn(move || {
+            if let Some(request) = worker_slot.lock().unwrap().take() {
+                unsafe {
+                    execute_request(
+                        request,
+                        &worker_integration,
+                        &worker_contexts,
+                        &worker_outstanding,
+                    )
+                };
+            }
+        });
+
+    if let Err(error) = spawned {
+        log::error!("smartcard: cannot start the status thread ({error}), running inline");
+        if let Some(request) = slot.lock().unwrap().take() {
+            unsafe { execute_request(request, integration, contexts, outstanding) };
+        }
+    }
+}
+
+/// Runs the parked requests that no longer have to wait, in arrival order.
+unsafe fn run_parked(
+    gate: &mut TransactionGate<Request>,
+    integration: &Arc<dyn SmartcardIntegration>,
+    contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
+    outstanding: &Arc<OutstandingIrpTracker>,
+) {
+    while let Some((ioctl, card, context, parked)) = gate.next_runnable() {
+        log::trace!("smartcard: {} card=0x{:X} resumed", ioctl_name(ioctl), card);
+        let result = unsafe { execute_request(parked, integration, contexts, outstanding) };
+        gate.on_completed(ioctl, card, context, result, Instant::now());
+    }
+}
+
+unsafe fn decode_irp(irp: *mut IRP) -> Option<Request> {
     let mut operation: freerdp_sys::SMARTCARD_OPERATION = unsafe { std::mem::zeroed() };
     let decode_status = unsafe {
         freerdp_sys::smartcard_irp_device_control_decode(
@@ -418,9 +585,56 @@ unsafe fn process_irp(
                 complete_fn(irp);
             }
         }
-        return;
+        return None;
     }
 
+    Some(Request { irp, operation })
+}
+
+/// Completes a parked request with `return_code` without calling the integration.
+unsafe fn complete_without_running(request: Request, return_code: u32) {
+    let Request { irp, mut operation } = request;
+    log::trace!(
+        "smartcard: {} card=0x{:X} completed without running: 0x{:08X}",
+        ioctl_name(operation.ioControlCode),
+        get_card_handle(unsafe { &operation.call.handles.hCard }).raw(),
+        return_code
+    );
+    unsafe {
+        let mut io_status = crate::integrations::smartcard::STATUS_SUCCESS as i32;
+        let body_pos = begin_response((*irp).output);
+        end_response(
+            (*irp).output,
+            body_pos,
+            return_code as i32,
+            operation.outputBufferLength,
+            &mut io_status,
+        );
+        (*irp).IoStatus = io_status;
+        if let Some(complete_fn) = (*irp).Complete {
+            complete_fn(irp);
+        }
+        freerdp_sys::smartcard_operation_free(&mut operation, 0);
+    }
+}
+
+unsafe fn discard_request(request: Request) {
+    let Request { irp, mut operation } = request;
+    unsafe {
+        freerdp_sys::smartcard_operation_free(&mut operation, 0);
+        if let Some(discard_fn) = (*irp).Discard {
+            discard_fn(irp);
+        }
+    }
+}
+
+unsafe fn execute_request(
+    request: Request,
+    integration: &Arc<dyn SmartcardIntegration>,
+    contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
+    outstanding: &Arc<OutstandingIrpTracker>,
+) -> u32 {
+    let Request { irp, mut operation } = request;
     let ioctl = operation.ioControlCode;
     let completion_id = operation.completionID;
 
@@ -470,6 +684,7 @@ unsafe fn process_irp(
     }
 
     outstanding.complete(completion_id);
+    return_code
 }
 
 // ---------------------------------------------------------------------------
@@ -531,6 +746,10 @@ pub(crate) unsafe extern "C" fn free_handler(device: *mut DEVICE) -> UINT {
         if handle.join().is_err() {
             log::error!("smartcard: device thread panicked during shutdown");
         }
+    }
+
+    if !scard.outstanding.wait_idle(Duration::from_secs(2)) {
+        log::warn!("smartcard: status threads still running at teardown");
     }
 
     {
@@ -654,6 +873,39 @@ mod tests {
     fn outstanding_tracker_cancel_empty_is_noop() {
         let tracker = OutstandingIrpTracker::new();
         tracker.cancel_all();
+    }
+
+    #[test]
+    fn wait_idle_returns_once_everything_completed() {
+        let tracker = Arc::new(OutstandingIrpTracker::new());
+        tracker.register(7);
+
+        let completer = tracker.clone();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            completer.complete(7);
+        });
+
+        assert!(tracker.wait_idle(Duration::from_secs(2)));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn wait_idle_gives_up_while_an_irp_is_outstanding() {
+        let tracker = OutstandingIrpTracker::new();
+        tracker.register(7);
+
+        assert!(!tracker.wait_idle(Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn only_get_status_change_runs_detached() {
+        use super::super::consts::{SCARD_IOCTL_ESTABLISHCONTEXT, SCARD_IOCTL_TRANSMIT};
+
+        assert!(is_status_change(SCARD_IOCTL_GETSTATUSCHANGEA));
+        assert!(is_status_change(SCARD_IOCTL_GETSTATUSCHANGEW));
+        assert!(!is_status_change(SCARD_IOCTL_TRANSMIT));
+        assert!(!is_status_change(SCARD_IOCTL_ESTABLISHCONTEXT));
     }
 
     #[test]
