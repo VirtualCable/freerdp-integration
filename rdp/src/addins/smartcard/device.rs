@@ -737,7 +737,7 @@ mod tests {
 
     use std::cell::UnsafeCell;
     use std::ffi::CString;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use freerdp_sys::{
         Connect_Return, GetAttrib_Return, LocateCards_Return, REDIR_SCARDHANDLE,
@@ -1101,8 +1101,14 @@ mod tests {
         fx.assert_not_completed("infinite status change");
 
         let release = fx.irp("release");
+        let started = Instant::now();
         fx.run(&release, operation(SCARD_IOCTL_RELEASECONTEXT, ctx));
         assert_eq!(release.return_code(), SCARD_S_SUCCESS);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "release waited {:?} for the in-flight status change",
+            started.elapsed()
+        );
 
         let order = [
             fx.wait_completed(),
