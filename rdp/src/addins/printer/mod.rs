@@ -17,7 +17,10 @@ use crate::context::OwnerFromCtx;
 use crate::utils::log;
 
 use consts::{RDPDR_DTYP_PRINT, RDPDR_PRINTER_ANNOUNCE_FLAG_DEFAULTPRINTER};
-use device::{PrinterDevice, free_handler, init_handler, irp_request_handler, printer_thread_main};
+use device::{
+    PrinterDevice, custom_component_handler, free_handler, init_handler, irp_request_handler,
+    printer_thread_main,
+};
 use handlers::stream_write_u32;
 
 pub unsafe extern "C" fn device_service_entry(
@@ -92,6 +95,7 @@ pub unsafe extern "C" fn device_service_entry(
         device_box.device.IRPRequest = Some(irp_request_handler);
         device_box.device.Free = Some(free_handler);
         device_box.device.Init = Some(init_handler);
+        device_box.device.CustomComponentRequest = Some(custom_component_handler);
 
         let port_str = printer
             .port_name
