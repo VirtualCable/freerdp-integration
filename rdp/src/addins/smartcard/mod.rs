@@ -10,6 +10,7 @@
 mod consts;
 mod device;
 mod handlers;
+mod operation;
 mod transactions;
 
 use std::collections::HashMap;

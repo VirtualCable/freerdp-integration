@@ -25,6 +25,7 @@ use super::consts::{
     ioctl_name,
 };
 use super::handlers::dispatch_ioctl;
+use super::operation::Operation;
 use super::transactions::{TRANSACTION_IDLE_TIMEOUT, TransactionGate};
 
 // ---------------------------------------------------------------------------
@@ -441,7 +442,7 @@ pub(crate) fn device_thread_main(
 /// A decoded IRP, ready to run now or to be parked until the card is free.
 struct Request {
     irp: *mut IRP,
-    operation: freerdp_sys::SMARTCARD_OPERATION,
+    operation: Operation,
 }
 
 // SAFETY: like `IrpWork`, the raw pointers belong to FreeRDP, which allows an IRP to be
@@ -558,13 +559,13 @@ unsafe fn run_parked(
 }
 
 unsafe fn decode_irp(irp: *mut IRP) -> Option<Request> {
-    let mut operation: freerdp_sys::SMARTCARD_OPERATION = unsafe { std::mem::zeroed() };
+    let mut operation = Operation::zeroed();
     let decode_status = unsafe {
         freerdp_sys::smartcard_irp_device_control_decode(
             (*irp).input,
             (*irp).CompletionId,
             (*irp).FileId,
-            &mut operation,
+            operation.as_mut_ptr(),
         )
     };
 
@@ -614,14 +615,14 @@ unsafe fn complete_without_running(request: Request, return_code: u32) {
         if let Some(complete_fn) = (*irp).Complete {
             complete_fn(irp);
         }
-        freerdp_sys::smartcard_operation_free(&mut operation, 0);
+        freerdp_sys::smartcard_operation_free(operation.as_mut_ptr(), 0);
     }
 }
 
 unsafe fn discard_request(request: Request) {
     let Request { irp, mut operation } = request;
     unsafe {
-        freerdp_sys::smartcard_operation_free(&mut operation, 0);
+        freerdp_sys::smartcard_operation_free(operation.as_mut_ptr(), 0);
         if let Some(discard_fn) = (*irp).Discard {
             discard_fn(irp);
         }
@@ -680,7 +681,7 @@ unsafe fn execute_request(
         } else {
             log::error!("smartcard: IRP has no Complete callback");
         }
-        freerdp_sys::smartcard_operation_free(&mut operation, 0);
+        freerdp_sys::smartcard_operation_free(operation.as_mut_ptr(), 0);
     }
 
     outstanding.complete(completion_id);
