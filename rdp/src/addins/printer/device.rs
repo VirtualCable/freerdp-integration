@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use freerdp_sys::{CHANNEL_RC_OK, DEVICE, IRP, UINT};
+use freerdp_sys::{CHANNEL_RC_OK, DEVICE, IRP, UINT, UINT16, wStream};
 
 use crate::integrations::PrinterIntegration;
 use crate::utils::log;
@@ -81,6 +81,23 @@ pub(crate) unsafe extern "C" fn init_handler(_device: *mut DEVICE) -> UINT {
     CHANNEL_RC_OK
 }
 
+/// Printer cache and XPS notices from the server (MS-RDPEPC). Nothing is cached,
+/// but they must be accepted: rdpdr treats an error here as a broken channel
+/// and drops the whole session.
+pub(crate) unsafe extern "C" fn custom_component_handler(
+    _device: *mut DEVICE,
+    component: UINT16,
+    packet_id: UINT16,
+    _stream: *mut wStream,
+) -> UINT {
+    log::debug!(
+        "printer: ignoring component message component=0x{:04X} packet=0x{:04X}",
+        component,
+        packet_id
+    );
+    CHANNEL_RC_OK
+}
+
 pub(crate) unsafe extern "C" fn free_handler(device: *mut DEVICE) -> UINT {
     if device.is_null() {
         return CHANNEL_RC_OK;
@@ -110,4 +127,27 @@ pub(crate) unsafe extern "C" fn free_handler(device: *mut DEVICE) -> UINT {
 
     log::info!("printer: device teardown complete");
     CHANNEL_RC_OK
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn printer_cache_messages_are_accepted() {
+        let cache_data = freerdp_sys::RDPDR_PAKID_PAKID_PRN_CACHE_DATA as UINT16;
+        let using_xps = freerdp_sys::RDPDR_PAKID_PAKID_PRN_USING_XPS as UINT16;
+        let component = freerdp_sys::RDPDR_CTYP_RDPDR_CTYP_PRN as UINT16;
+        for packet_id in [cache_data, using_xps] {
+            let result = unsafe {
+                custom_component_handler(
+                    std::ptr::null_mut(),
+                    component,
+                    packet_id,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(result, CHANNEL_RC_OK);
+        }
+    }
 }
