@@ -16,6 +16,13 @@ use freerdp_sys::{
 use super::Rdp;
 use crate::windows_types::{ExtendedWindowStyle, ShowWindowCmd, WindowStyle};
 
+/// Hard cap on the RAIL icon cache entry count. Keys are host-chosen
+/// (cacheId, cacheEntry); without a table-level bound a malicious host grows
+/// the cache without limit (memory DoS). Icons are re-fetchable, so evicting
+/// an arbitrary entry on overflow is safe. Per-entry bytes are already bounded
+/// by the w/h <= 256 check (~256 KiB max each).
+const MAX_ICON_CACHE_ENTRIES: usize = 1024;
+
 fn get_rail_string(rail_str: &freerdp_sys::RAIL_UNICODE_STRING) -> String {
     if rail_str.string.is_null() || rail_str.length == 0 {
         return String::new();
@@ -344,8 +351,18 @@ impl WindowCallbacks for Rdp {
             }
         }
 
-        // Save in cache
+        // Save in cache, bounded: host-chosen (cacheId, cacheEntry) keys with
+        // no table-level cap let a malicious host grow the cache without limit
+        // (memory DoS). Cap the entry count; on overflow evict an arbitrary
+        // entry (icons are re-fetchable via WindowCachedIcon). Per-entry size
+        // is already bounded by the w/h <= 256 check above.
         if let Ok(mut cache) = self.icon_cache.write() {
+            if cache.len() >= MAX_ICON_CACHE_ENTRIES
+                && !cache.contains_key(&(cache_id, cache_entry))
+                && let Some(&evict_key) = cache.keys().next()
+            {
+                cache.remove(&evict_key);
+            }
             cache.insert((cache_id, cache_entry), (rgba.clone(), w, h));
         }
 
@@ -422,5 +439,85 @@ mod tests {
     #[test]
     fn minimized_is_offscreen() {
         assert!(is_offscreen_pos(-32000, -32000));
+    }
+}
+
+#[cfg(test)]
+mod icon_cache_tests {
+    //! RAIL icon-cache bound (Fix T): host-chosen (cacheId, cacheEntry) keys
+    //! must not grow the cache without limit (memory DoS). The cache is capped
+    //! at MAX_ICON_CACHE_ENTRIES; overflow evicts an entry (icons are
+    //! re-fetchable).
+    use super::*;
+    use crate::settings::{RailBehavior, RailSettings};
+    use freerdp_sys::ICON_INFO;
+
+    fn make_rdp() -> crate::Rdp {
+        let mut settings = crate::settings::RdpSettings::default();
+        settings.rail = Some(RailSettings {
+            behavior: RailBehavior::IndividualWindows,
+            ..Default::default()
+        });
+        let integrations = crate::integrations::RdpIntegrations {
+            audio_output: None,
+            audio_input: None,
+            webcam: None,
+            clipboard: None,
+            smartcard: None,
+            printer: None,
+        };
+        let (update_tx, _rx) = flume::unbounded();
+        let (rdp, _cmd) = crate::Rdp::new(settings, update_tx, true, None, integrations);
+        rdp
+    }
+
+    /// Drive on_window_icon with a 1x1 32-bpp icon at the given cache key.
+    fn send_icon(rdp: &crate::Rdp, cache_id: u32, cache_entry: u32) {
+        let mut color = vec![0u8; 4]; // 1x1 BGRA
+        let mut info = ICON_INFO {
+            cacheEntry: cache_entry,
+            cacheId: cache_id,
+            bpp: 32,
+            width: 1,
+            height: 1,
+            cbColorTable: 0,
+            cbBitsMask: 0,
+            cbBitsColor: 4,
+            bitsMask: std::ptr::null_mut(),
+            colorTable: std::ptr::null_mut(),
+            bitsColor: color.as_mut_ptr(),
+        };
+        let mut order = WINDOW_ICON_ORDER {
+            iconInfo: &mut info,
+        };
+        let oi = WINDOW_ORDER_INFO {
+            windowId: 1,
+            fieldFlags: 0,
+            notifyIconId: 0,
+        };
+        let _ = rdp.on_window_icon(&oi, &order);
+    }
+
+    #[test]
+    fn icon_cache_is_bounded_under_host_key_flood() {
+        let rdp = make_rdp();
+        // Flood with distinct host-chosen keys well beyond the cap.
+        for i in 0..(MAX_ICON_CACHE_ENTRIES as u32 + 512) {
+            send_icon(&rdp, 0, i);
+        }
+        let len = rdp.icon_cache.read().unwrap().len();
+        assert!(
+            len <= MAX_ICON_CACHE_ENTRIES,
+            "icon cache must be bounded: len={len} > cap={MAX_ICON_CACHE_ENTRIES}"
+        );
+    }
+
+    #[test]
+    fn icon_cache_reuses_key_without_growth() {
+        let rdp = make_rdp();
+        for _ in 0..100 {
+            send_icon(&rdp, 7, 42);
+        }
+        assert_eq!(rdp.icon_cache.read().unwrap().len(), 1);
     }
 }
