@@ -948,4 +948,475 @@ mod tests {
         let result = handle.join();
         assert!(result.is_ok());
     }
+
+    // ── Characterization: detached status-thread IRP contract ────────────
+    //
+    // These pin the CURRENT observable behavior of the GET_STATUS_CHANGE
+    // detached path (run_detached -> execute_request) as the host/consumer
+    // sees it: the IRP is Completed exactly once with the backend's return
+    // code, the output stream is a valid packed response, and the tracker
+    // entry is removed. Test-only: the lifetime fix (Fix C) must preserve
+    // all of this while adding quiesce-on-teardown.
+
+    use crate::integrations::smartcard::{ReaderStateIn, ReaderStateOut, ScardContext};
+    use std::sync::Condvar;
+
+    /// Per-IRP completion sink, recovered from the IRP's `device` pointer
+    /// (a leaked Box<IrpSink>) so Complete/Discard calls from any thread
+    /// land in the right test. No globals.
+    struct IrpSink {
+        completed: Mutex<Vec<u32>>, // completion ids
+        discarded: Mutex<Vec<u32>>,
+    }
+
+    unsafe extern "C" fn fake_complete(irp: *mut IRP) -> UINT {
+        let sink = unsafe { &*((*irp).device as *const IrpSink) };
+        sink.completed
+            .lock()
+            .unwrap()
+            .push(unsafe { (*irp).CompletionId });
+        CHANNEL_RC_OK
+    }
+
+    unsafe extern "C" fn fake_discard(irp: *mut IRP) -> UINT {
+        let sink = unsafe { &*((*irp).device as *const IrpSink) };
+        sink.discarded
+            .lock()
+            .unwrap()
+            .push(unsafe { (*irp).CompletionId });
+        CHANNEL_RC_OK
+    }
+
+    /// A fake IRP with a real output stream (begin/end_response write into
+    /// it) and Complete/Discard that record into the sink. The operation is
+    /// built by the caller; `input` is unused by execute_request.
+    struct FakeIrp {
+        irp: *mut IRP,
+        sink: *mut IrpSink,
+        output: *mut freerdp_sys::wStream,
+    }
+
+    impl FakeIrp {
+        fn new(completion_id: u32) -> Self {
+            let sink = Box::into_raw(Box::new(IrpSink {
+                completed: Mutex::new(Vec::new()),
+                discarded: Mutex::new(Vec::new()),
+            }));
+            let output = unsafe { freerdp_sys::Stream_New(std::ptr::null_mut(), 4096) };
+            assert!(!output.is_null());
+            let irp = Box::into_raw(Box::new(unsafe { std::mem::zeroed::<IRP>() }));
+            unsafe {
+                (*irp).CompletionId = completion_id;
+                (*irp).device = sink as *mut DEVICE;
+                (*irp).output = output;
+                (*irp).Complete = Some(fake_complete);
+                (*irp).Discard = Some(fake_discard);
+            }
+            Self { irp, sink, output }
+        }
+        fn completed(&self) -> Vec<u32> {
+            unsafe { (*self.sink).completed.lock().unwrap().clone() }
+        }
+        fn discarded(&self) -> Vec<u32> {
+            unsafe { (*self.sink).discarded.lock().unwrap().clone() }
+        }
+    }
+
+    impl Drop for FakeIrp {
+        fn drop(&mut self) {
+            unsafe {
+                freerdp_sys::Stream_Free(self.output, 1);
+                let _ = Box::from_raw(self.irp);
+                let _ = Box::from_raw(self.sink);
+            }
+        }
+    }
+
+    /// Build a GET_STATUS_CHANGE Request with a valid context registered
+    /// and one reader state (the host always sends >= 1; a zero-reader
+    /// response is too small for end_response's NDR header arithmetic).
+    /// The returned Request keeps the reader-state allocation alive via
+    /// `ReaderStateGuard` — drop it only AFTER execute_request completes.
+    struct ReaderStateGuard {
+        states: *mut freerdp_sys::SCARD_READERSTATEA,
+        name: *mut std::ffi::c_char,
+    }
+    impl Drop for ReaderStateGuard {
+        fn drop(&mut self) {
+            unsafe {
+                // execute_request already freed these via
+                // smartcard_operation_free; nothing to do. Kept as a
+                // marker type for clarity.
+            }
+        }
+    }
+
+    fn status_request(
+        fake: &FakeIrp,
+        contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
+        completion_id: u32,
+        timeout_ms: u32,
+    ) -> Request {
+        let ctx = ScardContext::new();
+        contexts
+            .lock()
+            .unwrap()
+            .insert(ctx.raw(), ContextEntry { context: ctx });
+        let mut operation: freerdp_sys::SMARTCARD_OPERATION = unsafe { std::mem::zeroed() };
+        operation.ioControlCode = SCARD_IOCTL_GETSTATUSCHANGEA;
+        operation.completionID = completion_id;
+        operation.hContext = ctx.raw() as usize;
+        operation.outputBufferLength = 4096;
+        // One reader state, allocated like the upstream decoder does
+        // (strdup'd name + calloc'd array): smartcard_operation_free will
+        // free both after the response is packed.
+        unsafe {
+            let name = freerdp_sys::_strdup(c"TestReader".as_ptr());
+            let states = freerdp_sys::calloc(
+                1,
+                std::mem::size_of::<freerdp_sys::SCARD_READERSTATEA>() as u64,
+            ) as *mut freerdp_sys::SCARD_READERSTATEA;
+            (*states).szReader = name;
+            (*states).dwCurrentState = 0;
+            operation.call.getStatusChangeA.dwTimeOut = timeout_ms;
+            operation.call.getStatusChangeA.cReaders = 1;
+            operation.call.getStatusChangeA.rgReaderStates = states;
+        }
+        Request {
+            irp: fake.irp,
+            operation,
+        }
+    }
+
+    #[test]
+    fn execute_request_completes_status_irp_once_with_backend_code() {
+        let integration: Arc<dyn SmartcardIntegration> = Arc::new(DummySmartcardHandle::new());
+        let contexts = Arc::new(Mutex::new(HashMap::<u64, ContextEntry>::new()));
+        let outstanding = Arc::new(OutstandingIrpTracker::new());
+        let fake = FakeIrp::new(100);
+        let request = status_request(&fake, &contexts, 100, 0);
+
+        let rc = unsafe { execute_request(request, &integration, &contexts, &outstanding) };
+        assert_eq!(rc, SCARD_S_SUCCESS);
+        assert_eq!(fake.completed(), vec![100]);
+        assert!(fake.discarded().is_empty());
+        // tracker entry removed
+        assert!(outstanding.irps.lock().unwrap().is_empty());
+        // output stream sealed with a non-trivial packed response
+        let len = unsafe { (*fake.output).length };
+        assert!(len > 24, "packed response must exceed the 24-byte header");
+    }
+
+    #[test]
+    fn run_detached_completes_status_irp_on_its_own_thread() {
+        let integration: Arc<dyn SmartcardIntegration> = Arc::new(DummySmartcardHandle::new());
+        let contexts = Arc::new(Mutex::new(HashMap::<u64, ContextEntry>::new()));
+        let outstanding = Arc::new(OutstandingIrpTracker::new());
+        let fake = FakeIrp::new(200);
+        let request = status_request(&fake, &contexts, 200, 0);
+
+        unsafe { run_detached(request, &integration, &contexts, &outstanding) };
+        // The detached thread completes the IRP; wait for it (bounded).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fake.completed().is_empty() {
+            assert!(Instant::now() < deadline, "detached thread never completed");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(fake.completed(), vec![200]);
+        assert!(outstanding.wait_idle(Duration::from_secs(2)));
+    }
+
+    // NOTE: error paths of handle_get_status_change (invalid context or
+    // backend Err) leave the response body empty, which underflows
+    // end_response's NDR header arithmetic in debug builds. That is a
+    // separate pre-existing defect, out of scope for Fix C; no
+    // characterization test pins it here.
+
+    // ── Lifetime guarantee (Fix C: status threads quiesced on teardown) ──
+    //
+    // NEW safety contract: free_handler must not return while a detached
+    // status thread can still Complete(irp) — upstream frees the IRP/stream
+    // /devman right after Free. Deterministic and memory-safe: the backend
+    // get_status_change parks on a condvar; the fake IRP's Complete records
+    // into a sink that outlives the device.
+    //
+    // Against UNFIXED code this FAILS (free_handler returns after the 2 s
+    // wait_idle while the status thread is still parked, then the released
+    // thread Completes a torn-down IRP); against the fix it PASSES.
+
+    /// Integration whose get_status_change blocks until released, counting
+    /// how many waits are in flight. All other methods delegate to a dummy.
+    #[derive(Debug)]
+    struct BlockingStatusIntegration {
+        dummy: DummySmartcardHandle,
+        entered: Arc<(Mutex<bool>, Condvar)>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        inflight: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl SmartcardIntegration for BlockingStatusIntegration {
+        fn establish_context(&self, scope: u32) -> Result<ScardContext, u32> {
+            self.dummy.establish_context(scope)
+        }
+        fn release_context(&self, ctx: &ScardContext) -> Result<(), u32> {
+            self.dummy.release_context(ctx)
+        }
+        fn is_valid_context(&self, ctx: &ScardContext) -> bool {
+            self.dummy.is_valid_context(ctx)
+        }
+        fn list_readers(
+            &self,
+            ctx: &ScardContext,
+            groups: Option<&[String]>,
+        ) -> Result<Vec<String>, u32> {
+            self.dummy.list_readers(ctx, groups)
+        }
+        fn connect(
+            &self,
+            ctx: &ScardContext,
+            reader: &str,
+            share_mode: u32,
+            preferred_protocols: u32,
+        ) -> Result<crate::integrations::smartcard::ConnectResult, u32> {
+            self.dummy
+                .connect(ctx, reader, share_mode, preferred_protocols)
+        }
+        fn disconnect(
+            &self,
+            handle: &crate::integrations::smartcard::ScardHandle,
+            disposition: u32,
+        ) -> Result<(), u32> {
+            self.dummy.disconnect(handle, disposition)
+        }
+        fn reconnect(
+            &self,
+            handle: &crate::integrations::smartcard::ScardHandle,
+            share_mode: u32,
+            preferred_protocols: u32,
+            initialization: u32,
+        ) -> Result<u32, u32> {
+            self.dummy
+                .reconnect(handle, share_mode, preferred_protocols, initialization)
+        }
+        fn transmit(
+            &self,
+            handle: &crate::integrations::smartcard::ScardHandle,
+            send_pci: &crate::integrations::smartcard::ScardIORequest,
+            data: &[u8],
+        ) -> Result<crate::integrations::smartcard::TransmitResult, u32> {
+            self.dummy.transmit(handle, send_pci, data)
+        }
+        fn control(
+            &self,
+            handle: &crate::integrations::smartcard::ScardHandle,
+            control_code: u32,
+            in_data: &[u8],
+        ) -> Result<Vec<u8>, u32> {
+            self.dummy.control(handle, control_code, in_data)
+        }
+        fn status(
+            &self,
+            handle: &crate::integrations::smartcard::ScardHandle,
+        ) -> Result<crate::integrations::smartcard::ScardStatus, u32> {
+            self.dummy.status(handle)
+        }
+        fn get_status_change(
+            &self,
+            _ctx: &ScardContext,
+            _timeout: Duration,
+            _reader_states: &[ReaderStateIn],
+        ) -> Result<(Vec<ReaderStateOut>, u32), u32> {
+            self.inflight.fetch_add(1, Ordering::SeqCst);
+            let (lock, cvar) = &*self.entered;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+            let (rlock, rcvar) = &*self.release;
+            let mut released = rlock.lock().unwrap();
+            while !*released {
+                released = rcvar.wait(released).unwrap();
+            }
+            self.inflight.fetch_sub(1, Ordering::SeqCst);
+            // Return one reader state so the packed response body is large
+            // enough for end_response's NDR header arithmetic (a zero-reader
+            // body underflows it — separate pre-existing defect).
+            Ok((
+                vec![ReaderStateOut {
+                    reader_name: "TestReader".to_string(),
+                    current_state: 0,
+                    event_state: 0,
+                    atr: Vec::new(),
+                }],
+                SCARD_S_SUCCESS,
+            ))
+        }
+        fn begin_transaction(
+            &self,
+            handle: &crate::integrations::smartcard::ScardHandle,
+        ) -> Result<(), u32> {
+            self.dummy.begin_transaction(handle)
+        }
+        fn end_transaction(
+            &self,
+            handle: &crate::integrations::smartcard::ScardHandle,
+            disposition: u32,
+        ) -> Result<(), u32> {
+            self.dummy.end_transaction(handle, disposition)
+        }
+        fn get_attrib(
+            &self,
+            handle: &crate::integrations::smartcard::ScardHandle,
+            attr_id: u32,
+        ) -> Result<Vec<u8>, u32> {
+            self.dummy.get_attrib(handle, attr_id)
+        }
+        fn set_attrib(
+            &self,
+            handle: &crate::integrations::smartcard::ScardHandle,
+            attr_id: u32,
+            data: &[u8],
+        ) -> Result<(), u32> {
+            self.dummy.set_attrib(handle, attr_id, data)
+        }
+        fn get_container_info(
+            &self,
+            ctx: &ScardContext,
+            container_index: u8,
+        ) -> Result<Vec<u8>, u32> {
+            self.dummy.get_container_info(ctx, container_index)
+        }
+        fn get_certificate(&self, ctx: &ScardContext) -> Result<Vec<u8>, u32> {
+            self.dummy.get_certificate(ctx)
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    /// Build a SmartcardDevice exactly like device_service_entry does, with
+    /// the given integration. Returns the raw DEVICE pointer (owned by the
+    /// caller; free_handler consumes it).
+    fn make_device(integration: Arc<dyn SmartcardIntegration>) -> *mut DEVICE {
+        let (irp_tx, irp_rx) = flume::unbounded::<IrpWork>();
+        let contexts = Arc::new(Mutex::new(HashMap::<u64, ContextEntry>::new()));
+        let outstanding = Arc::new(OutstandingIrpTracker::new());
+        let integration_clone = integration.clone();
+        let contexts_clone = contexts.clone();
+        let outstanding_clone = outstanding.clone();
+        let device_thread = std::thread::Builder::new()
+            .name("smartcard-device-test".into())
+            .spawn(move || {
+                device_thread_main(irp_rx, integration_clone, contexts_clone, outstanding_clone);
+            })
+            .unwrap();
+        let mut device_box = Box::new(SmartcardDevice {
+            device: unsafe { std::mem::zeroed() },
+            integration,
+            contexts,
+            irp_tx,
+            device_thread: Some(device_thread),
+            outstanding,
+        });
+        device_box.device.type_ = crate::addins::smartcard::consts::RDPDR_DTYP_SMARTCARD;
+        device_box.device.IRPRequest = Some(irp_request_handler);
+        device_box.device.Free = Some(free_handler);
+        device_box.device.Init = Some(init_handler);
+        Box::into_raw(device_box) as *mut DEVICE
+    }
+
+    #[test]
+    fn free_handler_quiesces_detached_status_thread_before_returning() {
+        let entered = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let inflight = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let integration = Arc::new(BlockingStatusIntegration {
+            dummy: DummySmartcardHandle::new(),
+            entered: entered.clone(),
+            release: release.clone(),
+            inflight: inflight.clone(),
+        });
+        let device = make_device(integration.clone());
+
+        // Register a context and send a GET_STATUS_CHANGE IRP through the
+        // real device thread (irp_request_handler -> decode -> run_detached).
+        // We build the IRP with a real encoded input PDU is complex; instead
+        // drive run_detached directly via the device's own structures by
+        // sending a Process work item with a fake IRP whose input decodes.
+        // Simpler: call run_detached through the device thread by injecting
+        // a Request — but IrpWork only carries raw IRPs. So we exercise the
+        // detached path directly with the device's outstanding tracker.
+        let scard = unsafe { &*(device as *mut SmartcardDevice) };
+        let fake = FakeIrp::new(500);
+        let request = status_request(&fake, &scard.contexts, 500, 0xFFFF_FFFF);
+        unsafe {
+            run_detached(
+                request,
+                &scard.integration,
+                &scard.contexts,
+                &scard.outstanding,
+            )
+        };
+
+        // Wait until the status thread is parked inside get_status_change.
+        let (lock, cvar) = &*entered;
+        let mut entered_guard = lock.lock().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !*entered_guard {
+            let now = Instant::now();
+            assert!(
+                now < deadline,
+                "status thread never entered get_status_change"
+            );
+            let (g, _) = cvar.wait_timeout(entered_guard, deadline - now).unwrap();
+            entered_guard = g;
+        }
+        drop(entered_guard);
+        assert_eq!(inflight.load(Ordering::SeqCst), 1);
+
+        // free_handler on another thread: it must NOT return while the
+        // status thread can still Complete the IRP.
+        let dev_addr = device as usize;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rc = unsafe { free_handler(dev_addr as *mut DEVICE) };
+            let _ = done_tx.send(rc);
+        });
+
+        // Pre-fix: free_handler returns after ~2 s (wait_idle timeout) with
+        // the status thread still parked. Give it up to 3 s to (incorrectly)
+        // return early. Post-fix it blocks until the thread is quiesced.
+        let early_return = done_rx.recv_timeout(Duration::from_secs(3)).is_ok();
+
+        // Release the backend wait; the status thread now tries to Complete.
+        let (rlock, rcvar) = &*release;
+        *rlock.lock().unwrap() = true;
+        rcvar.notify_all();
+
+        let rc = if early_return {
+            CHANNEL_RC_OK
+        } else {
+            done_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("free_handler never returned after release")
+        };
+
+        // Let the released status thread finish before asserting.
+        let settle = Instant::now() + Duration::from_secs(2);
+        while inflight.load(Ordering::SeqCst) > 0 && Instant::now() < settle {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(
+            !early_return,
+            "free_handler returned while a detached status thread could still \
+             Complete the IRP — use-after-free on torn-down upstream state"
+        );
+        assert_eq!(rc, CHANNEL_RC_OK);
+        assert_eq!(inflight.load(Ordering::SeqCst), 0);
+        // Post-fix: the IRP must NOT be Completed after teardown. Pre-fix
+        // the released thread Completes it (recorded in the sink).
+        assert!(
+            fake.completed().is_empty(),
+            "IRP Completed after free_handler returned = use-after-free"
+        );
+    }
 }
