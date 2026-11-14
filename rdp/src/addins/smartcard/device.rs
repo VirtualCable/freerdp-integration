@@ -15,8 +15,8 @@ use freerdp_sys::{CHANNEL_RC_OK, DEVICE, IRP, UINT};
 
 use crate::integrations::SmartcardIntegration;
 use crate::integrations::smartcard::{
-    IRP_MJ_DEVICE_CONTROL, SCARD_E_CANCELLED, SCARD_S_SUCCESS, STATUS_BUFFER_TOO_SMALL,
-    STATUS_NOT_SUPPORTED, STATUS_UNSUCCESSFUL, ScardContext,
+    IRP_MJ_DEVICE_CONTROL, SCARD_E_CANCELLED, SCARD_E_NOT_READY, SCARD_S_SUCCESS,
+    STATUS_BUFFER_TOO_SMALL, STATUS_NOT_SUPPORTED, STATUS_UNSUCCESSFUL, ScardContext,
 };
 use crate::utils::log;
 
@@ -38,6 +38,14 @@ pub(crate) enum IrpWork {
 }
 
 unsafe impl Send for IrpWork {}
+
+/// Per-device IRP queue depth bound (printer-class sibling). The host can
+/// stream IRPs at wire rate against a slow pcsc backend; an unbounded queue
+/// lets a malicious pooled host grow per-session IRP/PDU retention without
+/// limit (the IRP's retained input stream is only released at Complete). A
+/// bounded queue turns that into real backpressure: when full, the IRP is
+/// completed synchronously with SCARD_E_NOT_READY instead of being queued.
+pub(crate) const SCARD_IRP_QUEUE_DEPTH: usize = 256;
 
 /// Tracks outstanding IRPs for cancellation and cleanup
 pub(crate) struct OutstandingIrpTracker {
@@ -990,18 +998,53 @@ pub(crate) unsafe extern "C" fn irp_request_handler(device: *mut DEVICE, irp: *m
 
     let scard = unsafe { &*(device as *const SmartcardDevice) };
 
-    if let Err(e) = scard.irp_tx.send(IrpWork::Process(irp)) {
-        log::error!("smartcard: failed to enqueue IRP: {}", e);
-        unsafe {
-            let irp_ref = &mut *irp;
-            irp_ref.IoStatus = STATUS_UNSUCCESSFUL as i32;
-            if let Some(complete_fn) = irp_ref.Complete {
-                complete_fn(irp);
+    // Bounded queue with real backpressure (printer-class sibling): an
+    // unbounded send can never be Full, so a malicious pooled host could
+    // stream IRPs at wire rate against a slow pcsc backend and grow
+    // per-session IRP/PDU retention without limit. On overflow, complete the
+    // IRP synchronously with a packed scard error (the caller is the rdpdr
+    // plugin thread that would run completion anyway); returning non-OK alone
+    // would leak the IRP on 3.26.
+    match scard.irp_tx.try_send(IrpWork::Process(irp)) {
+        Ok(()) => {}
+        Err(flume::TrySendError::Full(_)) => {
+            log::warn!("smartcard: IRP queue full, rejecting with SCARD_E_NOT_READY");
+            unsafe { complete_irp_with_error(irp, SCARD_E_NOT_READY) };
+        }
+        Err(flume::TrySendError::Disconnected(_)) => {
+            log::error!("smartcard: failed to enqueue IRP (channel disconnected)");
+            unsafe {
+                let irp_ref = &mut *irp;
+                irp_ref.IoStatus = STATUS_UNSUCCESSFUL as i32;
+                if let Some(complete_fn) = irp_ref.Complete {
+                    complete_fn(irp);
+                }
             }
         }
     }
 
     CHANNEL_RC_OK
+}
+
+/// Complete an IRP synchronously with a packed scard error body, mirroring the
+/// decode-failure path. Used for queue-overflow backpressure so the host sees
+/// a legitimate failure and upstream releases the retained input stream.
+unsafe fn complete_irp_with_error(irp: *mut IRP, scard_error: u32) {
+    unsafe {
+        let irp_ref = &mut *irp;
+        irp_ref.IoStatus = STATUS_UNSUCCESSFUL as i32;
+        if !irp_ref.output.is_null() {
+            freerdp_sys::Stream_SetPosition(irp_ref.output, 16);
+            stream_write_u32(irp_ref.output, 0);
+            freerdp_sys::smartcard_pack_common_type_header(irp_ref.output);
+            freerdp_sys::smartcard_pack_private_type_header(irp_ref.output, 0);
+            stream_write_u32(irp_ref.output, scard_error);
+            freerdp_sys::Stream_SealLength(irp_ref.output);
+        }
+        if let Some(complete_fn) = irp_ref.Complete {
+            complete_fn(irp);
+        }
+    }
 }
 
 // (re-exports handled via pub(crate) on the functions above)
@@ -1496,7 +1539,14 @@ mod tests {
     /// the given integration. Returns the raw DEVICE pointer (owned by the
     /// caller; free_handler consumes it).
     fn make_device(integration: Arc<dyn SmartcardIntegration>) -> *mut DEVICE {
-        let (irp_tx, irp_rx) = flume::unbounded::<IrpWork>();
+        make_device_bounded(integration, SCARD_IRP_QUEUE_DEPTH)
+    }
+
+    fn make_device_bounded(
+        integration: Arc<dyn SmartcardIntegration>,
+        depth: usize,
+    ) -> *mut DEVICE {
+        let (irp_tx, irp_rx) = flume::bounded::<IrpWork>(depth);
         let contexts = Arc::new(Mutex::new(HashMap::<u64, ContextEntry>::new()));
         let outstanding = Arc::new(OutstandingIrpTracker::new());
         let liveness = DeviceLiveness::new();
@@ -1633,5 +1683,119 @@ mod tests {
             fake.completed().is_empty(),
             "IRP Completed after free_handler returned = use-after-free"
         );
+    }
+    // ── IRP-queue backpressure (Fix O) ───────────────────────────────────
+
+    // IRP-queue backpressure guarantee (Fix O, printer-class sibling): the
+    // per-device queue is bounded; when full, irp_request_handler completes
+    // the IRP synchronously with a packed scard error (real backpressure)
+    // instead of growing an unbounded queue.
+    /// Build a device whose worker thread is NOT draining (we never send it
+    /// work and it blocks on recv), so the bounded channel can be filled
+    /// deterministically.
+    fn make_idle_device(depth: usize) -> (*mut DEVICE, flume::Receiver<IrpWork>) {
+        // No worker thread: the bounded channel is never drained, so filler
+        // IRPs (which have no decodable input) are never processed. The
+        // returned Receiver MUST be kept alive by the caller: dropping it
+        // disconnects the channel, which would make send() fail with
+        // Disconnected (a different error path) instead of Full.
+        let (irp_tx, irp_rx) = flume::bounded::<IrpWork>(depth);
+        let contexts = Arc::new(Mutex::new(HashMap::<u64, ContextEntry>::new()));
+        let outstanding = Arc::new(OutstandingIrpTracker::new());
+        let liveness = DeviceLiveness::new();
+        let status_threads = StatusThreads::new();
+        let integration: Arc<dyn SmartcardIntegration> = Arc::new(DummySmartcardHandle::new());
+        let mut device_box = Box::new(SmartcardDevice {
+            device: unsafe { std::mem::zeroed() },
+            integration,
+            contexts,
+            irp_tx,
+            device_thread: None,
+            outstanding,
+            liveness,
+            status_threads,
+        });
+        device_box.device.type_ = crate::addins::smartcard::consts::RDPDR_DTYP_SMARTCARD;
+        device_box.device.IRPRequest = Some(irp_request_handler);
+        device_box.device.Free = Some(free_handler);
+        device_box.device.Init = Some(init_handler);
+        (Box::into_raw(device_box) as *mut DEVICE, irp_rx)
+    }
+
+    #[test]
+    fn complete_irp_with_error_packs_and_completes() {
+        let f = FakeIrp::new(7);
+        unsafe { complete_irp_with_error(f.irp, SCARD_E_NOT_READY) };
+        assert_eq!(f.completed(), vec![7]);
+        unsafe {
+            assert_eq!((*f.irp).IoStatus, STATUS_UNSUCCESSFUL as i32);
+            // The packed error body must be non-trivial (header + scard error).
+            assert!((*f.output).length > 16);
+        }
+    }
+
+    #[test]
+    fn full_queue_completes_overflow_irp_inline() {
+        let depth = 4;
+        let (dev, _irp_rx) = make_idle_device(depth);
+        let scard = unsafe { &*(dev as *const SmartcardDevice) };
+
+        // Fill the bounded channel directly (worker is idle, blocked on recv,
+        // but we fill the channel buffer up to capacity without giving the
+        // worker a chance to drain by holding the send side). Use try_send to
+        // occupy all slots with dummy IRP pointers (never decoded because we
+        // complete the overflow before the worker runs them).
+        let mut filler = Vec::new();
+        for i in 0..depth {
+            let f = FakeIrp::new(200 + i as u32);
+            // Occupy a slot; the worker may pick it up, so we keep filling
+            // until try_send reports Full.
+            filler.push(f);
+        }
+        // Force the channel full by sending raw works until Full.
+        let mut sent = 0;
+        loop {
+            let f = FakeIrp::new(300 + sent);
+            match scard.irp_tx.try_send(IrpWork::Process(f.irp)) {
+                Ok(()) => {
+                    sent += 1;
+                    filler.push(f);
+                    if sent > (depth * 4) as u32 {
+                        break; // worker is draining; cannot force full this way
+                    }
+                }
+                Err(flume::TrySendError::Full(_)) => {
+                    filler.push(f);
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+
+        // Now the handler must complete the overflow IRP inline.
+        let overflow = FakeIrp::new(999);
+        unsafe {
+            (*overflow.irp).MajorFunction = IRP_MJ_DEVICE_CONTROL;
+        }
+        let rc = unsafe { irp_request_handler(dev, overflow.irp) };
+        assert_eq!(rc, CHANNEL_RC_OK);
+        // The channel is full (no worker drains it), so the overflow IRP MUST
+        // be completed synchronously with a scard error. With an unbounded
+        // queue this would instead be enqueued and never completed (RED).
+        assert_eq!(
+            overflow.completed(),
+            vec![999],
+            "overflow IRP must be completed synchronously when the queue is full"
+        );
+        unsafe {
+            assert_eq!((*overflow.irp).IoStatus, STATUS_UNSUCCESSFUL as i32);
+        }
+
+        // Drain the queue so free_handler's Shutdown send does not block on a
+        // full channel (there is no worker in this idle device).
+        while _irp_rx.try_recv().is_ok() {}
+        unsafe {
+            let _ = free_handler(dev);
+        }
     }
 }

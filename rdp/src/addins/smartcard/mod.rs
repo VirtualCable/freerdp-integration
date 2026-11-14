@@ -69,7 +69,7 @@ pub unsafe extern "C" fn device_service_entry(
         return CHANNEL_RC_OK;
     }
 
-    let (irp_tx, irp_rx) = flume::unbounded::<IrpWork>();
+    let (irp_tx, irp_rx) = flume::bounded::<IrpWork>(device::SCARD_IRP_QUEUE_DEPTH);
     let contexts = Arc::new(Mutex::new(HashMap::<u64, ContextEntry>::new()));
     let outstanding = Arc::new(OutstandingIrpTracker::new());
     let liveness = DeviceLiveness::new();
