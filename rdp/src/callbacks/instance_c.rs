@@ -148,6 +148,60 @@ extern "C" fn post_connect(instance: *mut freerdp) -> BOOL {
         } else {
             utils::pixel_format(32, 4, 8, 8, 8, 8) // BGRA
         };
+        // Clamp the host-advertised desktop geometry BEFORE gdi_init allocates
+        // the connect-time primary buffer (the host is the resizer:
+        // DesktopResize=TRUE). Out-of-bounds geometry aborts the activation.
+        let context = unsafe { (*instance).context };
+        if !context.is_null() {
+            let settings = unsafe { (*context).settings };
+            if !settings.is_null() {
+                let w = unsafe {
+                    freerdp_sys::freerdp_settings_get_uint32(
+                        settings,
+                        freerdp_sys::FreeRDP_Settings_Keys_UInt32_FreeRDP_DesktopWidth,
+                    )
+                };
+                let h = unsafe {
+                    freerdp_sys::freerdp_settings_get_uint32(
+                        settings,
+                        freerdp_sys::FreeRDP_Settings_Keys_UInt32_FreeRDP_DesktopHeight,
+                    )
+                };
+                match crate::connection::callbacks_impl::update::clamp_desktop_dims(w, h) {
+                    Some((cw, ch)) => {
+                        if cw != w {
+                            unsafe {
+                                freerdp_sys::freerdp_settings_set_uint32(
+                                    settings,
+                                    freerdp_sys::FreeRDP_Settings_Keys_UInt32_FreeRDP_DesktopWidth,
+                                    cw,
+                                )
+                            };
+                        }
+                        if ch != h {
+                            unsafe {
+                                freerdp_sys::freerdp_settings_set_uint32(
+                                    settings,
+                                    freerdp_sys::FreeRDP_Settings_Keys_UInt32_FreeRDP_DesktopHeight,
+                                    ch,
+                                )
+                            };
+                        }
+                    }
+                    None => {
+                        log::error!(
+                            " **** PostConnect aborted: host desktop geometry {}x{} \
+                             exceeds the {}x{} bound",
+                            w,
+                            h,
+                            crate::connection::callbacks_impl::update::MAX_DESKTOP_DIM,
+                            crate::connection::callbacks_impl::update::MAX_DESKTOP_DIM
+                        );
+                        return false.into();
+                    }
+                }
+            }
+        }
         unsafe { gdi_init(instance, pixel_format) };
         let context = unsafe { (*instance).context };
         // Setup our callbacks

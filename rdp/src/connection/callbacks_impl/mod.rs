@@ -6,7 +6,7 @@
 mod channels;
 mod graphics; // implements graphics callbacks
 mod instance; // implements instance callbacks
-mod update; // implements update callbacks // implements channel callbacks
+pub(crate) mod update; // implements update callbacks // implements channel callbacks
 
 // Clipboard is set on channel connection. Callbacks will be registered then
 // and will invoke us
