@@ -96,7 +96,11 @@ pub unsafe extern "C" fn on_control_data(
     }
 
     let s = unsafe { &*stream };
-    let bytes = unsafe { std::slice::from_raw_parts(s.pointer, s.length) };
+    // Expose only the remaining span [pointer, buffer+length): the DVC data
+    // path advances s.pointer past the header while s.length stays the full
+    // sealed length; slicing the whole length would over-read past the end.
+    let remaining = unsafe { freerdp_sys::Stream_GetRemainingLength(stream) };
+    let bytes = unsafe { std::slice::from_raw_parts(s.pointer, remaining) };
 
     if bytes.len() < 2 {
         log::error!("Webcam Control PDU too short: {}", bytes.len());

@@ -73,7 +73,12 @@ pub unsafe extern "C" fn on_data(
     }
 
     let s = unsafe { &*stream };
-    let bytes = unsafe { std::slice::from_raw_parts(s.pointer, s.length) };
+    // The non-fragmented DVC data path leaves s.pointer advanced past the Cmd
+    // byte + ChannelId while s.length is still the FULL sealed totalLength.
+    // Expose only the remaining span [pointer, buffer+length), not the whole
+    // length (which would over-read pos bytes past the logical end / heap).
+    let remaining = unsafe { freerdp_sys::Stream_GetRemainingLength(stream) };
+    let bytes = unsafe { std::slice::from_raw_parts(s.pointer, remaining) };
 
     let Ok((_version, msg_id, payload)) = parse_pdu_header(bytes) else {
         log::error!("Webcam: failed to parse PDU header!");
@@ -1252,5 +1257,69 @@ mod tests {
             vec![header(SUCCESS)],
             "a frame sent after close must never be written"
         );
+    }
+    // ── Regression (Fix L): DVC slice must use remaining span ────────────
+
+    /// Drive on_data with a wStream whose pointer is advanced `pos` bytes past
+    /// buffer, length = full buffer length (the upstream non-fragmented DVC
+    /// invariant). The buffer is exactly `data.len()` bytes (capacity==length),
+    /// so any over-read past the end is past the heap allocation.
+    fn send_advanced(h: &Harness, data: &[u8], pos: usize) -> freerdp_sys::UINT {
+        let mut stream = freerdp_sys::wStream {
+            buffer: data.as_ptr() as *mut _,
+            pointer: unsafe { data.as_ptr().add(pos) } as *mut _,
+            length: data.len(),
+            capacity: data.len(),
+            count: 1,
+            pool: std::ptr::null_mut(),
+            isAllocatedStream: 0,
+            isOwner: 0,
+        };
+        unsafe { on_data(h.ctx as *mut _, &mut stream) }
+    }
+
+    #[test]
+    fn advanced_pointer_uses_remaining_not_full_length() {
+        let mock = MockWebcam::new(false, (640, 480), (640, 480), 15);
+        let mut h = Harness::new(mock.clone());
+        // 2-byte DVC prefix + a StartStreams PDU one byte short of a valid
+        // media type (missing flags): header(2)+idx(1)+25 media = 28 bytes.
+        // Buffer = 30, pointer advanced 2, length = 30, capacity = 30.
+        //   remaining = 28 -> payload = 26 -> media = 25 < 26 -> ERROR.
+        // Pre-fix sliced full length (30): payload = 28 -> media = 27, reading
+        // the flags byte PAST the heap allocation -> wrongly accepted.
+        let mut data = vec![0xAA, 0xBB];
+        data.extend_from_slice(&[1, START_STREAMS, 0, 1]);
+        data.extend_from_slice(&320u32.to_le_bytes());
+        data.extend_from_slice(&240u32.to_le_bytes());
+        data.extend_from_slice(&15u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        assert_eq!(data.len(), 30);
+        let rc = send_advanced(&h, &data, 2);
+        assert_eq!(rc, freerdp_sys::CHANNEL_RC_OK);
+        assert_eq!(h.written(), vec![header(ERROR)]);
+        assert!(
+            !h.mock.calls().iter().any(|c| c.starts_with("start_stream")),
+            "must not start a stream from an over-read media type"
+        );
+        h.close();
+    }
+
+    #[test]
+    fn advanced_pointer_valid_pdu_still_accepted() {
+        let mock = MockWebcam::new(false, (640, 480), (640, 480), 15);
+        let mut h = Harness::new(mock.clone());
+        let mut data = vec![0xAA, 0xBB];
+        data.extend_from_slice(&start_streams_payload(0, 1, 320, 240, 15, 1));
+        assert_eq!(data.len(), 31);
+        let rc = send_advanced(&h, &data, 2);
+        assert_eq!(rc, freerdp_sys::CHANNEL_RC_OK);
+        assert!(
+            h.mock.calls().iter().any(|c| c.starts_with("start_stream")),
+            "a valid PDU behind an advanced pointer must still be accepted"
+        );
+        h.close();
     }
 }
