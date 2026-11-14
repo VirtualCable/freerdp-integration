@@ -934,9 +934,88 @@ impl Drop for Rdp {
                 freerdp_client_context_free(conn.context);
 
                 self.instance = None;
-                // Destroy the stop event
-                CloseHandle(self.stop_event.as_handle());
             }
+            // Reclaim BOTH events on every path (including unbuilt instances):
+            // SafeHandle has no Drop, so without an explicit CloseHandle the
+            // eventfd + WINPR_EVENT block leak for the process lifetime.
+            // command_event was previously never closed on any path.
+            CloseHandle(self.stop_event.as_handle());
+            CloseHandle(self.command_event.as_handle());
         }
+    }
+}
+
+#[cfg(test)]
+mod drop_tests {
+    //! Event-handle reclaim contract (Fix R): Drop for Rdp must CloseHandle
+    //! BOTH stop_event and command_event on every path (SafeHandle has no
+    //! Drop). command_event was previously never closed -> eventfd + WINPR
+    //! block leak per session. Measured via the process fd count (agnostic to
+    //! winpr's event implementation, which differs between 3.15 and 3.26).
+    use super::*;
+
+    fn make_rdp() -> Rdp {
+        let integrations = crate::integrations::RdpIntegrations {
+            audio_output: None,
+            audio_input: None,
+            webcam: None,
+            clipboard: None,
+            smartcard: None,
+            printer: None,
+        };
+        let (update_tx, _rx) = flume::unbounded();
+        let (rdp, _cmd) = Rdp::new(
+            crate::settings::RdpSettings::default(),
+            update_tx,
+            true,
+            None,
+            integrations,
+        );
+        rdp
+    }
+
+    fn fd_count() -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .map(|d| d.count())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn drop_reclaims_event_fds_no_leak() {
+        // Warm up once (lazy winpr init may allocate persistent fds).
+        drop(make_rdp());
+        let baseline = fd_count();
+        for _ in 0..16 {
+            let rdp = make_rdp();
+            // Touch both handles so they are realized.
+            let _ = rdp.get_stop_event().as_handle();
+            let _ = rdp.get_command_event().as_handle();
+            drop(rdp);
+        }
+        let after = fd_count();
+        // Without the fix, command_event leaks one fd per iteration (16+).
+        // Allow a tiny slack for unrelated runtime fds.
+        assert!(
+            after <= baseline + 2,
+            "event fds leaked: baseline={baseline}, after={after} (command_event not closed on drop)"
+        );
+    }
+
+    #[test]
+    fn drop_closes_events_for_unbuilt_instance() {
+        // An Rdp that was never built (instance = None) must still reclaim its
+        // events (the closes are outside the `if let Some(conn)` guard).
+        drop(make_rdp());
+        let baseline = fd_count();
+        for _ in 0..16 {
+            let rdp = make_rdp();
+            assert!(rdp.instance.is_none());
+            drop(rdp);
+        }
+        let after = fd_count();
+        assert!(
+            after <= baseline + 2,
+            "unbuilt-instance event fds leaked: baseline={baseline}, after={after}"
+        );
     }
 }
