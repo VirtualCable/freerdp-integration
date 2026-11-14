@@ -208,6 +208,7 @@ pub unsafe extern "C" fn on_new_device_channel(
         webcam,
         stream_index: 0,
         rdpcontext,
+        gate: channel::new_writer_gate(),
     });
 
     unsafe {
@@ -353,13 +354,20 @@ mod tests {
         pp_listener: *mut *mut IWTSListener,
     ) -> UINT {
         let fake = unsafe { &*(mgr as *const FakeMgr) };
-        let name = unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned();
-        let cb_fn = unsafe { (*cb).OnNewChannelConnection }.map(|f| f as usize).unwrap_or(0);
+        let name = unsafe { CStr::from_ptr(name) }
+            .to_string_lossy()
+            .into_owned();
+        let cb_fn = unsafe { (*cb).OnNewChannelConnection }
+            .map(|f| f as usize)
+            .unwrap_or(0);
         let listener = Box::into_raw(Box::new(IWTSListener {
             GetConfiguration: None,
             pInterface: std::ptr::null_mut(),
         }));
-        fake.created.lock().unwrap().push((name, listener as usize, cb_fn));
+        fake.created
+            .lock()
+            .unwrap()
+            .push((name, listener as usize, cb_fn));
         unsafe { *pp_listener = listener };
         CHANNEL_RC_OK
     }

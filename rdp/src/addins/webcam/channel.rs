@@ -4,12 +4,54 @@
 // Authors: Adolfo Gómez, dkmaster at dkmon dot com
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::integrations::{WebcamIntegration, WebcamMode};
 use crate::utils::log;
 use freerdp_sys::{CHANNEL_RC_OK, IWTSVirtualChannel, IWTSVirtualChannelCallback, UINT};
 
 use super::pdu::{self, parse_pdu_header, write_to_channel};
+
+/// Lifetime gate for the detached frame-writer thread.
+///
+/// Upstream dvcman frees the `DVCMAN_CHANNEL` immediately after `OnClose`
+/// returns (FreeRDP 3.15 and 3.26), so the writer must be fully quiesced
+/// before `on_close` returns — no in-flight `Write`, no queued frame ever
+/// written afterwards. The gate closes the check-then-use race:
+///
+/// - writer: CAS `busy` false->true, then re-check `alive`; write only if
+///   still alive, and always clear `busy`.
+/// - `on_close`: set `alive=false` FIRST, drain the queue, then wait
+///   (bounded) for `busy` to clear before freeing the context.
+///
+/// A writer that wins the CAS before `alive=false` is observed via `busy`
+/// and waited for; one that wins it after sees `alive=false` and skips the
+/// write. Either way no `Write` can start after `on_close` returns.
+pub(crate) struct WriterGate {
+    alive: AtomicBool,
+    busy: AtomicBool,
+}
+
+impl WriterGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            alive: AtomicBool::new(true),
+            busy: AtomicBool::new(false),
+        })
+    }
+}
+
+/// Fresh gate for a new device channel (used by the listener).
+pub(super) fn new_writer_gate() -> Arc<WriterGate> {
+    WriterGate::new()
+}
+
+/// Hard bound for waiting on an in-flight frame write during close.
+/// `Write` is a short memcpy-to-stream; 5 s is far beyond any legitimate
+/// write and keeps disconnect from stalling indefinitely. If it ever
+/// fires, we log and proceed (the alternative is hanging the instance
+/// thread forever).
+const WRITER_QUIESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[repr(C)]
 pub struct ChannelCtx {
@@ -18,6 +60,7 @@ pub struct ChannelCtx {
     pub webcam: Arc<dyn WebcamIntegration>,
     pub stream_index: u8,
     pub rdpcontext: *mut freerdp_sys::rdpContext,
+    pub(crate) gate: Arc<WriterGate>,
 }
 
 pub unsafe extern "C" fn on_data(
@@ -157,15 +200,36 @@ fn handle_start_streams(ctx: &ChannelCtx, payload: &[u8]) {
     let rx = ctx.webcam.start_stream(width, height, fps);
     ctx.webcam.set_format(format as u32, width, height, fps);
 
+    let gate = ctx.gate.clone();
     std::thread::spawn(move || {
         log::debug!("Webcam: Frame writer thread started for stream {stream_idx}");
         while let Ok(frame) = rx.recv() {
-            log::trace!(
-                "Webcam: Sending sample response of {} bytes, stream_idx={stream_idx}",
-                frame.data.len()
-            );
-            let pdu = pdu::build_sample_response(stream_idx, &frame.data);
-            unsafe { pdu::write_to_channel(frame.channel_ptr as *mut _, &pdu) };
+            // Claim the write slot, then re-check liveness: on_close sets
+            // alive=false before waiting on busy, so a write claimed here
+            // either started before close (and is waited for) or is skipped.
+            if gate
+                .busy
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                // Another write is in flight (single writer: cannot happen);
+                // drop the frame rather than risk a concurrent Write.
+                continue;
+            }
+            if gate.alive.load(Ordering::Acquire) {
+                log::trace!(
+                    "Webcam: Sending sample response of {} bytes, stream_idx={stream_idx}",
+                    frame.data.len()
+                );
+                let pdu = pdu::build_sample_response(stream_idx, &frame.data);
+                unsafe { pdu::write_to_channel(frame.channel_ptr as *mut _, &pdu) };
+            }
+            gate.busy.store(false, Ordering::Release);
+            if !gate.alive.load(Ordering::Acquire) {
+                // Channel closed: stop without touching it again. Remaining
+                // queued frames are drained by on_close / dropped with rx.
+                break;
+            }
         }
         log::debug!("Webcam: Frame writer thread stopped for stream {stream_idx}");
     });
@@ -330,7 +394,29 @@ pub unsafe extern "C" fn on_close(cb: *mut IWTSVirtualChannelCallback) -> UINT {
     log::info!("Webcam Device: Channel closed");
 
     unsafe {
+        // Clone the gate Arc out first: no implicit autoref on the raw
+        // pointer, and the gate stays alive for the whole quiesce wait.
+        let gate = (*ctx).gate.clone();
+        // Stop new writes FIRST: the writer re-checks alive after claiming
+        // busy, so after this store no new Write can start.
+        gate.alive.store(false, Ordering::Release);
         (*ctx).webcam.stop_stream();
+
+        // Wait for any in-flight Write to finish before freeing the ctx
+        // (upstream frees the DVCMAN_CHANNEL right after we return).
+        let deadline = std::time::Instant::now() + WRITER_QUIESCE_TIMEOUT;
+        while gate.busy.load(Ordering::Acquire) {
+            if std::time::Instant::now() >= deadline {
+                log::error!(
+                    "Webcam: writer still busy after {}s quiesce timeout; \
+                     proceeding with close (in-flight Write may race)",
+                    WRITER_QUIESCE_TIMEOUT.as_secs()
+                );
+                break;
+            }
+            std::thread::yield_now();
+        }
+
         let _ = Box::from_raw(ctx);
     }
     CHANNEL_RC_OK
@@ -557,6 +643,7 @@ mod tests {
             webcam,
             stream_index: 0,
             rdpcontext: std::ptr::null_mut(),
+            gate: WriterGate::new(),
         });
         Box::into_raw(ctx)
     }
@@ -725,7 +812,11 @@ mod tests {
         let mut h = Harness::new(mock.clone());
         let p = start_streams_payload(1, FMT_MJPG, 160, 120, 10, 1);
         h.send(&p);
-        assert!(h.mock.calls().contains(&"start_stream:160,120,10".to_string()));
+        assert!(
+            h.mock
+                .calls()
+                .contains(&"start_stream:160,120,10".to_string())
+        );
         h.close();
 
         // denominator 0 -> requested falls back to 15, min(15, configured 30) = 15
@@ -733,7 +824,11 @@ mod tests {
         let mut h2 = Harness::new(mock2.clone());
         let p2 = start_streams_payload(0, FMT_MJPG, 160, 120, 99, 0);
         h2.send(&p2);
-        assert!(h2.mock.calls().contains(&"start_stream:160,120,15".to_string()));
+        assert!(
+            h2.mock
+                .calls()
+                .contains(&"start_stream:160,120,15".to_string())
+        );
         h2.close();
     }
 
@@ -743,7 +838,11 @@ mod tests {
         let mut h = Harness::new(mock.clone());
         h.send(&start_streams_payload(0, FMT_H264, 320, 240, 15, 1));
         assert!(h.mock.calls().contains(&"set_mode:H264".to_string()));
-        assert!(h.mock.calls().contains(&"set_format:1,320,240,15".to_string()));
+        assert!(
+            h.mock
+                .calls()
+                .contains(&"set_format:1,320,240,15".to_string())
+        );
         h.close();
 
         let mock2 = MockWebcam::new(false, (640, 480), (640, 480), 15);
@@ -751,7 +850,11 @@ mod tests {
         h2.send(&start_streams_payload(0, FMT_H264, 320, 240, 15, 1));
         assert!(h2.mock.calls().contains(&"set_mode:MJPEG".to_string()));
         // format stays H264 on the wire contract (only mode falls back)
-        assert!(h2.mock.calls().contains(&"set_format:1,320,240,15".to_string()));
+        assert!(
+            h2.mock
+                .calls()
+                .contains(&"set_format:1,320,240,15".to_string())
+        );
         h2.close();
     }
 
@@ -988,9 +1091,7 @@ mod tests {
         while !*entered {
             let now = std::time::Instant::now();
             assert!(now < deadline, "writer never entered Write");
-            let (g, _) = cvar
-                .wait_timeout(entered, deadline - now)
-                .unwrap();
+            let (g, _) = cvar.wait_timeout(entered, deadline - now).unwrap();
             entered = g;
         }
         drop(entered);
@@ -1102,7 +1203,11 @@ mod tests {
         // failing assert cannot race the harness drop into the allocator.
         settle_writer();
         leak_fake(&mut h);
-        assert_eq!(writes.len(), 2, "queued frames must be drained, not written");
+        assert_eq!(
+            writes.len(),
+            2,
+            "queued frames must be drained, not written"
+        );
         assert_eq!(writes[0], header(SUCCESS));
         assert_eq!(writes[1][..3], [1, SAMPLE_RESP, 0]);
         assert_eq!(writes[1][3], 0u8); // frame 0, the in-flight one
