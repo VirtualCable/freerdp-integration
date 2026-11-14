@@ -335,3 +335,547 @@ pub unsafe extern "C" fn on_close(cb: *mut IWTSVirtualChannelCallback) -> UINT {
     }
     CHANNEL_RC_OK
 }
+
+#[cfg(test)]
+mod tests {
+    //! Characterization tests for the webcam device-channel contract as the
+    //! external consumer (rdphtml5 WebcamHandle) relies on it. They pin the
+    //! CURRENT observable behavior — exact wire PDUs, integration call
+    //! sequence, return codes — so the lifetime fix (WriterGate quiesce in
+    //! on_close) can be proven not to alter it. Test-only: no production
+    //! change is made here.
+    use super::*;
+    use crate::integrations::{WebcamFrame, WebcamIntegration, WebcamMode};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    // Wire message ids (MS-RDPECAM), asserted numerically so a binding
+    // constant rename cannot silently change what these tests pin.
+    const SUCCESS: u8 = 1;
+    const ERROR: u8 = 2;
+    const ACTIVATE: u8 = 7;
+    const DEACTIVATE: u8 = 8;
+    const STREAM_LIST_REQ: u8 = 9;
+    const STREAM_LIST_RESP: u8 = 10;
+    const MEDIA_TYPE_LIST_REQ: u8 = 11;
+    const MEDIA_TYPE_LIST_RESP: u8 = 12;
+    const CURRENT_MEDIA_TYPE_REQ: u8 = 13;
+    const CURRENT_MEDIA_TYPE_RESP: u8 = 14;
+    const START_STREAMS: u8 = 15;
+    const STOP_STREAMS: u8 = 16;
+    const SAMPLE_REQ: u8 = 17;
+    const SAMPLE_RESP: u8 = 18;
+    const PROPERTY_LIST_REQ: u8 = 20;
+    const PROPERTY_LIST_RESP: u8 = 21;
+
+    const FMT_H264: u8 = 1;
+    const FMT_MJPG: u8 = 2;
+    const FMT_YUY2: u8 = 3;
+
+    /// Fake host DVC channel. `Write` captures the exact PDU bytes into a
+    /// per-channel sink recovered from the `pChannel` pointer itself (the
+    /// fake is `#[repr(C)]` with the C struct first), so writes from ANY
+    /// thread — including the detached writer thread — land in the right
+    /// test's sink. No globals, tests run safely in parallel.
+    #[repr(C)]
+    struct FakeChannel {
+        inner: freerdp_sys::IWTSVirtualChannel,
+        sink: WriteSink,
+    }
+
+    // The fake is shared with the writer thread in these tests.
+    unsafe impl Send for FakeChannel {}
+    unsafe impl Sync for FakeChannel {}
+
+    type WriteSink = Arc<Mutex<Vec<(usize, Vec<u8>)>>>;
+
+    unsafe extern "C" fn fake_write(
+        channel: *mut freerdp_sys::IWTSVirtualChannel,
+        size: freerdp_sys::ULONG,
+        buffer: *const freerdp_sys::BYTE,
+        _reserved: *mut std::ffi::c_void,
+    ) -> freerdp_sys::UINT {
+        let bytes = unsafe { std::slice::from_raw_parts(buffer, size as usize) }.to_vec();
+        let fake = unsafe { &*(channel as *const FakeChannel) };
+        fake.sink.lock().unwrap().push((channel as usize, bytes));
+        freerdp_sys::CHANNEL_RC_OK
+    }
+
+    impl FakeChannel {
+        fn new(sink: WriteSink) -> Box<Self> {
+            Box::new(FakeChannel {
+                inner: freerdp_sys::IWTSVirtualChannel {
+                    Write: Some(fake_write),
+                    Close: None,
+                },
+                sink,
+            })
+        }
+        fn ptr(&mut self) -> *mut freerdp_sys::IWTSVirtualChannel {
+            &mut self.inner
+        }
+    }
+
+    /// Records every integration call in order; `start_stream` hands back a
+    /// real flume receiver so the writer-thread path is exercised end to end.
+    #[derive(Debug)]
+    struct MockWebcam {
+        calls: Mutex<Vec<String>>,
+        h264: bool,
+        dims: (u32, u32),
+        max_dims: (u32, u32),
+        fps: u32,
+        frame_tx: Mutex<Option<flume::Sender<WebcamFrame>>>,
+        stop_count: AtomicU32,
+    }
+
+    impl MockWebcam {
+        fn new(h264: bool, dims: (u32, u32), max_dims: (u32, u32), fps: u32) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                h264,
+                dims,
+                max_dims,
+                fps,
+                frame_tx: Mutex::new(None),
+                stop_count: AtomicU32::new(0),
+            })
+        }
+        fn record(&self, s: String) {
+            self.calls.lock().unwrap().push(s);
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+        fn send_frame(&self, data: Vec<u8>, channel_ptr: usize) {
+            let guard = self.frame_tx.lock().unwrap();
+            guard
+                .as_ref()
+                .expect("start_stream must have been called")
+                .send(WebcamFrame { data, channel_ptr })
+                .expect("writer thread must still be receiving");
+        }
+    }
+
+    impl WebcamIntegration for MockWebcam {
+        fn is_h264_available(&self) -> bool {
+            self.h264
+        }
+        fn get_camera_dimensions(&self) -> (u32, u32) {
+            self.dims
+        }
+        fn get_max_dimensions(&self) -> (u32, u32) {
+            self.max_dims
+        }
+        fn get_fps(&self) -> u32 {
+            self.fps
+        }
+        fn set_mode(&self, mode: WebcamMode) {
+            self.record(format!("set_mode:{mode:?}"));
+        }
+        fn set_format(&self, format: u32, width: u32, height: u32, fps: u32) {
+            self.record(format!("set_format:{format},{width},{height},{fps}"));
+        }
+        fn start_stream(&self, width: u32, height: u32, fps: u32) -> flume::Receiver<WebcamFrame> {
+            self.record(format!("start_stream:{width},{height},{fps}"));
+            let (tx, rx) = flume::unbounded();
+            *self.frame_tx.lock().unwrap() = Some(tx);
+            rx
+        }
+        fn stop_stream(&self) {
+            self.stop_count.fetch_add(1, Ordering::SeqCst);
+            *self.frame_tx.lock().unwrap() = None;
+            self.record("stop_stream".to_string());
+        }
+        fn request_sample(&self, channel_ptr: usize) {
+            self.record(format!("request_sample:{channel_ptr}"));
+        }
+        fn push_frame(&self, data: Vec<u8>) {
+            self.record(format!("push_frame:{}", data.len()));
+        }
+    }
+
+    /// Heap-allocated ChannelCtx wired like `on_new_device_channel` does.
+    /// Returns the raw callback pointer; tests own it and must call
+    /// `on_close` (or free manually) exactly once.
+    fn make_ctx(
+        webcam: Arc<MockWebcam>,
+        channel: *mut freerdp_sys::IWTSVirtualChannel,
+    ) -> *mut ChannelCtx {
+        let ctx = Box::new(ChannelCtx {
+            channel_cb: freerdp_sys::IWTSVirtualChannelCallback {
+                OnDataReceived: Some(on_data),
+                OnOpen: Some(on_open),
+                OnClose: Some(on_close),
+                pInterface: std::ptr::null_mut(),
+            },
+            channel,
+            webcam,
+            stream_index: 0,
+            rdpcontext: std::ptr::null_mut(),
+        });
+        Box::into_raw(ctx)
+    }
+
+    fn send_pdu(ctx: *mut ChannelCtx, bytes: &[u8]) -> freerdp_sys::UINT {
+        let mut stream = freerdp_sys::wStream {
+            buffer: bytes.as_ptr() as *mut _,
+            pointer: bytes.as_ptr() as *mut _,
+            length: bytes.len(),
+            capacity: bytes.len(),
+            count: 1,
+            pool: std::ptr::null_mut(),
+            isAllocatedStream: 0,
+            isOwner: 0,
+        };
+        unsafe { on_data(ctx as *mut _, &mut stream) }
+    }
+
+    /// StartStreams payload: version + msg id + stream index + 26-byte media
+    /// type description (29 bytes on the wire; handler requires payload >= 27).
+    fn start_streams_payload(idx: u8, fmt: u8, w: u32, h: u32, num: u32, den: u32) -> Vec<u8> {
+        let mut p = vec![1, START_STREAMS, idx, fmt];
+        p.extend_from_slice(&w.to_le_bytes());
+        p.extend_from_slice(&h.to_le_bytes());
+        p.extend_from_slice(&num.to_le_bytes());
+        p.extend_from_slice(&den.to_le_bytes());
+        p.extend_from_slice(&1u32.to_le_bytes()); // aspect num
+        p.extend_from_slice(&1u32.to_le_bytes()); // aspect den
+        p.push(1); // DecodingRequired
+        p
+    }
+
+    fn header(msg: u8) -> Vec<u8> {
+        vec![1, msg]
+    }
+
+    /// Serialize the expected 26-byte media type entry for response PDUs.
+    fn mt_bytes(fmt: u8, w: u32, h: u32, fps: u32) -> Vec<u8> {
+        let mut b = vec![fmt];
+        b.extend_from_slice(&w.to_le_bytes());
+        b.extend_from_slice(&h.to_le_bytes());
+        b.extend_from_slice(&fps.to_le_bytes());
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.push(1);
+        b
+    }
+
+    struct Harness {
+        ctx: *mut ChannelCtx,
+        mock: Arc<MockWebcam>,
+        writes: WriteSink,
+        channel_ptr: usize,
+        // MUST outlive the writer thread: dropped only after close() has
+        // quiesced it (post-fix). Field order matters for Drop.
+        _channel: Box<FakeChannel>,
+        closed: bool,
+    }
+
+    impl Harness {
+        fn new(mock: Arc<MockWebcam>) -> Self {
+            let writes: WriteSink = Arc::new(Mutex::new(Vec::new()));
+            let mut channel = FakeChannel::new(writes.clone());
+            let channel_ptr = channel.ptr() as usize;
+            let ctx = make_ctx(mock.clone(), channel.ptr());
+            Self {
+                ctx,
+                mock,
+                writes,
+                channel_ptr,
+                _channel: channel,
+                closed: false,
+            }
+        }
+        fn send(&self, bytes: &[u8]) -> freerdp_sys::UINT {
+            send_pdu(self.ctx, bytes)
+        }
+        fn written(&self) -> Vec<Vec<u8>> {
+            self.writes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(p, _)| *p == self.channel_ptr)
+                .map(|(_, b)| b.clone())
+                .collect()
+        }
+        fn close(&mut self) -> freerdp_sys::UINT {
+            self.closed = true;
+            unsafe { on_close(self.ctx as *mut _) }
+        }
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            if !self.closed {
+                unsafe {
+                    let _ = Box::from_raw(self.ctx);
+                }
+            }
+        }
+    }
+
+    /// Wait until the writer thread has delivered `n` PDUs (bounded).
+    fn wait_writes(h: &Harness, n: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while h.written().len() < n {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {n} writes, got {}",
+                h.written().len()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn start_streams_mjpeg_full_contract() {
+        let mock = MockWebcam::new(false, (640, 480), (640, 480), 15);
+        let mut h = Harness::new(mock.clone());
+        // host asks 30fps; configured 15 -> min = 15
+        let p = start_streams_payload(0, FMT_MJPG, 320, 240, 30, 1);
+        assert_eq!(h.send(&p), freerdp_sys::CHANNEL_RC_OK);
+        assert_eq!(
+            h.mock.calls(),
+            vec![
+                "set_mode:MJPEG",
+                "start_stream:320,240,15",
+                "set_format:2,320,240,15",
+            ]
+        );
+        assert_eq!(h.written(), vec![header(SUCCESS)]);
+        h.close();
+    }
+
+    #[test]
+    fn start_streams_fps_min_and_den_zero_default() {
+        // requested below configured -> requested wins
+        let mock = MockWebcam::new(false, (640, 480), (640, 480), 30);
+        let mut h = Harness::new(mock.clone());
+        let p = start_streams_payload(1, FMT_MJPG, 160, 120, 10, 1);
+        h.send(&p);
+        assert!(h.mock.calls().contains(&"start_stream:160,120,10".to_string()));
+        h.close();
+
+        // denominator 0 -> requested falls back to 15, min(15, configured 30) = 15
+        let mock2 = MockWebcam::new(false, (640, 480), (640, 480), 30);
+        let mut h2 = Harness::new(mock2.clone());
+        let p2 = start_streams_payload(0, FMT_MJPG, 160, 120, 99, 0);
+        h2.send(&p2);
+        assert!(h2.mock.calls().contains(&"start_stream:160,120,15".to_string()));
+        h2.close();
+    }
+
+    #[test]
+    fn start_streams_h264_when_available_and_fallback_when_not() {
+        let mock = MockWebcam::new(true, (640, 480), (640, 480), 15);
+        let mut h = Harness::new(mock.clone());
+        h.send(&start_streams_payload(0, FMT_H264, 320, 240, 15, 1));
+        assert!(h.mock.calls().contains(&"set_mode:H264".to_string()));
+        assert!(h.mock.calls().contains(&"set_format:1,320,240,15".to_string()));
+        h.close();
+
+        let mock2 = MockWebcam::new(false, (640, 480), (640, 480), 15);
+        let mut h2 = Harness::new(mock2.clone());
+        h2.send(&start_streams_payload(0, FMT_H264, 320, 240, 15, 1));
+        assert!(h2.mock.calls().contains(&"set_mode:MJPEG".to_string()));
+        // format stays H264 on the wire contract (only mode falls back)
+        assert!(h2.mock.calls().contains(&"set_format:1,320,240,15".to_string()));
+        h2.close();
+    }
+
+    #[test]
+    fn start_streams_yuy2_and_unknown_format() {
+        let mock = MockWebcam::new(false, (640, 480), (640, 480), 15);
+        let mut h = Harness::new(mock.clone());
+        h.send(&start_streams_payload(0, FMT_YUY2, 320, 240, 15, 1));
+        assert!(h.mock.calls().contains(&"set_mode:YUY2".to_string()));
+        h.close();
+
+        let mock2 = MockWebcam::new(false, (640, 480), (640, 480), 15);
+        let mut h2 = Harness::new(mock2.clone());
+        h2.send(&start_streams_payload(0, 99, 320, 240, 15, 1));
+        assert!(h2.mock.calls().contains(&"set_mode:Raw".to_string()));
+        h2.close();
+    }
+
+    #[test]
+    fn start_streams_short_payload_sends_error_no_stream() {
+        let mock = MockWebcam::new(false, (640, 480), (640, 480), 15);
+        let mut h = Harness::new(mock.clone());
+        // header + 26 bytes of payload (< 27 required)
+        let mut p = vec![1, START_STREAMS];
+        p.extend_from_slice(&[0u8; 26]);
+        assert_eq!(h.send(&p), freerdp_sys::CHANNEL_RC_OK);
+        assert_eq!(h.written(), vec![header(ERROR)]);
+        assert!(h.mock.calls().is_empty());
+        h.close();
+    }
+
+    #[test]
+    fn sample_request_forwards_channel_ptr() {
+        let mock = MockWebcam::new(false, (640, 480), (640, 480), 15);
+        let mut h = Harness::new(mock.clone());
+        let ptr = h.channel_ptr;
+        h.send(&header(SAMPLE_REQ));
+        assert_eq!(h.mock.calls(), vec![format!("request_sample:{ptr}")]);
+        assert!(h.written().is_empty()); // no response PDU for SampleRequest
+        h.close();
+    }
+
+    #[test]
+    fn stop_and_deactivate_stop_stream_and_ack() {
+        for msg in [STOP_STREAMS, DEACTIVATE] {
+            let mock = MockWebcam::new(false, (640, 480), (640, 480), 15);
+            let mut h = Harness::new(mock.clone());
+            h.send(&header(msg));
+            assert_eq!(h.mock.calls(), vec!["stop_stream"]);
+            assert_eq!(h.written(), vec![header(SUCCESS)]);
+            assert_eq!(h.mock.stop_count.load(Ordering::SeqCst), 1);
+            h.close();
+        }
+    }
+
+    #[test]
+    fn activate_acks_without_stopping() {
+        let mock = MockWebcam::new(false, (640, 480), (640, 480), 15);
+        let mut h = Harness::new(mock.clone());
+        h.send(&header(ACTIVATE));
+        assert!(h.mock.calls().is_empty());
+        assert_eq!(h.written(), vec![header(SUCCESS)]);
+        h.close();
+    }
+
+    #[test]
+    fn stream_list_response_exact_bytes() {
+        let mock = MockWebcam::new(false, (640, 480), (640, 480), 15);
+        let mut h = Harness::new(mock.clone());
+        h.send(&header(STREAM_LIST_REQ));
+        let mut expected = vec![1, STREAM_LIST_RESP];
+        expected.extend_from_slice(&1u16.to_le_bytes()); // frame source types
+        expected.push(1); // category
+        expected.push(1); // selected
+        expected.push(0); // can_be_shared
+        assert_eq!(h.written(), vec![expected]);
+        h.close();
+    }
+
+    #[test]
+    fn media_type_list_clamps_to_max_and_lists_h264_first() {
+        // camera 1920x1080 but max 640x480 -> clamped; fps.max(1)
+        let mock = MockWebcam::new(true, (1920, 1080), (640, 480), 0);
+        let mut h = Harness::new(mock.clone());
+        h.send(&header(MEDIA_TYPE_LIST_REQ));
+        let mut expected = vec![1, MEDIA_TYPE_LIST_RESP];
+        expected.extend_from_slice(&mt_bytes(FMT_H264, 640, 480, 1));
+        expected.extend_from_slice(&mt_bytes(FMT_MJPG, 640, 480, 1));
+        assert_eq!(h.written(), vec![expected]);
+        h.close();
+    }
+
+    #[test]
+    fn media_type_list_without_h264_only_mjpeg() {
+        let mock = MockWebcam::new(false, (320, 240), (640, 480), 20);
+        let mut h = Harness::new(mock.clone());
+        h.send(&header(MEDIA_TYPE_LIST_REQ));
+        let mut expected = vec![1, MEDIA_TYPE_LIST_RESP];
+        expected.extend_from_slice(&mt_bytes(FMT_MJPG, 320, 240, 20));
+        assert_eq!(h.written(), vec![expected]);
+        h.close();
+    }
+
+    #[test]
+    fn current_media_type_prefers_h264_and_clamps() {
+        let mock = MockWebcam::new(true, (800, 600), (640, 480), 15);
+        let mut h = Harness::new(mock.clone());
+        h.send(&header(CURRENT_MEDIA_TYPE_REQ));
+        let mut expected = vec![1, CURRENT_MEDIA_TYPE_RESP];
+        expected.extend_from_slice(&mt_bytes(FMT_H264, 640, 480, 15));
+        assert_eq!(h.written(), vec![expected]);
+        h.close();
+
+        let mock2 = MockWebcam::new(false, (800, 600), (640, 480), 15);
+        let mut h2 = Harness::new(mock2.clone());
+        h2.send(&header(CURRENT_MEDIA_TYPE_REQ));
+        let mut expected2 = vec![1, CURRENT_MEDIA_TYPE_RESP];
+        expected2.extend_from_slice(&mt_bytes(FMT_MJPG, 640, 480, 15));
+        assert_eq!(h2.written(), vec![expected2]);
+        h2.close();
+    }
+
+    #[test]
+    fn property_list_response_exact_bytes() {
+        let mock = MockWebcam::new(false, (640, 480), (640, 480), 15);
+        let mut h = Harness::new(mock.clone());
+        h.send(&header(PROPERTY_LIST_REQ));
+        let mut expected = vec![1, PROPERTY_LIST_RESP];
+        expected.extend_from_slice(&0u64.to_le_bytes());
+        assert_eq!(h.written(), vec![expected]);
+        h.close();
+    }
+
+    #[test]
+    fn unknown_msg_sends_error() {
+        let mock = MockWebcam::new(false, (640, 480), (640, 480), 15);
+        let mut h = Harness::new(mock.clone());
+        h.send(&header(250));
+        assert_eq!(h.written(), vec![header(ERROR)]);
+        h.close();
+    }
+
+    #[test]
+    fn malformed_pdus_never_panic() {
+        let mock = MockWebcam::new(false, (640, 480), (640, 480), 15);
+        let mut h = Harness::new(mock.clone());
+        assert_eq!(h.send(&[]), freerdp_sys::CHANNEL_RC_OK); // too short
+        assert_eq!(h.send(&[1]), freerdp_sys::CHANNEL_RC_OK); // 1 byte
+        assert!(h.written().is_empty());
+        // null stream is tolerated
+        let rc = unsafe { on_data(h.ctx as *mut _, std::ptr::null_mut()) };
+        assert_eq!(rc, freerdp_sys::CHANNEL_RC_OK);
+        h.close();
+    }
+
+    #[test]
+    fn frames_are_written_as_exact_sample_response_pdus() {
+        let mock = MockWebcam::new(false, (640, 480), (640, 480), 15);
+        let mut h = Harness::new(mock.clone());
+        let ptr = h.channel_ptr;
+        h.send(&start_streams_payload(3, FMT_MJPG, 320, 240, 15, 1));
+        assert_eq!(h.written(), vec![header(SUCCESS)]);
+
+        let data1 = vec![0xAAu8; 64];
+        let data2 = vec![0xBBu8; 128];
+        h.mock.send_frame(data1.clone(), ptr);
+        h.mock.send_frame(data2.clone(), ptr);
+        wait_writes(&h, 3); // Success + 2 samples
+
+        let mut s1 = vec![1, SAMPLE_RESP, 3];
+        s1.extend_from_slice(&data1);
+        let mut s2 = vec![1, SAMPLE_RESP, 3];
+        s2.extend_from_slice(&data2);
+        assert_eq!(h.written(), vec![header(SUCCESS), s1, s2]);
+        h.close();
+    }
+
+    #[test]
+    fn on_close_stops_stream_and_returns_ok() {
+        let mock = MockWebcam::new(false, (640, 480), (640, 480), 15);
+        let mut h = Harness::new(mock.clone());
+        h.send(&start_streams_payload(0, FMT_MJPG, 320, 240, 15, 1));
+        let rc = h.close();
+        assert_eq!(rc, freerdp_sys::CHANNEL_RC_OK);
+        assert_eq!(h.mock.stop_count.load(Ordering::SeqCst), 1);
+        assert!(h.mock.calls().contains(&"stop_stream".to_string()));
+    }
+
+    #[test]
+    fn on_open_returns_ok() {
+        let mock = MockWebcam::new(false, (640, 480), (640, 480), 15);
+        let mut h = Harness::new(mock.clone());
+        let rc = unsafe { on_open(h.ctx as *mut _) };
+        assert_eq!(rc, freerdp_sys::CHANNEL_RC_OK);
+        h.close();
+    }
+}
