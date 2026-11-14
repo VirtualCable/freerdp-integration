@@ -44,6 +44,11 @@ impl RdpChannels {
     }
 
     pub fn clear_cliprdr(&mut self) {
+        // Invalidate every clone already handed to the consumer BEFORE the
+        // library frees the CliprdrClientContext (fail-closed liveness).
+        if let Some(ref clipboard) = self.cliprdr {
+            clipboard.stop();
+        }
         self.cliprdr = None;
     }
 

@@ -3,6 +3,7 @@
 // All rights reserved.
 // Authors: Adolfo Gómez, dkmaster at dkmon dot com
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 mod callbacks_c;
@@ -50,6 +51,14 @@ impl RdpClipboardFormat {
 pub struct RdpClipboard {
     ptr: Option<utils::SafePtr<freerdp_sys::CliprdrClientContext>>,
 
+    /// Liveness token shared by every clone of this handle. The registry
+    /// (`clear_cliprdr`) flips it to false BEFORE the library frees the
+    /// CliprdrClientContext, so any clone already handed to the consumer
+    /// short-circuits its FFI calls instead of dereferencing freed memory.
+    /// Fail-closed: a call on a stopped handle returns CHANNEL_RC_OK without
+    /// touching the pointer.
+    alive: Arc<AtomicBool>,
+
     pub caps_flags: u32,
     pub remote_formats: Vec<RdpClipboardFormat>, // Currently, we only support text format, but can be extended
     pub text: Arc<RwLock<String>>,               // Cached text from local clipboard
@@ -59,13 +68,29 @@ impl RdpClipboard {
     pub fn new(ptr: *mut freerdp_sys::CliprdrClientContext) -> Self {
         Self {
             ptr: utils::SafePtr::new(ptr),
+            alive: Arc::new(AtomicBool::new(true)),
             caps_flags: 0, // Currently we dont use the caps_flags from remote server, we assume server supports text formats :)
             remote_formats: Vec::new(),
             text: Arc::new(RwLock::new(String::new())),
         }
     }
 
+    /// Invalidate every clone of this handle. Called by the registry on
+    /// channel disconnect, before the library frees the context. Idempotent.
+    pub fn stop(&self) {
+        self.alive.store(false, Ordering::Release);
+    }
+
+    /// Whether this handle may still touch the underlying context.
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+
     pub fn client_capabilities(&self, capabilities: &freerdp_sys::CLIPRDR_CAPABILITIES) -> u32 {
+        if !self.is_alive() {
+            crate::utils::log::debug!("cliprdr: client_capabilities suppressed (channel stopped)");
+            return freerdp_sys::CHANNEL_RC_OK;
+        }
         if let Some(ptr) = &self.ptr
             && let Some(func) = ptr.ClientCapabilities
         {
@@ -104,6 +129,10 @@ impl RdpClipboard {
 
     // Internal helper to send client format list
     pub fn client_format_list(&self, format_list: &freerdp_sys::CLIPRDR_FORMAT_LIST) -> u32 {
+        if !self.is_alive() {
+            crate::utils::log::debug!("cliprdr: client_format_list suppressed (channel stopped)");
+            return freerdp_sys::CHANNEL_RC_OK;
+        }
         if let Some(ptr) = &self.ptr
             && let Some(func) = ptr.ClientFormatList
         {
@@ -162,6 +191,12 @@ impl RdpClipboard {
     }
 
     pub fn send_format_list_response(&self, success: bool) -> u32 {
+        if !self.is_alive() {
+            crate::utils::log::debug!(
+                "cliprdr: send_format_list_response suppressed (channel stopped)"
+            );
+            return freerdp_sys::CHANNEL_RC_OK;
+        }
         if let Some(ptr) = &self.ptr
             && let Some(func) = ptr.ClientFormatListResponse
         {
@@ -191,6 +226,12 @@ impl RdpClipboard {
         &self,
         format_data_response: &freerdp_sys::CLIPRDR_FORMAT_DATA_RESPONSE,
     ) -> u32 {
+        if !self.is_alive() {
+            crate::utils::log::debug!(
+                "cliprdr: send_client_format_data_response suppressed (channel stopped)"
+            );
+            return freerdp_sys::CHANNEL_RC_OK;
+        }
         if let Some(ptr) = &self.ptr
             && let Some(func) = ptr.ClientFormatDataResponse
         {
@@ -210,6 +251,12 @@ impl RdpClipboard {
         &self,
         format_data_request: &freerdp_sys::CLIPRDR_FORMAT_DATA_REQUEST,
     ) -> u32 {
+        if !self.is_alive() {
+            crate::utils::log::debug!(
+                "cliprdr: client_format_data_request suppressed (channel stopped)"
+            );
+            return freerdp_sys::CHANNEL_RC_OK;
+        }
         if let Some(ptr) = &self.ptr
             && let Some(func) = ptr.ClientFormatDataRequest
         {
@@ -332,6 +379,175 @@ mod tests {
         assert_eq!(
             cb.send_format_list_response(true),
             freerdp_sys::CHANNEL_RC_OK
+        );
+    }
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    //! Lifetime guarantee (Fix E): a clone of RdpClipboard handed to the
+    //! consumer must not touch the CliprdrClientContext after the registry
+    //! stops it (clear_cliprdr), because the library frees the context right
+    //! after channel disconnect. Fail-closed: stopped clones return
+    //! CHANNEL_RC_OK without invoking any callback.
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Per-test sink recovered from the fake context's `custom` pointer.
+    struct CallSink {
+        calls: Mutex<Vec<&'static str>>,
+    }
+
+    unsafe extern "C" fn rec_capabilities(
+        ctx: *mut freerdp_sys::CliprdrClientContext,
+        _caps: *const freerdp_sys::CLIPRDR_CAPABILITIES,
+    ) -> u32 {
+        let sink = unsafe { &*((*ctx).custom as *const CallSink) };
+        sink.calls.lock().unwrap().push("capabilities");
+        freerdp_sys::CHANNEL_RC_OK
+    }
+    unsafe extern "C" fn rec_format_list(
+        ctx: *mut freerdp_sys::CliprdrClientContext,
+        _fl: *const freerdp_sys::CLIPRDR_FORMAT_LIST,
+    ) -> u32 {
+        let sink = unsafe { &*((*ctx).custom as *const CallSink) };
+        sink.calls.lock().unwrap().push("format_list");
+        freerdp_sys::CHANNEL_RC_OK
+    }
+    unsafe extern "C" fn rec_format_list_response(
+        ctx: *mut freerdp_sys::CliprdrClientContext,
+        _r: *const freerdp_sys::CLIPRDR_FORMAT_LIST_RESPONSE,
+    ) -> u32 {
+        let sink = unsafe { &*((*ctx).custom as *const CallSink) };
+        sink.calls.lock().unwrap().push("format_list_response");
+        freerdp_sys::CHANNEL_RC_OK
+    }
+    unsafe extern "C" fn rec_format_data_request(
+        ctx: *mut freerdp_sys::CliprdrClientContext,
+        _r: *const freerdp_sys::CLIPRDR_FORMAT_DATA_REQUEST,
+    ) -> u32 {
+        let sink = unsafe { &*((*ctx).custom as *const CallSink) };
+        sink.calls.lock().unwrap().push("format_data_request");
+        freerdp_sys::CHANNEL_RC_OK
+    }
+    unsafe extern "C" fn rec_format_data_response(
+        ctx: *mut freerdp_sys::CliprdrClientContext,
+        _r: *const freerdp_sys::CLIPRDR_FORMAT_DATA_RESPONSE,
+    ) -> u32 {
+        let sink = unsafe { &*((*ctx).custom as *const CallSink) };
+        sink.calls.lock().unwrap().push("format_data_response");
+        freerdp_sys::CHANNEL_RC_OK
+    }
+
+    struct FakeCtx {
+        ctx: *mut freerdp_sys::CliprdrClientContext,
+        sink: *mut CallSink,
+    }
+    impl FakeCtx {
+        fn new() -> Self {
+            let sink = Box::into_raw(Box::new(CallSink {
+                calls: Mutex::new(Vec::new()),
+            }));
+            let ctx = Box::into_raw(Box::new(unsafe {
+                std::mem::zeroed::<freerdp_sys::CliprdrClientContext>()
+            }));
+            unsafe {
+                (*ctx).custom = sink as *mut std::ffi::c_void;
+                (*ctx).ClientCapabilities = Some(rec_capabilities);
+                (*ctx).ClientFormatList = Some(rec_format_list);
+                (*ctx).ClientFormatListResponse = Some(rec_format_list_response);
+                (*ctx).ClientFormatDataRequest = Some(rec_format_data_request);
+                (*ctx).ClientFormatDataResponse = Some(rec_format_data_response);
+            }
+            Self { ctx, sink }
+        }
+        fn calls(&self) -> Vec<&'static str> {
+            unsafe { (*self.sink).calls.lock().unwrap().clone() }
+        }
+    }
+    impl Drop for FakeCtx {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = Box::from_raw(self.ctx);
+                let _ = Box::from_raw(self.sink);
+            }
+        }
+    }
+
+    fn all_calls(cb: &RdpClipboard) {
+        cb.send_client_capabilities(0);
+        cb.send_client_format_list(&[RdpClipboardFormat::TextUnicode]);
+        cb.send_format_list_response(true);
+        let req = unsafe { std::mem::zeroed::<freerdp_sys::CLIPRDR_FORMAT_DATA_REQUEST>() };
+        cb.client_format_data_request(&req);
+        let resp = unsafe { std::mem::zeroed::<freerdp_sys::CLIPRDR_FORMAT_DATA_RESPONSE>() };
+        cb.send_client_format_data_response(&resp);
+    }
+
+    #[test]
+    fn live_handle_invokes_callbacks() {
+        let fake = FakeCtx::new();
+        let cb = RdpClipboard::new(fake.ctx);
+        assert!(cb.is_alive());
+        all_calls(&cb);
+        assert_eq!(
+            fake.calls(),
+            vec![
+                "capabilities",
+                "format_list",
+                "format_list_response",
+                "format_data_request",
+                "format_data_response",
+            ]
+        );
+    }
+
+    #[test]
+    fn stopped_clone_never_invokes_callbacks() {
+        let fake = FakeCtx::new();
+        let original = RdpClipboard::new(fake.ctx);
+        // Clone handed to the consumer (like on_monitor_ready does).
+        let consumer_clone = original.clone();
+        assert!(consumer_clone.is_alive());
+
+        // Registry disconnect: stop invalidates EVERY clone.
+        original.stop();
+        assert!(!consumer_clone.is_alive());
+        assert!(!original.is_alive());
+
+        all_calls(&consumer_clone);
+        all_calls(&original);
+        assert!(
+            fake.calls().is_empty(),
+            "a stopped clone must not touch the (freed) context"
+        );
+    }
+
+    #[test]
+    fn stop_is_idempotent_and_fail_closed() {
+        let fake = FakeCtx::new();
+        let cb = RdpClipboard::new(fake.ctx);
+        cb.stop();
+        cb.stop();
+        assert_eq!(cb.send_client_capabilities(0), freerdp_sys::CHANNEL_RC_OK);
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn registry_clear_cliprdr_invalidates_outstanding_clones() {
+        let fake = FakeCtx::new();
+        let mut channels = crate::channels::RdpChannels::new();
+        channels.set_cliprdr_ptr(fake.ctx);
+        let consumer_clone = channels.cliprdr().unwrap();
+        assert!(consumer_clone.is_alive());
+
+        // Disconnect path: clear_cliprdr must stop the handle before drop.
+        channels.clear_cliprdr();
+        assert!(!consumer_clone.is_alive());
+        all_calls(&consumer_clone);
+        assert!(
+            fake.calls().is_empty(),
+            "clear_cliprdr must invalidate clones already handed out"
         );
     }
 }
