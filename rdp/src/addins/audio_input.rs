@@ -26,7 +26,16 @@ pub struct MicPlugin {
     frames_per_packet: u32,
     audio_input: Option<Arc<dyn AudioInputIntegration>>,
     stop_tx: Option<flume::Sender<()>>,
+    /// Join handle for the reader thread. Close joins it so no receive
+    /// callback is in flight when Close returns (upstream audin frees the
+    /// plugin right after Close — FreeRDP 3.15 and 3.26).
+    reader_join: Option<thread::JoinHandle<()>>,
 }
+
+/// Hard bound for joining the reader thread during close. The reader's
+/// receive callback is a short host-stack call; 5 s is far beyond any
+/// legitimate packet and keeps disconnect from stalling indefinitely.
+const READER_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub unsafe extern "C" fn mic_entry(p_entry_points: PFREERDP_AUDIN_DEVICE_ENTRY_POINTS) -> UINT {
     if p_entry_points.is_null() {
@@ -48,6 +57,7 @@ pub unsafe extern "C" fn mic_entry(p_entry_points: PFREERDP_AUDIN_DEVICE_ENTRY_P
         frames_per_packet: 0,
         audio_input: None,
         stop_tx: None,
+        reader_join: None,
     });
 
     unsafe {
@@ -173,7 +183,7 @@ unsafe extern "C" fn open(
     let block_align = plugin.format.nBlockAlign * 2;
     let avg_bps = plugin.format.nAvgBytesPerSec * 2;
 
-    thread::spawn(move || {
+    let reader = thread::spawn(move || {
         let ud = user_data_usize as *mut std::ffi::c_void;
 
         let stereo_fmt = AUDIO_FORMAT {
@@ -204,7 +214,31 @@ unsafe extern "C" fn open(
             duration
         );
 
-        while let Ok(mono_data) = data_rx.recv() {
+        loop {
+            // Wait for a data packet OR the stop signal, whichever comes
+            // first: close must wake the reader even if the consumer keeps
+            // its sender alive with no data flowing.
+            let mono_data = {
+                let mut slot: Option<Vec<u8>> = None;
+                let mut stopped = false;
+                flume::Selector::new()
+                    .recv(&data_rx, |r| {
+                        if let Ok(d) = r {
+                            slot = Some(d);
+                        }
+                    })
+                    .recv(&stop_rx, |_| {
+                        stopped = true;
+                    })
+                    .wait();
+                if stopped {
+                    break;
+                }
+                match slot {
+                    Some(d) => d,
+                    None => break, // data channel disconnected
+                }
+            };
             if stop_rx.try_recv().is_ok() {
                 break;
             }
@@ -239,6 +273,7 @@ unsafe extern "C" fn open(
         }
         log::info!("Mic reader thread ending");
     });
+    plugin.reader_join = Some(reader);
 
     log::debug!(
         "Mic opened: sample_rate={}, channels={}, bits={}, fps={}",
@@ -258,6 +293,28 @@ unsafe extern "C" fn close(device: *mut IAudinDevice) -> UINT {
     }
     if let Some(audio_input) = plugin.audio_input.take() {
         audio_input.stop();
+    }
+    // Join the reader so no receive callback is in flight when we return:
+    // upstream audin frees the plugin/callback right after Close. The
+    // reader wakes on the disconnected data channel (integration stopped)
+    // or the stop signal; the join is bounded so a stuck host callback
+    // cannot hang disconnect forever.
+    if let Some(reader) = plugin.reader_join.take() {
+        let deadline = std::time::Instant::now() + READER_JOIN_TIMEOUT;
+        while !reader.is_finished() {
+            if std::time::Instant::now() >= deadline {
+                log::error!(
+                    "Mic: reader still running after {}s join timeout; \
+                     proceeding with close (in-flight receive may race)",
+                    READER_JOIN_TIMEOUT.as_secs()
+                );
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        if reader.is_finished() {
+            let _ = reader.join();
+        }
     }
     CHANNEL_RC_OK
 }
@@ -477,6 +534,7 @@ mod tests {
                 frames_per_packet: 0,
                 audio_input: None,
                 stop_tx: None,
+                reader_join: None,
             }));
 
             // userData = leaked per-test state; reclaimed in Drop.
