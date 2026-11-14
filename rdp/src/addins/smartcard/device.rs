@@ -44,6 +44,69 @@ pub(crate) struct OutstandingIrpTracker {
     irps: Mutex<HashMap<u32, OutstandingIrp>>,
 }
 
+/// Device-liveness gate shared by every IRP-executing thread (device thread
+/// and detached status workers). `free_handler` sets `alive = false` before
+/// tearing down; `execute_request` checks it before touching the IRP's
+/// output stream / Complete, so no thread Completes an IRP after teardown
+/// (upstream frees the IRP/stream/devman right after Free).
+pub(crate) struct DeviceLiveness {
+    alive: AtomicBool,
+}
+
+impl DeviceLiveness {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            alive: AtomicBool::new(true),
+        })
+    }
+    pub(crate) fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+    pub(crate) fn mark_dead(&self) {
+        self.alive.store(false, Ordering::Release);
+    }
+}
+
+/// Registry of detached status-thread JoinHandles so `free_handler` can
+/// join them (bounded) instead of leaving them detached.
+pub(crate) struct StatusThreads {
+    handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
+}
+
+impl StatusThreads {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            handles: Mutex::new(Vec::new()),
+        })
+    }
+    fn push(&self, handle: std::thread::JoinHandle<()>) {
+        let mut handles = self.handles.lock().unwrap();
+        // Reap finished handles so a long-lived device does not accumulate
+        // one entry per GET_STATUS_CHANGE IRP.
+        handles.retain(|h| !h.is_finished());
+        handles.push(handle);
+    }
+    /// Join all registered threads, bounded by `deadline`. Returns the
+    /// number of threads still running when the bound expired.
+    fn join_all(&self, deadline: Instant) -> usize {
+        let handles: Vec<_> = self.handles.lock().unwrap().drain(..).collect();
+        let mut still_running = 0;
+        for handle in handles {
+            while !handle.is_finished() {
+                if Instant::now() >= deadline {
+                    still_running += 1;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
+        }
+        still_running
+    }
+}
+
 struct OutstandingIrp {
     #[allow(dead_code)]
     completion_id: u32,
@@ -121,6 +184,13 @@ pub(crate) struct SmartcardDevice {
 
     /// Tracker for outstanding IRPs
     pub(crate) outstanding: Arc<OutstandingIrpTracker>,
+
+    /// Liveness gate: cleared by free_handler before teardown so no
+    /// IRP-executing thread Completes an IRP afterwards.
+    pub(crate) liveness: Arc<DeviceLiveness>,
+
+    /// JoinHandles of detached status threads (joined on teardown).
+    pub(crate) status_threads: Arc<StatusThreads>,
 }
 
 // SAFETY: SmartcardDevice is only accessed from FreeRDP callback threads
@@ -384,6 +454,8 @@ pub(crate) fn device_thread_main(
     integration: Arc<dyn SmartcardIntegration>,
     contexts: Arc<Mutex<HashMap<u64, ContextEntry>>>,
     outstanding: Arc<OutstandingIrpTracker>,
+    liveness: Arc<DeviceLiveness>,
+    status_threads: Arc<StatusThreads>,
 ) {
     log::info!("smartcard: device thread started");
 
@@ -410,7 +482,16 @@ pub(crate) fn device_thread_main(
                 card,
                 TRANSACTION_IDLE_TIMEOUT
             );
-            unsafe { run_parked(&mut gate, &integration, &contexts, &outstanding) };
+            unsafe {
+                run_parked(
+                    &mut gate,
+                    &integration,
+                    &contexts,
+                    &outstanding,
+                    &liveness,
+                    &status_threads,
+                )
+            };
         }
 
         match work {
@@ -421,7 +502,15 @@ pub(crate) fn device_thread_main(
             Some(IrpWork::Process(irp)) => {
                 if let Some(request) = unsafe { decode_irp(irp) } {
                     unsafe {
-                        handle_request(request, &mut gate, &integration, &contexts, &outstanding)
+                        handle_request(
+                            request,
+                            &mut gate,
+                            &integration,
+                            &contexts,
+                            &outstanding,
+                            &liveness,
+                            &status_threads,
+                        )
                     };
                 }
             }
@@ -468,11 +557,22 @@ unsafe fn handle_request(
     integration: &Arc<dyn SmartcardIntegration>,
     contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
     outstanding: &Arc<OutstandingIrpTracker>,
+    liveness: &Arc<DeviceLiveness>,
+    status_threads: &Arc<StatusThreads>,
 ) {
     let (ioctl, card, context) = (request.ioctl(), request.card(), request.context());
 
     if is_status_change(ioctl) {
-        unsafe { run_detached(request, integration, contexts, outstanding) };
+        unsafe {
+            run_detached(
+                request,
+                integration,
+                contexts,
+                outstanding,
+                liveness,
+                status_threads,
+            )
+        };
         return;
     }
 
@@ -487,18 +587,27 @@ unsafe fn handle_request(
         return;
     }
 
-    let result = unsafe { execute_request(request, integration, contexts, outstanding) };
+    let result = unsafe { execute_request(request, integration, contexts, outstanding, liveness) };
     gate.on_completed(ioctl, card, context, result, Instant::now());
 
     // SCardCancel only interrupts blocking status waits, so a CANCEL leaves parked
     // requests alone; once the context is gone they can never run.
     if ioctl == SCARD_IOCTL_RELEASECONTEXT && result == SCARD_S_SUCCESS {
         for parked in gate.take_context(context) {
-            unsafe { complete_without_running(parked, SCARD_E_CANCELLED) };
+            unsafe { complete_without_running(parked, SCARD_E_CANCELLED, liveness) };
         }
     }
 
-    unsafe { run_parked(gate, integration, contexts, outstanding) };
+    unsafe {
+        run_parked(
+            gate,
+            integration,
+            contexts,
+            outstanding,
+            liveness,
+            status_threads,
+        )
+    };
 }
 
 fn is_status_change(ioctl: u32) -> bool {
@@ -512,13 +621,19 @@ unsafe fn run_detached(
     integration: &Arc<dyn SmartcardIntegration>,
     contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
     outstanding: &Arc<OutstandingIrpTracker>,
+    liveness: &Arc<DeviceLiveness>,
+    status_threads: &Arc<StatusThreads>,
 ) {
     outstanding.register(request.operation.completionID);
 
     let slot = Arc::new(Mutex::new(Some(request)));
     let worker_slot = slot.clone();
-    let (worker_integration, worker_contexts, worker_outstanding) =
-        (integration.clone(), contexts.clone(), outstanding.clone());
+    let (worker_integration, worker_contexts, worker_outstanding, worker_liveness) = (
+        integration.clone(),
+        contexts.clone(),
+        outstanding.clone(),
+        liveness.clone(),
+    );
 
     let spawned = std::thread::Builder::new()
         .name("scard-status".into())
@@ -530,15 +645,19 @@ unsafe fn run_detached(
                         &worker_integration,
                         &worker_contexts,
                         &worker_outstanding,
+                        &worker_liveness,
                     )
                 };
             }
         });
 
-    if let Err(error) = spawned {
-        log::error!("smartcard: cannot start the status thread ({error}), running inline");
-        if let Some(request) = slot.lock().unwrap().take() {
-            unsafe { execute_request(request, integration, contexts, outstanding) };
+    match spawned {
+        Ok(handle) => status_threads.push(handle),
+        Err(error) => {
+            log::error!("smartcard: cannot start the status thread ({error}), running inline");
+            if let Some(request) = slot.lock().unwrap().take() {
+                unsafe { execute_request(request, integration, contexts, outstanding, liveness) };
+            }
         }
     }
 }
@@ -549,10 +668,14 @@ unsafe fn run_parked(
     integration: &Arc<dyn SmartcardIntegration>,
     contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
     outstanding: &Arc<OutstandingIrpTracker>,
+    liveness: &Arc<DeviceLiveness>,
+    status_threads: &Arc<StatusThreads>,
 ) {
+    let _ = status_threads; // parked requests run inline on the device thread
     while let Some((ioctl, card, context, parked)) = gate.next_runnable() {
         log::trace!("smartcard: {} card=0x{:X} resumed", ioctl_name(ioctl), card);
-        let result = unsafe { execute_request(parked, integration, contexts, outstanding) };
+        let result =
+            unsafe { execute_request(parked, integration, contexts, outstanding, liveness) };
         gate.on_completed(ioctl, card, context, result, Instant::now());
     }
 }
@@ -592,8 +715,20 @@ unsafe fn decode_irp(irp: *mut IRP) -> Option<Request> {
 }
 
 /// Completes a parked request with `return_code` without calling the integration.
-unsafe fn complete_without_running(request: Request, return_code: u32) {
+unsafe fn complete_without_running(
+    request: Request,
+    return_code: u32,
+    liveness: &Arc<DeviceLiveness>,
+) {
     let Request { irp, mut operation } = request;
+    if !liveness.is_alive() {
+        log::warn!(
+            "smartcard: dropping parked IRP completion_id={}: device torn down",
+            operation.completionID
+        );
+        unsafe { freerdp_sys::smartcard_operation_free(&mut operation, 0) };
+        return;
+    }
     log::trace!(
         "smartcard: {} card=0x{:X} completed without running: 0x{:08X}",
         ioctl_name(operation.ioControlCode),
@@ -633,6 +768,7 @@ unsafe fn execute_request(
     integration: &Arc<dyn SmartcardIntegration>,
     contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
     outstanding: &Arc<OutstandingIrpTracker>,
+    liveness: &Arc<DeviceLiveness>,
 ) -> u32 {
     let Request { irp, mut operation } = request;
     let ioctl = operation.ioControlCode;
@@ -659,12 +795,39 @@ unsafe fn execute_request(
 
     let _cancel_token = outstanding.register(completion_id);
 
+    // Teardown gate: if the device is already being freed, do NOT touch the
+    // IRP's output stream or Complete — upstream may have freed them. Drop
+    // the request (free only our decoded operation) and log.
+    if !liveness.is_alive() {
+        log::warn!(
+            "smartcard: dropping IRP completion_id={} ({}): device torn down",
+            completion_id,
+            ioctl_name(ioctl)
+        );
+        unsafe { freerdp_sys::smartcard_operation_free(&mut operation, 0) };
+        outstanding.complete(completion_id);
+        return SCARD_E_CANCELLED;
+    }
+
     let mut io_status = crate::integrations::smartcard::STATUS_SUCCESS as i32;
     let body_pos = unsafe { begin_response((*irp).output) };
 
     let return_code = dispatch_ioctl(ioctl, &operation, integration, contexts, unsafe {
         (*irp).output
     });
+
+    // Re-check after the (possibly blocking) backend call: teardown may have
+    // begun while we were inside the integration. If so, do not Complete.
+    if !liveness.is_alive() {
+        log::warn!(
+            "smartcard: suppressing IRP completion_id={} ({}): device torn down during backend call",
+            completion_id,
+            ioctl_name(ioctl)
+        );
+        unsafe { freerdp_sys::smartcard_operation_free(&mut operation, 0) };
+        outstanding.complete(completion_id);
+        return SCARD_E_CANCELLED;
+    }
 
     unsafe {
         end_response(
@@ -717,6 +880,11 @@ pub(crate) unsafe extern "C" fn free_handler(device: *mut DEVICE) -> UINT {
 
     let mut scard = unsafe { Box::from_raw(device as *mut SmartcardDevice) };
 
+    // Mark the device dead FIRST: every IRP-executing thread (device thread
+    // and detached status workers) checks this before touching the IRP's
+    // output stream / Complete, so none can Complete after teardown begins.
+    scard.liveness.mark_dead();
+
     // Un in-flight GET_STATUS_CHANGE may be blocked inside the integration. Take
     // a snapshot first so backend cancellation does not run while holding the
     // contexts mutex, then wait for the device thread to finish safely.
@@ -746,6 +914,20 @@ pub(crate) unsafe extern "C" fn free_handler(device: *mut DEVICE) -> UINT {
         if handle.join().is_err() {
             log::error!("smartcard: device thread panicked during shutdown");
         }
+    }
+
+    // Join the detached status threads (bounded). Their backend waits were
+    // cancelled above (integration.cancel + cancel_all); a well-behaved
+    // backend returns promptly. The liveness gate already prevents any
+    // Complete after teardown, so even a thread that overruns the bound
+    // cannot touch freed upstream state — it drops its request and exits.
+    let status_deadline = Instant::now() + Duration::from_secs(5);
+    let still_running = scard.status_threads.join_all(status_deadline);
+    if still_running > 0 {
+        log::warn!(
+            "smartcard: {still_running} status thread(s) still running at teardown bound; \
+             liveness gate prevents post-teardown IRP completion"
+        );
     }
 
     if !scard.outstanding.wait_idle(Duration::from_secs(2)) {
@@ -920,7 +1102,14 @@ mod tests {
         let outstanding_clone = outstanding.clone();
 
         let handle = std::thread::spawn(move || {
-            device_thread_main(rx, integration_clone, contexts_clone, outstanding_clone);
+            device_thread_main(
+                rx,
+                integration_clone,
+                contexts_clone,
+                outstanding_clone,
+                DeviceLiveness::new(),
+                StatusThreads::new(),
+            );
         });
 
         tx.send(IrpWork::Shutdown).unwrap();
@@ -939,7 +1128,14 @@ mod tests {
         let outstanding_clone = outstanding.clone();
 
         let handle = std::thread::spawn(move || {
-            device_thread_main(rx, integration_clone, contexts_clone, outstanding_clone);
+            device_thread_main(
+                rx,
+                integration_clone,
+                contexts_clone,
+                outstanding_clone,
+                DeviceLiveness::new(),
+                StatusThreads::new(),
+            );
         });
 
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1096,7 +1292,15 @@ mod tests {
         let fake = FakeIrp::new(100);
         let request = status_request(&fake, &contexts, 100, 0);
 
-        let rc = unsafe { execute_request(request, &integration, &contexts, &outstanding) };
+        let rc = unsafe {
+            execute_request(
+                request,
+                &integration,
+                &contexts,
+                &outstanding,
+                &DeviceLiveness::new(),
+            )
+        };
         assert_eq!(rc, SCARD_S_SUCCESS);
         assert_eq!(fake.completed(), vec![100]);
         assert!(fake.discarded().is_empty());
@@ -1115,7 +1319,16 @@ mod tests {
         let fake = FakeIrp::new(200);
         let request = status_request(&fake, &contexts, 200, 0);
 
-        unsafe { run_detached(request, &integration, &contexts, &outstanding) };
+        unsafe {
+            run_detached(
+                request,
+                &integration,
+                &contexts,
+                &outstanding,
+                &DeviceLiveness::new(),
+                &StatusThreads::new(),
+            )
+        };
         // The detached thread completes the IRP; wait for it (bounded).
         let deadline = Instant::now() + Duration::from_secs(5);
         while fake.completed().is_empty() {
@@ -1299,13 +1512,24 @@ mod tests {
         let (irp_tx, irp_rx) = flume::unbounded::<IrpWork>();
         let contexts = Arc::new(Mutex::new(HashMap::<u64, ContextEntry>::new()));
         let outstanding = Arc::new(OutstandingIrpTracker::new());
+        let liveness = DeviceLiveness::new();
+        let status_threads = StatusThreads::new();
         let integration_clone = integration.clone();
         let contexts_clone = contexts.clone();
         let outstanding_clone = outstanding.clone();
+        let liveness_clone = liveness.clone();
+        let status_threads_clone = status_threads.clone();
         let device_thread = std::thread::Builder::new()
             .name("smartcard-device-test".into())
             .spawn(move || {
-                device_thread_main(irp_rx, integration_clone, contexts_clone, outstanding_clone);
+                device_thread_main(
+                    irp_rx,
+                    integration_clone,
+                    contexts_clone,
+                    outstanding_clone,
+                    liveness_clone,
+                    status_threads_clone,
+                );
             })
             .unwrap();
         let mut device_box = Box::new(SmartcardDevice {
@@ -1315,6 +1539,8 @@ mod tests {
             irp_tx,
             device_thread: Some(device_thread),
             outstanding,
+            liveness,
+            status_threads,
         });
         device_box.device.type_ = crate::addins::smartcard::consts::RDPDR_DTYP_SMARTCARD;
         device_box.device.IRPRequest = Some(irp_request_handler);
@@ -1353,6 +1579,8 @@ mod tests {
                 &scard.integration,
                 &scard.contexts,
                 &scard.outstanding,
+                &scard.liveness,
+                &scard.status_threads,
             )
         };
 

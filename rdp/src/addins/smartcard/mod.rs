@@ -23,8 +23,8 @@ use crate::utils::log;
 
 use consts::RDPDR_DTYP_SMARTCARD;
 use device::{
-    ContextEntry, IrpWork, OutstandingIrpTracker, SmartcardDevice, device_thread_main,
-    free_handler, init_handler, irp_request_handler,
+    ContextEntry, DeviceLiveness, IrpWork, OutstandingIrpTracker, SmartcardDevice, StatusThreads,
+    device_thread_main, free_handler, init_handler, irp_request_handler,
 };
 
 // ---------------------------------------------------------------------------
@@ -70,15 +70,26 @@ pub unsafe extern "C" fn device_service_entry(
     let (irp_tx, irp_rx) = flume::unbounded::<IrpWork>();
     let contexts = Arc::new(Mutex::new(HashMap::<u64, ContextEntry>::new()));
     let outstanding = Arc::new(OutstandingIrpTracker::new());
+    let liveness = DeviceLiveness::new();
+    let status_threads = StatusThreads::new();
 
     let integration_clone = integration.clone();
     let contexts_clone = contexts.clone();
     let outstanding_clone = outstanding.clone();
+    let liveness_clone = liveness.clone();
+    let status_threads_clone = status_threads.clone();
 
     let device_thread = std::thread::Builder::new()
         .name("smartcard-device".to_string())
         .spawn(move || {
-            device_thread_main(irp_rx, integration_clone, contexts_clone, outstanding_clone);
+            device_thread_main(
+                irp_rx,
+                integration_clone,
+                contexts_clone,
+                outstanding_clone,
+                liveness_clone,
+                status_threads_clone,
+            );
         })
         .expect("failed to spawn smartcard device thread");
 
@@ -89,6 +100,8 @@ pub unsafe extern "C" fn device_service_entry(
         irp_tx,
         device_thread: Some(device_thread),
         outstanding,
+        liveness,
+        status_threads,
     });
 
     device_box.device.type_ = RDPDR_DTYP_SMARTCARD;
