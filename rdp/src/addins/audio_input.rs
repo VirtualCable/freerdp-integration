@@ -267,3 +267,438 @@ unsafe extern "C" fn free(device: *mut IAudinDevice) -> UINT {
     let _plugin = unsafe { Box::from_raw(device as *mut MicPlugin) };
     CHANNEL_RC_OK
 }
+
+#[cfg(test)]
+mod tests {
+    //! Characterization tests for the mic (audin) device contract as the
+    //! external consumer relies on it: format negotiation, the mono->stereo
+    //! reader relay (exact bytes, stereo AUDIO_FORMAT, userData forwarding),
+    //! MicConfig messages, and close/free semantics. Test-only: pins the
+    //! CURRENT observable behavior so the reader-lifetime fix (Fix B) can be
+    //! proven not to alter it.
+    use super::*;
+    use crate::integrations::AudioInputIntegration;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    // ── fakes ────────────────────────────────────────────────────────────
+
+    /// Captured receive-callback invocations: (format, data, userData).
+    type RecvSink = Arc<Mutex<Vec<(AUDIO_FORMAT, Vec<u8>, usize)>>>;
+
+    /// The receive callback FreeRDP passes to Open. Recovers the per-test
+    /// sink from the userData pointer (a leaked Box<RecvSink>), so calls
+    /// from the reader thread land in the right test. No globals.
+    unsafe extern "C" fn fake_receive(
+        format: *const AUDIO_FORMAT,
+        data: *const BYTE,
+        size: usize,
+        user_data: *mut std::ffi::c_void,
+    ) -> UINT {
+        let fmt = unsafe { *format };
+        let bytes = unsafe { std::slice::from_raw_parts(data, size) }.to_vec();
+        let sink = unsafe { &*(user_data as *const RecvSink) };
+        sink.lock().unwrap().push((fmt, bytes, user_data as usize));
+        CHANNEL_RC_OK
+    }
+
+    unsafe extern "C" fn failing_receive(
+        _format: *const AUDIO_FORMAT,
+        _data: *const BYTE,
+        _size: usize,
+        _user_data: *mut std::ffi::c_void,
+    ) -> UINT {
+        7 // non-OK: reader must stop relaying
+    }
+
+    #[derive(Debug)]
+    struct MockAudioInput {
+        calls: Mutex<Vec<String>>,
+        starts: AtomicU32,
+        stops: AtomicU32,
+        fail_start: bool,
+        data_tx: Mutex<Option<flume::Sender<Vec<u8>>>>,
+    }
+
+    impl MockAudioInput {
+        fn new(fail_start: bool) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                starts: AtomicU32::new(0),
+                stops: AtomicU32::new(0),
+                fail_start,
+                data_tx: Mutex::new(None),
+            })
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+        fn push(&self, data: Vec<u8>) {
+            let guard = self.data_tx.lock().unwrap();
+            guard
+                .as_ref()
+                .expect("start must have been called")
+                .send(data)
+                .expect("reader must still be receiving");
+        }
+    }
+
+    impl AudioInputIntegration for MockAudioInput {
+        fn start(
+            &self,
+            sample_rate: u32,
+            channels: u16,
+            bits_per_sample: u16,
+            frames_per_packet: u32,
+        ) -> anyhow::Result<flume::Receiver<Vec<u8>>> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            self.calls.lock().unwrap().push(format!(
+                "start:{sample_rate},{channels},{bits_per_sample},{frames_per_packet}"
+            ));
+            if self.fail_start {
+                anyhow::bail!("mock start failure");
+            }
+            let (tx, rx) = flume::unbounded();
+            *self.data_tx.lock().unwrap() = Some(tx);
+            Ok(rx)
+        }
+        fn stop(&self) {
+            self.stops.fetch_add(1, Ordering::SeqCst);
+            *self.data_tx.lock().unwrap() = None;
+            self.calls.lock().unwrap().push("stop".to_string());
+        }
+    }
+
+    fn pcm_format(rate: u32, channels: u16, bits: u16) -> AUDIO_FORMAT {
+        AUDIO_FORMAT {
+            wFormatTag: WAVE_FORMAT_PCM as u16,
+            nChannels: channels,
+            nSamplesPerSec: rate,
+            nAvgBytesPerSec: 0, // set_format must recompute
+            nBlockAlign: 0,     // set_format must recompute
+            wBitsPerSample: bits,
+            cbSize: 0,
+            data: std::ptr::null_mut(),
+        }
+    }
+
+    /// Heap MicPlugin wired exactly like mic_entry does, plus a real Rdp
+    /// owner behind a zeroed RdpContext (no FreeRDP connection needed:
+    /// owner_from_ctx only reads the owner back-pointer).
+    struct Harness {
+        plugin: *mut MicPlugin,
+        rdp: *mut crate::Rdp,
+        ctx: *mut crate::context::RdpContext,
+        mock: Arc<MockAudioInput>,
+        sink: RecvSink,
+        user_data: *mut std::ffi::c_void,
+        update_rx: flume::Receiver<crate::messaging::RdpMessage>,
+        freed: bool,
+    }
+
+    impl Harness {
+        fn new(fail_start: bool) -> Self {
+            let mock = MockAudioInput::new(fail_start);
+            let integrations = crate::integrations::RdpIntegrations {
+                audio_output: None,
+                audio_input: Some(mock.clone()),
+                webcam: None,
+                clipboard: None,
+                smartcard: None,
+                printer: None,
+            };
+            let (update_tx, update_rx) = flume::unbounded();
+            let (rdp, _command_tx) = crate::Rdp::new(
+                crate::settings::RdpSettings::default(),
+                update_tx,
+                true,
+                None,
+                integrations,
+            );
+            // Rdp is !Unpin (PhantomPinned): keep it at a stable heap address.
+            let rdp = Box::into_raw(Box::new(rdp));
+            let ctx = Box::into_raw(Box::new(crate::context::RdpContext {
+                common: unsafe { std::mem::zeroed() },
+                owner: rdp,
+            }));
+
+            let plugin = Box::into_raw(Box::new(MicPlugin {
+                iface: IAudinDevice {
+                    Open: Some(open),
+                    FormatSupported: Some(format_supported),
+                    SetFormat: Some(set_format),
+                    Close: Some(close),
+                    Free: Some(free),
+                },
+                rdpcontext: ctx as *mut freerdp_sys::rdpContext,
+                format: unsafe { std::mem::zeroed() },
+                frames_per_packet: 0,
+                audio_input: None,
+                stop_tx: None,
+            }));
+
+            // userData = leaked per-test sink; reclaimed in Drop.
+            let sink: RecvSink = Arc::new(Mutex::new(Vec::new()));
+            let user_data = Box::into_raw(Box::new(sink.clone())) as *mut std::ffi::c_void;
+
+            Self {
+                plugin,
+                rdp,
+                ctx,
+                mock,
+                sink,
+                user_data,
+                update_rx,
+                freed: false,
+            }
+        }
+
+        fn set_format(&self, fmt: &AUDIO_FORMAT, fps: u32) -> UINT {
+            unsafe { set_format(self.device(), fmt, fps) }
+        }
+        fn device(&self) -> *mut IAudinDevice {
+            self.plugin as *mut IAudinDevice
+        }
+        fn open(&self) -> UINT {
+            unsafe { open(self.device(), Some(fake_receive), self.user_data) }
+        }
+        fn open_with(&self, receive: AudinReceive) -> UINT {
+            unsafe { open(self.device(), receive, self.user_data) }
+        }
+        fn close(&self) -> UINT {
+            unsafe { close(self.device()) }
+        }
+        fn received(&self) -> Vec<(AUDIO_FORMAT, Vec<u8>, usize)> {
+            self.sink.lock().unwrap().clone()
+        }
+        fn mic_configs(&self) -> Vec<(u32, u32)> {
+            let mut out = Vec::new();
+            while let Ok(msg) = self.update_rx.try_recv() {
+                if let crate::messaging::RdpMessage::MicConfig {
+                    sample_rate,
+                    frames_per_packet,
+                } = msg
+                {
+                    out.push((sample_rate, frames_per_packet));
+                }
+            }
+            out
+        }
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.freed {
+                    let _ = free(self.device());
+                }
+                let _ = Box::from_raw(self.user_data as *mut RecvSink);
+                let _ = Box::from_raw(self.ctx);
+                let _ = Box::from_raw(self.rdp);
+            }
+        }
+    }
+
+    /// Wait until the reader has delivered n packets (bounded).
+    fn wait_received(h: &Harness, n: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while h.received().len() < n {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {n} packets, got {}",
+                h.received().len()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    // ── format negotiation ───────────────────────────────────────────────
+
+    #[test]
+    fn format_supported_pcm_mono_only() {
+        let h = Harness::new(false);
+        let ok = pcm_format(48000, 1, 16);
+        assert_ne!(unsafe { format_supported(h.device(), &ok) }, 0);
+        let stereo = pcm_format(48000, 2, 16);
+        assert_eq!(unsafe { format_supported(h.device(), &stereo) }, 0);
+        let non_pcm = AUDIO_FORMAT {
+            wFormatTag: 0x0055, // MP3
+            ..pcm_format(48000, 1, 16)
+        };
+        assert_eq!(unsafe { format_supported(h.device(), &non_pcm) }, 0);
+    }
+
+    #[test]
+    fn set_format_recomputes_align_and_rate_and_notifies() {
+        let h = Harness::new(false);
+        let fmt = pcm_format(48000, 1, 16);
+        assert_eq!(h.set_format(&fmt, 480), CHANNEL_RC_OK);
+        unsafe {
+            assert_eq!((*h.plugin).format.nBlockAlign, 2);
+            assert_eq!((*h.plugin).format.nAvgBytesPerSec, 96000);
+            assert_eq!((*h.plugin).frames_per_packet, 480);
+        }
+        assert_eq!(h.mic_configs(), vec![(48000, 480)]);
+    }
+
+    // ── open contract ────────────────────────────────────────────────────
+
+    #[test]
+    fn open_null_receive_is_ok_noop() {
+        let h = Harness::new(false);
+        assert_eq!(h.open_with(None), CHANNEL_RC_OK);
+        assert!(h.mock.calls().is_empty());
+    }
+
+    #[test]
+    fn open_start_failure_returns_error() {
+        let h = Harness::new(true);
+        h.set_format(&pcm_format(48000, 1, 16), 480);
+        assert_eq!(h.open(), 1);
+        assert_eq!(h.mock.starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn open_starts_integration_with_negotiated_format_and_notifies() {
+        let h = Harness::new(false);
+        h.set_format(&pcm_format(44100, 1, 16), 441);
+        assert_eq!(h.open(), CHANNEL_RC_OK);
+        assert_eq!(h.mock.calls(), vec!["start:44100,1,16,441"]);
+        // set_format + open each emit one MicConfig
+        assert_eq!(h.mic_configs(), vec![(44100, 441), (44100, 441)]);
+    }
+
+    // ── mono -> stereo relay (the consumer-visible audio contract) ──────
+
+    #[test]
+    fn mono_frames_are_duplicated_to_stereo_exact_bytes() {
+        let h = Harness::new(false);
+        h.set_format(&pcm_format(48000, 1, 16), 4); // 4 frames/packet, 2B each
+        assert_eq!(h.open(), CHANNEL_RC_OK);
+
+        // 4 mono samples: 0x1122, 0x3344, 0x5566, 0x7788 (LE)
+        let mono: Vec<u8> = vec![0x22, 0x11, 0x44, 0x33, 0x66, 0x55, 0x88, 0x77];
+        h.mock.push(mono);
+        wait_received(&h, 1);
+
+        let (fmt, data, ud) = &h.received()[0];
+        // stereo duplication, sample by sample
+        assert_eq!(
+            data,
+            &vec![
+                0x22, 0x11, 0x22, 0x11, //
+                0x44, 0x33, 0x44, 0x33, //
+                0x66, 0x55, 0x66, 0x55, //
+                0x88, 0x77, 0x88, 0x77,
+            ]
+        );
+        assert_eq!(fmt.wFormatTag, WAVE_FORMAT_PCM as u16);
+        assert_eq!(fmt.nChannels, 2);
+        assert_eq!(fmt.nSamplesPerSec, 48000);
+        assert_eq!(fmt.wBitsPerSample, 16);
+        assert_eq!(fmt.nBlockAlign, 4); // mono align 2 * 2
+        assert_eq!(fmt.nAvgBytesPerSec, 192000); // mono 96000 * 2
+        assert_eq!(fmt.cbSize, 0);
+        assert_eq!(*ud, h.user_data as usize);
+        h.close();
+    }
+
+    #[test]
+    fn short_mono_frame_is_padded_with_silence() {
+        let h = Harness::new(false);
+        h.set_format(&pcm_format(48000, 1, 16), 4);
+        assert_eq!(h.open(), CHANNEL_RC_OK);
+        // only 1 sample present; remaining 3 must be silence
+        h.mock.push(vec![0xAB, 0xCD]);
+        wait_received(&h, 1);
+        let (_, data, _) = &h.received()[0];
+        assert_eq!(
+            data,
+            &vec![
+                0xAB, 0xCD, 0xAB, 0xCD, //
+                0, 0, 0, 0, //
+                0, 0, 0, 0, //
+                0, 0, 0, 0,
+            ]
+        );
+        h.close();
+    }
+
+    #[test]
+    fn multiple_frames_relay_in_order() {
+        let h = Harness::new(false);
+        h.set_format(&pcm_format(48000, 1, 16), 2); // 2 frames x 2B = 4B mono
+        assert_eq!(h.open(), CHANNEL_RC_OK);
+        for i in 0..5u8 {
+            h.mock.push(vec![i, i, i, i]);
+        }
+        wait_received(&h, 5);
+        let got = h.received();
+        for (i, (_, data, _)) in got.iter().enumerate() {
+            let b = i as u8;
+            assert_eq!(data, &vec![b, b, b, b, b, b, b, b]);
+        }
+        h.close();
+    }
+
+    #[test]
+    fn receive_failure_stops_the_reader() {
+        let h = Harness::new(false);
+        h.set_format(&pcm_format(48000, 1, 16), 2);
+        assert_eq!(h.open_with(Some(failing_receive)), CHANNEL_RC_OK);
+        h.mock.push(vec![1, 2, 3, 4]);
+        // reader breaks on first non-OK; further pushes must not panic
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let tx = h.mock.data_tx.lock().unwrap().clone();
+        if let Some(tx) = tx {
+            let _ = tx.send(vec![5, 6, 7, 8]); // may fail if reader exited; fine
+        }
+        h.close();
+    }
+
+    // ── close / free contract ────────────────────────────────────────────
+
+    #[test]
+    fn close_stops_integration_and_returns_ok() {
+        let h = Harness::new(false);
+        h.set_format(&pcm_format(48000, 1, 16), 4);
+        assert_eq!(h.open(), CHANNEL_RC_OK);
+        assert_eq!(h.close(), CHANNEL_RC_OK);
+        assert_eq!(h.mock.stops.load(Ordering::SeqCst), 1);
+        assert!(h.mock.calls().contains(&"stop".to_string()));
+        unsafe {
+            assert!((*h.plugin).stop_tx.is_none());
+            assert!((*h.plugin).audio_input.is_none());
+        }
+    }
+
+    #[test]
+    fn close_without_open_is_ok_noop() {
+        let h = Harness::new(false);
+        assert_eq!(h.close(), CHANNEL_RC_OK);
+        assert_eq!(h.mock.stops.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn free_returns_ok() {
+        let mut h = Harness::new(false);
+        let rc = unsafe { free(h.device()) };
+        assert_eq!(rc, CHANNEL_RC_OK);
+        h.freed = true;
+    }
+
+    #[test]
+    fn invalid_format_reader_exits_without_relay() {
+        let h = Harness::new(false);
+        // sample_rate 0 -> reader thread must exit without relaying
+        h.set_format(&pcm_format(0, 1, 16), 4);
+        assert_eq!(h.open(), CHANNEL_RC_OK);
+        let tx = h.mock.data_tx.lock().unwrap().clone();
+        if let Some(tx) = tx {
+            let _ = tx.send(vec![0; 8]);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(h.received().is_empty());
+        h.close();
+    }
+}
