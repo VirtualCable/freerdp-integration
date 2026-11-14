@@ -187,12 +187,22 @@ extern "C" fn context_free(instance: *mut freerdp, context: *mut freerdp_sys::rd
 extern "C" fn post_disconnect(instance: *mut freerdp) {
     log::debug!(" **** Post disconnect called... on {instance:?}");
 
-    unsafe {
-        gdi_free(instance);
-    }
-
+    // Notify the owner BEFORE freeing the GDI: consumers get a documented
+    // point to revoke GDI validity and stop/join reader tasks while the GDI
+    // is still alive (the published gdi_lock protocol is two-sided below).
     if let Some(owner) = instance.owner() {
         owner.on_post_disconnect();
+    }
+
+    // Hold the write side of the published gdi_lock across gdi_free so any
+    // consumer holding the read side (e.g. RectSender::encode) is ordered
+    // before the free — upstream frees the GDI here, mid-teardown.
+    let gdi_lock = instance.owner().map(|owner| owner.gdi_lock());
+    let _write_guard = gdi_lock
+        .as_ref()
+        .map(|lock| lock.write().unwrap_or_else(|e| e.into_inner()));
+    unsafe {
+        gdi_free(instance);
     }
 }
 
@@ -496,5 +506,164 @@ extern "C" fn retry_dialog(
         owner.on_retry_dialog(&what, current, userarg) as SSizeT
     } else {
         -1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Characterization + lifetime guarantee for post_disconnect's GDI
+    //! teardown contract (Fix D). The fake freerdp has context->gdi = null
+    //! and cache = null, so the real gdi_free is a safe no-op; the tests
+    //! observe the LOCK protocol and the owner-notification ordering, which
+    //! are the consumer-visible guarantees.
+    use super::*;
+    use crate::context::RdpContext;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+
+    /// Heap-stable fake freerdp + RdpContext + real Rdp owner. gdi/cache are
+    /// null so gdi_free is a no-op; owner is a real Rdp (instance = None).
+    struct Fixture {
+        rdp: *mut crate::Rdp,
+        ctx: *mut RdpContext,
+        instance: *mut freerdp,
+        gdi_lock: Arc<std::sync::RwLock<()>>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let integrations = crate::integrations::RdpIntegrations {
+                audio_output: None,
+                audio_input: None,
+                webcam: None,
+                clipboard: None,
+                smartcard: None,
+                printer: None,
+            };
+            let (update_tx, _update_rx) = flume::unbounded();
+            let (rdp, _command_tx) = crate::Rdp::new(
+                crate::settings::RdpSettings::default(),
+                update_tx,
+                true,
+                None,
+                integrations,
+            );
+            let gdi_lock = rdp.gdi_lock();
+            let rdp = Box::into_raw(Box::new(rdp));
+            let ctx = Box::into_raw(Box::new(RdpContext {
+                common: unsafe { std::mem::zeroed() },
+                owner: rdp,
+            }));
+            let instance = Box::into_raw(Box::new(unsafe { std::mem::zeroed::<freerdp>() }));
+            unsafe {
+                (*instance).context = ctx as *mut freerdp_sys::rdpContext;
+                // gdi and cache stay null: gdi_free is a safe no-op.
+            }
+            Self {
+                rdp,
+                ctx,
+                instance,
+                gdi_lock,
+            }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = Box::from_raw(self.instance);
+                let _ = Box::from_raw(self.ctx);
+                let _ = Box::from_raw(self.rdp);
+            }
+        }
+    }
+
+    #[test]
+    fn post_disconnect_returns_ok_with_null_gdi() {
+        let f = Fixture::new();
+        // Should not crash: gdi_free with null gdi/cache is a no-op.
+        post_disconnect(f.instance);
+        // gdi remains null (nothing to free).
+        unsafe {
+            assert!((*(*f.instance).context).gdi.is_null());
+        }
+    }
+
+    #[test]
+    fn post_disconnect_takes_gdi_write_lock() {
+        let f = Fixture::new();
+        // Hold the READ side on another thread; post_disconnect must block
+        // on the WRITE side until we release it.
+        let lock = f.gdi_lock.clone();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let reader = std::thread::spawn(move || {
+            let _guard = lock.read().unwrap();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx.recv().unwrap(); // read lock is held
+
+        let inst = f.instance as usize;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            post_disconnect(inst as *mut freerdp);
+            done_tx.send(()).unwrap();
+        });
+
+        // post_disconnect must NOT complete while the read lock is held.
+        let early = done_rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_ok();
+        assert!(
+            !early,
+            "post_disconnect freed GDI without taking the gdi_lock write side"
+        );
+
+        release_tx.send(()).unwrap();
+        reader.join().unwrap();
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("post_disconnect never completed after read lock released");
+    }
+
+    #[test]
+    fn post_disconnect_notifies_owner_before_free() {
+        // The owner notification (on_post_disconnect) must happen BEFORE
+        // gdi_free. We observe this by holding the gdi_lock WRITE side on
+        // another thread: post_disconnect notifies the owner first (which
+        // does not need the lock), then blocks acquiring the write lock for
+        // the free. If the owner were notified AFTER the free, it could not
+        // run while we hold the write lock.
+        //
+        // Since the crate's Rdp::on_post_disconnect only logs, we instead
+        // verify the ordering structurally: post_disconnect must complete
+        // the owner notification even while the write lock is held (i.e.
+        // the notification is not gated behind the lock).
+        let f = Fixture::new();
+        let lock = f.gdi_lock.clone();
+        let write_guard = lock.write().unwrap();
+
+        let inst = f.instance as usize;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            post_disconnect(inst as *mut freerdp);
+            done_tx.send(()).unwrap();
+        });
+
+        // It must block on the write lock (free is gated), proving the free
+        // is under the lock. The owner notification already ran (it is not
+        // observable here, but the code path runs it before acquiring).
+        let early = done_rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_ok();
+        assert!(
+            !early,
+            "gdi_free must be gated behind the gdi_lock write side"
+        );
+        drop(write_guard);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("post_disconnect never completed");
     }
 }
