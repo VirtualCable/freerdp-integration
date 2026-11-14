@@ -220,96 +220,114 @@ unsafe extern "C" fn open(
     let block_align = plugin.format.nBlockAlign * 2;
     let avg_bps = plugin.format.nAvgBytesPerSec * 2;
 
-    let reader = thread::spawn(move || {
-        let ud = user_data_usize as *mut std::ffi::c_void;
+    // Handle thread-creation failure as a recoverable error: a bare
+    // thread::spawn panics on failure, and a panic on FreeRDP's extern "C"
+    // C-stack aborts the whole process. Return an error UINT instead.
+    let reader = thread::Builder::new()
+        .name("mic-reader".to_string())
+        .spawn(move || {
+            let ud = user_data_usize as *mut std::ffi::c_void;
 
-        let stereo_fmt = AUDIO_FORMAT {
-            wFormatTag: format_tag,
-            nChannels: 2,
-            nSamplesPerSec: sample_rate_val,
-            nAvgBytesPerSec: avg_bps,
-            nBlockAlign: block_align,
-            wBitsPerSample: bits_val,
-            cbSize: 0,
-            data: std::ptr::null_mut(),
-        };
-
-        if sample_rate == 0 || fps == 0 {
-            log::error!("Mic reader: invalid format or frames_per_packet");
-            return;
-        }
-
-        let duration =
-            std::time::Duration::from_nanos((fps as u64 * 1_000_000_000) / sample_rate as u64);
-        let mono_packet_bytes = fps as usize * (bits as usize / 8);
-        let stereo_packet_bytes = mono_packet_bytes * 2;
-
-        log::info!(
-            "Mic reader thread started: rate={}, frames={}, duration={:?}",
-            sample_rate,
-            fps,
-            duration
-        );
-
-        loop {
-            // Wait for a data packet OR the stop signal, whichever comes
-            // first: close must wake the reader even if the consumer keeps
-            // its sender alive with no data flowing.
-            let mono_data = {
-                let mut slot: Option<Vec<u8>> = None;
-                let mut stopped = false;
-                flume::Selector::new()
-                    .recv(&data_rx, |r| {
-                        if let Ok(d) = r {
-                            slot = Some(d);
-                        }
-                    })
-                    .recv(&stop_rx, |_| {
-                        stopped = true;
-                    })
-                    .wait();
-                if stopped {
-                    break;
-                }
-                match slot {
-                    Some(d) => d,
-                    None => break, // data channel disconnected
-                }
+            let stereo_fmt = AUDIO_FORMAT {
+                wFormatTag: format_tag,
+                nChannels: 2,
+                nSamplesPerSec: sample_rate_val,
+                nAvgBytesPerSec: avg_bps,
+                nBlockAlign: block_align,
+                wBitsPerSample: bits_val,
+                cbSize: 0,
+                data: std::ptr::null_mut(),
             };
-            if stop_rx.try_recv().is_ok() {
-                break;
+
+            if sample_rate == 0 || fps == 0 {
+                log::error!("Mic reader: invalid format or frames_per_packet");
+                return;
             }
 
-            let mut stereo_data = Vec::with_capacity(stereo_packet_bytes);
-            let bytes_per_sample = (bits as usize) / 8;
-            for i in 0..fps as usize {
-                let start = i * bytes_per_sample;
-                let end = start + bytes_per_sample;
-                if end <= mono_data.len() {
-                    stereo_data.extend_from_slice(&mono_data[start..end]);
-                    stereo_data.extend_from_slice(&mono_data[start..end]);
-                } else {
-                    let silence = vec![0u8; bytes_per_sample];
-                    stereo_data.extend_from_slice(&silence);
-                    stereo_data.extend_from_slice(&silence);
-                }
-            }
+            let duration =
+                std::time::Duration::from_nanos((fps as u64 * 1_000_000_000) / sample_rate as u64);
+            let mono_packet_bytes = fps as usize * (bits as usize / 8);
+            let stereo_packet_bytes = mono_packet_bytes * 2;
 
-            unsafe {
-                let res = (receive_cb)(
-                    &stereo_fmt,
-                    stereo_data.as_ptr() as *const BYTE,
-                    stereo_data.len(),
-                    ud,
-                );
-                if res != CHANNEL_RC_OK {
-                    log::error!("Mic receive failed with {}", res);
+            log::info!(
+                "Mic reader thread started: rate={}, frames={}, duration={:?}",
+                sample_rate,
+                fps,
+                duration
+            );
+
+            loop {
+                // Wait for a data packet OR the stop signal, whichever comes
+                // first: close must wake the reader even if the consumer keeps
+                // its sender alive with no data flowing.
+                let mono_data = {
+                    let mut slot: Option<Vec<u8>> = None;
+                    let mut stopped = false;
+                    flume::Selector::new()
+                        .recv(&data_rx, |r| {
+                            if let Ok(d) = r {
+                                slot = Some(d);
+                            }
+                        })
+                        .recv(&stop_rx, |_| {
+                            stopped = true;
+                        })
+                        .wait();
+                    if stopped {
+                        break;
+                    }
+                    match slot {
+                        Some(d) => d,
+                        None => break, // data channel disconnected
+                    }
+                };
+                if stop_rx.try_recv().is_ok() {
                     break;
                 }
+
+                let mut stereo_data = Vec::with_capacity(stereo_packet_bytes);
+                let bytes_per_sample = (bits as usize) / 8;
+                for i in 0..fps as usize {
+                    let start = i * bytes_per_sample;
+                    let end = start + bytes_per_sample;
+                    if end <= mono_data.len() {
+                        stereo_data.extend_from_slice(&mono_data[start..end]);
+                        stereo_data.extend_from_slice(&mono_data[start..end]);
+                    } else {
+                        let silence = vec![0u8; bytes_per_sample];
+                        stereo_data.extend_from_slice(&silence);
+                        stereo_data.extend_from_slice(&silence);
+                    }
+                }
+
+                unsafe {
+                    let res = (receive_cb)(
+                        &stereo_fmt,
+                        stereo_data.as_ptr() as *const BYTE,
+                        stereo_data.len(),
+                        ud,
+                    );
+                    if res != CHANNEL_RC_OK {
+                        log::error!("Mic receive failed with {}", res);
+                        break;
+                    }
+                }
             }
+            log::info!("Mic reader thread ending");
+        });
+    let reader = match reader {
+        Ok(handle) => handle,
+        Err(e) => {
+            log::error!("Mic: failed to spawn reader thread ({e})");
+            if let Some(stop_tx) = plugin.stop_tx.take() {
+                let _ = stop_tx.send(());
+            }
+            if let Some(audio_input) = plugin.audio_input.take() {
+                audio_input.stop();
+            }
+            return freerdp_sys::CHANNEL_RC_NO_MEMORY;
         }
-        log::info!("Mic reader thread ending");
-    });
+    };
     plugin.reader_join = Some(reader);
 
     log::debug!(

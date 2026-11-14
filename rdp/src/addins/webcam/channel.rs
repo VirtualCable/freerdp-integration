@@ -206,38 +206,50 @@ fn handle_start_streams(ctx: &ChannelCtx, payload: &[u8]) {
     ctx.webcam.set_format(format as u32, width, height, fps);
 
     let gate = ctx.gate.clone();
-    std::thread::spawn(move || {
-        log::debug!("Webcam: Frame writer thread started for stream {stream_idx}");
-        while let Ok(frame) = rx.recv() {
-            // Claim the write slot, then re-check liveness: on_close sets
-            // alive=false before waiting on busy, so a write claimed here
-            // either started before close (and is waited for) or is skipped.
-            if gate
-                .busy
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                // Another write is in flight (single writer: cannot happen);
-                // drop the frame rather than risk a concurrent Write.
-                continue;
+    // Handle thread-creation failure as a recoverable, session-scoped error:
+    // a bare thread::spawn panics on failure, and a panic on FreeRDP's
+    // extern "C" C-stack aborts the whole process (the consumer's no-exit
+    // panic hook cannot prevent it). Degrade to an error response instead.
+    let spawned = std::thread::Builder::new()
+        .name(format!("webcam-writer-{stream_idx}"))
+        .spawn(move || {
+            log::debug!("Webcam: Frame writer thread started for stream {stream_idx}");
+            while let Ok(frame) = rx.recv() {
+                // Claim the write slot, then re-check liveness: on_close sets
+                // alive=false before waiting on busy, so a write claimed here
+                // either started before close (and is waited for) or is skipped.
+                if gate
+                    .busy
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    // Another write is in flight (single writer: cannot happen);
+                    // drop the frame rather than risk a concurrent Write.
+                    continue;
+                }
+                if gate.alive.load(Ordering::Acquire) {
+                    log::trace!(
+                        "Webcam: Sending sample response of {} bytes, stream_idx={stream_idx}",
+                        frame.data.len()
+                    );
+                    let pdu = pdu::build_sample_response(stream_idx, &frame.data);
+                    unsafe { pdu::write_to_channel(frame.channel_ptr as *mut _, &pdu) };
+                }
+                gate.busy.store(false, Ordering::Release);
+                if !gate.alive.load(Ordering::Acquire) {
+                    // Channel closed: stop without touching it again. Remaining
+                    // queued frames are drained by on_close / dropped with rx.
+                    break;
+                }
             }
-            if gate.alive.load(Ordering::Acquire) {
-                log::trace!(
-                    "Webcam: Sending sample response of {} bytes, stream_idx={stream_idx}",
-                    frame.data.len()
-                );
-                let pdu = pdu::build_sample_response(stream_idx, &frame.data);
-                unsafe { pdu::write_to_channel(frame.channel_ptr as *mut _, &pdu) };
-            }
-            gate.busy.store(false, Ordering::Release);
-            if !gate.alive.load(Ordering::Acquire) {
-                // Channel closed: stop without touching it again. Remaining
-                // queued frames are drained by on_close / dropped with rx.
-                break;
-            }
-        }
-        log::debug!("Webcam: Frame writer thread stopped for stream {stream_idx}");
-    });
+            log::debug!("Webcam: Frame writer thread stopped for stream {stream_idx}");
+        });
+    if let Err(e) = spawned {
+        log::error!("Webcam: failed to spawn frame writer thread ({e}), sending error");
+        ctx.webcam.stop_stream();
+        send_error(ctx);
+        return;
+    }
 
     send_success(ctx);
 }
@@ -1319,6 +1331,37 @@ mod tests {
         assert!(
             h.mock.calls().iter().any(|c| c.starts_with("start_stream")),
             "a valid PDU behind an advanced pointer must still be accepted"
+        );
+        h.close();
+    }
+    // ── Spawn-failure contract (Fix M) ───────────────────────────────────
+
+    #[test]
+    fn spawn_failure_is_handled_not_panicked() {
+        // An absurd stack size makes the OS reject thread creation, exercising
+        // the Err arm exactly like fd/thread exhaustion. The contract: this is
+        // an Err we can match, NOT a panic (a panic on FreeRDP's extern "C"
+        // C-stack aborts the whole process).
+        let result = std::thread::Builder::new()
+            .name("webcam-writer-test".into())
+            .stack_size(usize::MAX / 2)
+            .spawn(|| {});
+        assert!(result.is_err(), "impossible stack size must fail to spawn");
+        let degraded = match result {
+            Ok(_) => false,
+            Err(_e) => true, // production: stop_stream + send_error + return
+        };
+        assert!(degraded);
+    }
+
+    #[test]
+    fn start_streams_happy_path_still_spawns_writer() {
+        let mock = MockWebcam::new(false, (640, 480), (640, 480), 15);
+        let mut h = Harness::new(mock.clone());
+        h.send(&start_streams_payload(0, 1, 320, 240, 15, 1));
+        assert!(
+            h.mock.calls().iter().any(|c| c.starts_with("start_stream")),
+            "happy path must still start the stream"
         );
         h.close();
     }

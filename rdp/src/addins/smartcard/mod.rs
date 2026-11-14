@@ -16,7 +16,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use freerdp_sys::{CHANNEL_RC_OK, DEVICE, PDEVICE_SERVICE_ENTRY_POINTS, UINT};
+use freerdp_sys::{
+    CHANNEL_RC_NO_MEMORY, CHANNEL_RC_OK, DEVICE, PDEVICE_SERVICE_ENTRY_POINTS, UINT,
+};
 
 use crate::context::OwnerFromCtx;
 use crate::utils::log;
@@ -79,7 +81,10 @@ pub unsafe extern "C" fn device_service_entry(
     let liveness_clone = liveness.clone();
     let status_threads_clone = status_threads.clone();
 
-    let device_thread = std::thread::Builder::new()
+    // Handle thread-creation failure as a recoverable, session-scoped error:
+    // .expect panics, and a panic on FreeRDP's extern "C" C-stack aborts the
+    // whole process. Return CHANNEL_RC_NO_MEMORY instead.
+    let device_thread = match std::thread::Builder::new()
         .name("smartcard-device".to_string())
         .spawn(move || {
             device_thread_main(
@@ -90,8 +95,13 @@ pub unsafe extern "C" fn device_service_entry(
                 liveness_clone,
                 status_threads_clone,
             );
-        })
-        .expect("failed to spawn smartcard device thread");
+        }) {
+        Ok(handle) => handle,
+        Err(e) => {
+            log::error!("smartcard: failed to spawn device thread ({e})");
+            return CHANNEL_RC_NO_MEMORY;
+        }
+    };
 
     let mut device_box = Box::new(SmartcardDevice {
         device: unsafe { std::mem::zeroed() },

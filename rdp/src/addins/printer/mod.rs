@@ -78,12 +78,20 @@ pub unsafe extern "C" fn device_service_entry(
         let integration_clone = integration.clone();
         let printer_name = printer.name.clone();
 
-        let device_thread = std::thread::Builder::new()
+        // Handle thread-creation failure as a recoverable, session-scoped
+        // error: .expect panics, and a panic on FreeRDP's extern "C" C-stack
+        // aborts the whole process. Return CHANNEL_RC_NO_MEMORY instead.
+        let device_thread = match std::thread::Builder::new()
             .name(format!("printer-worker-{}", idx))
             .spawn(move || {
                 printer_thread_main(irp_rx, integration_clone, printer_name);
-            })
-            .expect("failed to spawn printer device worker thread");
+            }) {
+            Ok(handle) => handle,
+            Err(e) => {
+                log::error!("printer: failed to spawn worker thread ({e})");
+                return freerdp_sys::CHANNEL_RC_NO_MEMORY;
+            }
+        };
 
         let mut device_box = Box::new(PrinterDevice {
             device: unsafe { std::mem::zeroed() },
