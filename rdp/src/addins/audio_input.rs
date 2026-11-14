@@ -863,7 +863,7 @@ mod tests {
             ..Default::default()
         });
         hold.enabled.store(true, Ordering::SeqCst);
-        let mut h = Harness::with_hold(false, Some(hold.clone()));
+        let h = Harness::with_hold(false, Some(hold.clone()));
         h.set_format(&pcm_format(48000, 1, 16), 4);
         assert_eq!(h.open(), CHANNEL_RC_OK);
 
@@ -932,7 +932,7 @@ mod tests {
             ..Default::default()
         });
         hold.enabled.store(true, Ordering::SeqCst);
-        let mut h = Harness::with_hold(false, Some(hold.clone()));
+        let h = Harness::with_hold(false, Some(hold.clone()));
         h.set_format(&pcm_format(48000, 1, 16), 2);
         assert_eq!(h.open(), CHANNEL_RC_OK);
 

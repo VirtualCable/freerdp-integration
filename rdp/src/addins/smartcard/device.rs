@@ -1231,22 +1231,9 @@ mod tests {
     /// Build a GET_STATUS_CHANGE Request with a valid context registered
     /// and one reader state (the host always sends >= 1; a zero-reader
     /// response is too small for end_response's NDR header arithmetic).
-    /// The returned Request keeps the reader-state allocation alive via
-    /// `ReaderStateGuard` — drop it only AFTER execute_request completes.
-    struct ReaderStateGuard {
-        states: *mut freerdp_sys::SCARD_READERSTATEA,
-        name: *mut std::ffi::c_char,
-    }
-    impl Drop for ReaderStateGuard {
-        fn drop(&mut self) {
-            unsafe {
-                // execute_request already freed these via
-                // smartcard_operation_free; nothing to do. Kept as a
-                // marker type for clarity.
-            }
-        }
-    }
-
+    /// The reader-state allocations (strdup'd name + calloc'd array) are
+    /// reclaimed by smartcard_operation_free after execute_request packs
+    /// the response, mirroring the upstream decoder's ownership.
     fn status_request(
         fake: &FakeIrp,
         contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,

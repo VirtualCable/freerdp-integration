@@ -572,8 +572,7 @@ mod tests {
     //! are the consumer-visible guarantees.
     use super::*;
     use crate::context::RdpContext;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::{Arc, Condvar, Mutex};
+    use std::sync::Arc;
 
     /// Heap-stable fake freerdp + RdpContext + real Rdp owner. gdi/cache are
     /// null so gdi_free is a no-op; owner is a real Rdp (instance = None).
