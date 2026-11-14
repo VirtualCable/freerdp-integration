@@ -57,6 +57,10 @@ fn main() {
     // Generate bindings with bindgen
     // If wrapper.h changes, rerun this build script
     println!("cargo:rerun-if-changed=wrapper.h");
+    // If FREERDP_ROOT changes (e.g. switching between the system FreeRDP and a
+    // local install), rerun so bindgen and link paths are regenerated instead
+    // of silently reusing bindings from the other version.
+    println!("cargo:rerun-if-env-changed=FREERDP_ROOT");
 
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
