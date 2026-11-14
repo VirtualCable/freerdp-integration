@@ -24,7 +24,7 @@ use super::consts::{
     SCARD_IOCTL_GETSTATUSCHANGEA, SCARD_IOCTL_GETSTATUSCHANGEW, SCARD_IOCTL_RELEASECONTEXT,
     ioctl_name,
 };
-use super::handlers::dispatch_ioctl;
+use super::handlers::{CardCache, dispatch_ioctl};
 use super::transactions::{TRANSACTION_IDLE_TIMEOUT, TransactionGate};
 
 // ---------------------------------------------------------------------------
@@ -199,6 +199,11 @@ pub(crate) struct SmartcardDevice {
 
     /// JoinHandles of detached status threads (joined on teardown).
     pub(crate) status_threads: Arc<StatusThreads>,
+
+    /// Per-device READ_CACHE/WRITE_CACHE store (session-scoped, drained on
+    /// teardown). Replaces the former process-global cache that leaked
+    /// public-key material across sessions.
+    pub(crate) card_cache: CardCache,
 }
 
 // SAFETY: SmartcardDevice is only accessed from FreeRDP callback threads
@@ -464,6 +469,7 @@ pub(crate) fn device_thread_main(
     outstanding: Arc<OutstandingIrpTracker>,
     liveness: Arc<DeviceLiveness>,
     status_threads: Arc<StatusThreads>,
+    card_cache: CardCache,
 ) {
     log::info!("smartcard: device thread started");
 
@@ -498,6 +504,7 @@ pub(crate) fn device_thread_main(
                     &outstanding,
                     &liveness,
                     &status_threads,
+                    &card_cache,
                 )
             };
         }
@@ -518,6 +525,7 @@ pub(crate) fn device_thread_main(
                             &outstanding,
                             &liveness,
                             &status_threads,
+                            &card_cache,
                         )
                     };
                 }
@@ -559,6 +567,7 @@ impl Request {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn handle_request(
     request: Request,
     gate: &mut TransactionGate<Request>,
@@ -567,6 +576,7 @@ unsafe fn handle_request(
     outstanding: &Arc<OutstandingIrpTracker>,
     liveness: &Arc<DeviceLiveness>,
     status_threads: &Arc<StatusThreads>,
+    card_cache: &CardCache,
 ) {
     let (ioctl, card, context) = (request.ioctl(), request.card(), request.context());
 
@@ -579,6 +589,7 @@ unsafe fn handle_request(
                 outstanding,
                 liveness,
                 status_threads,
+                card_cache,
             )
         };
         return;
@@ -595,7 +606,16 @@ unsafe fn handle_request(
         return;
     }
 
-    let result = unsafe { execute_request(request, integration, contexts, outstanding, liveness) };
+    let result = unsafe {
+        execute_request(
+            request,
+            integration,
+            contexts,
+            outstanding,
+            liveness,
+            card_cache,
+        )
+    };
     gate.on_completed(ioctl, card, context, result, Instant::now());
 
     // SCardCancel only interrupts blocking status waits, so a CANCEL leaves parked
@@ -614,6 +634,7 @@ unsafe fn handle_request(
             outstanding,
             liveness,
             status_threads,
+            card_cache,
         )
     };
 }
@@ -631,16 +652,24 @@ unsafe fn run_detached(
     outstanding: &Arc<OutstandingIrpTracker>,
     liveness: &Arc<DeviceLiveness>,
     status_threads: &Arc<StatusThreads>,
+    card_cache: &CardCache,
 ) {
     outstanding.register(request.operation.completionID);
 
     let slot = Arc::new(Mutex::new(Some(request)));
     let worker_slot = slot.clone();
-    let (worker_integration, worker_contexts, worker_outstanding, worker_liveness) = (
+    let (
+        worker_integration,
+        worker_contexts,
+        worker_outstanding,
+        worker_liveness,
+        worker_card_cache,
+    ) = (
         integration.clone(),
         contexts.clone(),
         outstanding.clone(),
         liveness.clone(),
+        card_cache.clone(),
     );
 
     let spawned = std::thread::Builder::new()
@@ -654,6 +683,7 @@ unsafe fn run_detached(
                         &worker_contexts,
                         &worker_outstanding,
                         &worker_liveness,
+                        &worker_card_cache,
                     )
                 };
             }
@@ -664,7 +694,16 @@ unsafe fn run_detached(
         Err(error) => {
             log::error!("smartcard: cannot start the status thread ({error}), running inline");
             if let Some(request) = slot.lock().unwrap().take() {
-                unsafe { execute_request(request, integration, contexts, outstanding, liveness) };
+                unsafe {
+                    execute_request(
+                        request,
+                        integration,
+                        contexts,
+                        outstanding,
+                        liveness,
+                        card_cache,
+                    )
+                };
             }
         }
     }
@@ -678,12 +717,21 @@ unsafe fn run_parked(
     outstanding: &Arc<OutstandingIrpTracker>,
     liveness: &Arc<DeviceLiveness>,
     status_threads: &Arc<StatusThreads>,
+    card_cache: &CardCache,
 ) {
     let _ = status_threads; // parked requests run inline on the device thread
     while let Some((ioctl, card, context, parked)) = gate.next_runnable() {
         log::trace!("smartcard: {} card=0x{:X} resumed", ioctl_name(ioctl), card);
-        let result =
-            unsafe { execute_request(parked, integration, contexts, outstanding, liveness) };
+        let result = unsafe {
+            execute_request(
+                parked,
+                integration,
+                contexts,
+                outstanding,
+                liveness,
+                card_cache,
+            )
+        };
         gate.on_completed(ioctl, card, context, result, Instant::now());
     }
 }
@@ -777,6 +825,7 @@ unsafe fn execute_request(
     contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
     outstanding: &Arc<OutstandingIrpTracker>,
     liveness: &Arc<DeviceLiveness>,
+    card_cache: &CardCache,
 ) -> u32 {
     let Request { irp, mut operation } = request;
     let ioctl = operation.ioControlCode;
@@ -820,9 +869,14 @@ unsafe fn execute_request(
     let mut io_status = crate::integrations::smartcard::STATUS_SUCCESS as i32;
     let body_pos = unsafe { begin_response((*irp).output) };
 
-    let return_code = dispatch_ioctl(ioctl, &operation, integration, contexts, unsafe {
-        (*irp).output
-    });
+    let return_code = dispatch_ioctl(
+        ioctl,
+        &operation,
+        integration,
+        contexts,
+        card_cache,
+        unsafe { (*irp).output },
+    );
 
     // Re-check after the (possibly blocking) backend call: teardown may have
     // begun while we were inside the integration. If so, do not Complete.
@@ -1152,6 +1206,7 @@ mod tests {
                 outstanding_clone,
                 DeviceLiveness::new(),
                 StatusThreads::new(),
+                new_card_cache(),
             );
         });
 
@@ -1178,6 +1233,7 @@ mod tests {
                 outstanding_clone,
                 DeviceLiveness::new(),
                 StatusThreads::new(),
+                new_card_cache(),
             );
         });
 
@@ -1197,6 +1253,7 @@ mod tests {
     // entry is removed. Test-only: the lifetime fix (Fix C) must preserve
     // all of this while adding quiesce-on-teardown.
 
+    use super::super::handlers::new_card_cache;
     use crate::integrations::smartcard::{ReaderStateIn, ReaderStateOut, ScardContext};
     use std::sync::Condvar;
 
@@ -1329,6 +1386,7 @@ mod tests {
                 &contexts,
                 &outstanding,
                 &DeviceLiveness::new(),
+                &new_card_cache(),
             )
         };
         assert_eq!(rc, SCARD_S_SUCCESS);
@@ -1357,6 +1415,7 @@ mod tests {
                 &outstanding,
                 &DeviceLiveness::new(),
                 &StatusThreads::new(),
+                &new_card_cache(),
             )
         };
         // The detached thread completes the IRP; wait for it (bounded).
@@ -1566,6 +1625,7 @@ mod tests {
                     outstanding_clone,
                     liveness_clone,
                     status_threads_clone,
+                    new_card_cache(),
                 );
             })
             .unwrap();
@@ -1578,6 +1638,7 @@ mod tests {
             outstanding,
             liveness,
             status_threads,
+            card_cache: new_card_cache(),
         });
         device_box.device.type_ = crate::addins::smartcard::consts::RDPDR_DTYP_SMARTCARD;
         device_box.device.IRPRequest = Some(irp_request_handler);
@@ -1618,6 +1679,7 @@ mod tests {
                 &scard.outstanding,
                 &scard.liveness,
                 &scard.status_threads,
+                &scard.card_cache,
             )
         };
 
@@ -1714,6 +1776,7 @@ mod tests {
             outstanding,
             liveness,
             status_threads,
+            card_cache: new_card_cache(),
         });
         device_box.device.type_ = crate::addins::smartcard::consts::RDPDR_DTYP_SMARTCARD;
         device_box.device.IRPRequest = Some(irp_request_handler);

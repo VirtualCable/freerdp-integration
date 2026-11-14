@@ -74,12 +74,14 @@ pub unsafe extern "C" fn device_service_entry(
     let outstanding = Arc::new(OutstandingIrpTracker::new());
     let liveness = DeviceLiveness::new();
     let status_threads = StatusThreads::new();
+    let card_cache = handlers::new_card_cache();
 
     let integration_clone = integration.clone();
     let contexts_clone = contexts.clone();
     let outstanding_clone = outstanding.clone();
     let liveness_clone = liveness.clone();
     let status_threads_clone = status_threads.clone();
+    let card_cache_clone = card_cache.clone();
 
     // Handle thread-creation failure as a recoverable, session-scoped error:
     // .expect panics, and a panic on FreeRDP's extern "C" C-stack aborts the
@@ -94,6 +96,7 @@ pub unsafe extern "C" fn device_service_entry(
                 outstanding_clone,
                 liveness_clone,
                 status_threads_clone,
+                card_cache_clone,
             );
         }) {
         Ok(handle) => handle,
@@ -112,6 +115,7 @@ pub unsafe extern "C" fn device_service_entry(
         outstanding,
         liveness,
         status_threads,
+        card_cache,
     });
 
     device_box.device.type_ = RDPDR_DTYP_SMARTCARD;

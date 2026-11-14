@@ -974,17 +974,28 @@ mod drop_tests {
         rdp
     }
 
-    fn fd_count() -> usize {
-        std::fs::read_dir("/proc/self/fd")
-            .map(|d| d.count())
-            .unwrap_or(0)
+    /// Count only eventfd descriptors (what CreateEventW allocates on Unix),
+    /// not all fds: other tests open sockets/pipes concurrently, so a total
+    /// fd count is racy under parallel test execution. eventfd count is stable.
+    fn eventfd_count() -> usize {
+        let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+            return 0;
+        };
+        entries
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                std::fs::read_link(e.path())
+                    .map(|t| t.to_string_lossy().contains("eventfd"))
+                    .unwrap_or(false)
+            })
+            .count()
     }
 
     #[test]
     fn drop_reclaims_event_fds_no_leak() {
         // Warm up once (lazy winpr init may allocate persistent fds).
         drop(make_rdp());
-        let baseline = fd_count();
+        let baseline = eventfd_count();
         for _ in 0..16 {
             let rdp = make_rdp();
             // Touch both handles so they are realized.
@@ -992,7 +1003,7 @@ mod drop_tests {
             let _ = rdp.get_command_event().as_handle();
             drop(rdp);
         }
-        let after = fd_count();
+        let after = eventfd_count();
         // Without the fix, command_event leaks one fd per iteration (16+).
         // Allow a tiny slack for unrelated runtime fds.
         assert!(
@@ -1006,13 +1017,13 @@ mod drop_tests {
         // An Rdp that was never built (instance = None) must still reclaim its
         // events (the closes are outside the `if let Some(conn)` guard).
         drop(make_rdp());
-        let baseline = fd_count();
+        let baseline = eventfd_count();
         for _ in 0..16 {
             let rdp = make_rdp();
             assert!(rdp.instance.is_none());
             drop(rdp);
         }
-        let after = fd_count();
+        let after = eventfd_count();
         assert!(
             after <= baseline + 2,
             "unbuilt-instance event fds leaked: baseline={baseline}, after={after}"

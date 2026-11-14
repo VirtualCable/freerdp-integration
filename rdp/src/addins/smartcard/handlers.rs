@@ -34,6 +34,7 @@ pub(crate) fn dispatch_ioctl(
     operation: &freerdp_sys::SMARTCARD_OPERATION,
     integration: &Arc<dyn SmartcardIntegration>,
     contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
+    card_cache: &CardCache,
     out: *mut freerdp_sys::wStream,
 ) -> u32 {
     match ioctl {
@@ -86,12 +87,13 @@ pub(crate) fn dispatch_ioctl(
         SCARD_IOCTL_READCACHEA | SCARD_IOCTL_READCACHEW => handle_read_cache(
             integration,
             contexts,
+            card_cache,
             operation,
             out,
             ioctl == SCARD_IOCTL_READCACHEW,
         ),
         SCARD_IOCTL_WRITECACHEA | SCARD_IOCTL_WRITECACHEW => {
-            handle_write_cache(operation, ioctl == SCARD_IOCTL_WRITECACHEW)
+            handle_write_cache(card_cache, operation, ioctl == SCARD_IOCTL_WRITECACHEW)
         }
         SCARD_IOCTL_GETREADERICON => handle_get_reader_icon(operation, out),
         _ => {
@@ -997,9 +999,19 @@ fn handle_get_reader_icon(
 // READ_CACHE / WRITE_CACHE — key-value store so msclmd doesn't loop
 // ===========================================================================
 
-static CARD_CACHE: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<Vec<u16>, Vec<u8>>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+/// Per-device smartcard read/write cache (MS-RDPESC READ_CACHE/WRITE_CACHE).
+/// Scoped to the device instance (NOT process-global) so public-key material
+/// from one session is never readable by another session in the same gateway
+/// process. Drained in free_handler. Bounded to cap host-controlled growth.
+pub(crate) type CardCache =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Vec<u16>, Vec<u8>>>>;
+
+/// Hard cap on cache entries (host controls szLookupName keys and cbDataLen).
+pub(crate) const MAX_CARD_CACHE_ENTRIES: usize = 256;
+
+pub(crate) fn new_card_cache() -> CardCache {
+    std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
+}
 
 unsafe fn widestr_to_vec(ptr: *const u16) -> Vec<u16> {
     if ptr.is_null() {
@@ -1032,7 +1044,11 @@ fn widestr_debug(v: &[u16]) -> String {
     format!("\"{}\" [{}]", as_string, hex)
 }
 
-fn handle_write_cache(operation: &freerdp_sys::SMARTCARD_OPERATION, _is_wide: bool) -> u32 {
+fn handle_write_cache(
+    card_cache: &CardCache,
+    operation: &freerdp_sys::SMARTCARD_OPERATION,
+    _is_wide: bool,
+) -> u32 {
     let call = unsafe { &operation.call.writeCacheW };
     let name = unsafe { widestr_to_vec(call.szLookupName) };
     let pb = call.Common.pbData;
@@ -1047,13 +1063,22 @@ fn handle_write_cache(operation: &freerdp_sys::SMARTCARD_OPERATION, _is_wide: bo
         data.len(),
         name.len()
     );
-    CARD_CACHE.lock().unwrap().insert(name, data.to_vec());
+    let mut cache = card_cache.lock().unwrap();
+    // Bound host-controlled growth: evict an arbitrary entry on overflow.
+    if cache.len() >= MAX_CARD_CACHE_ENTRIES
+        && !cache.contains_key(&name)
+        && let Some(evict_key) = cache.keys().next().cloned()
+    {
+        cache.remove(&evict_key);
+    }
+    cache.insert(name, data.to_vec());
     SCARD_S_SUCCESS
 }
 
 fn handle_read_cache(
     integration: &Arc<dyn SmartcardIntegration>,
     contexts: &Arc<Mutex<HashMap<u64, ContextEntry>>>,
+    card_cache: &CardCache,
     operation: &freerdp_sys::SMARTCARD_OPERATION,
     out: *mut freerdp_sys::wStream,
     _is_wide: bool,
@@ -1062,7 +1087,7 @@ fn handle_read_cache(
     let name = unsafe { widestr_to_vec(call.szLookupName) };
 
     // Serve from the in-memory cache first.
-    let cached = CARD_CACHE.lock().unwrap().get(&name).cloned();
+    let cached = card_cache.lock().unwrap().get(&name).cloned();
 
     let data = match cached {
         Some(d) => d,
@@ -1078,7 +1103,7 @@ fn handle_read_cache(
                         generated.len(),
                         widestr_debug(&name)
                     );
-                    CARD_CACHE
+                    card_cache
                         .lock()
                         .unwrap()
                         .insert(name.clone(), generated.clone());
@@ -1234,5 +1259,80 @@ mod transmit_tests {
         let out = unsafe { freerdp_sys::Stream_New(std::ptr::null_mut(), 4096) };
         let _rc = handle_transmit(&integration, &op, out);
         unsafe { freerdp_sys::Stream_Free(out, 1) };
+    }
+}
+
+#[cfg(test)]
+mod card_cache_tests {
+    //! Card-cache scoping + bound (Fix U): the READ_CACHE/WRITE_CACHE store is
+    //! per-device (session-scoped), so public-key material written by one
+    //! session is never readable by another session's cache; and the cache is
+    //! bounded against host-controlled key growth.
+    use super::*;
+
+    fn write_op(name: &mut [u16], data: &mut [u8]) -> freerdp_sys::SMARTCARD_OPERATION {
+        let mut op: freerdp_sys::SMARTCARD_OPERATION = unsafe { std::mem::zeroed() };
+        op.call.writeCacheW.szLookupName = name.as_mut_ptr();
+        op.call.writeCacheW.Common.pbData = data.as_mut_ptr();
+        op.call.writeCacheW.Common.cbDataLen = data.len() as u32;
+        op
+    }
+
+    fn key(s: &str) -> Vec<u16> {
+        let mut v: Vec<u16> = s.encode_utf16().collect();
+        v.push(0);
+        v
+    }
+
+    #[test]
+    fn separate_device_caches_are_isolated() {
+        let cache_a = new_card_cache();
+        let cache_b = new_card_cache();
+        let mut name = key("CardPublicKey");
+        let mut data = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let op = write_op(&mut name, &mut data);
+
+        // Session A writes key material.
+        assert_eq!(handle_write_cache(&cache_a, &op, true), SCARD_S_SUCCESS);
+        assert!(
+            cache_a
+                .lock()
+                .unwrap()
+                .contains_key(&name[..name.len() - 1])
+        );
+        // Session B's cache must NOT contain session A's material.
+        assert!(
+            !cache_b
+                .lock()
+                .unwrap()
+                .contains_key(&name[..name.len() - 1]),
+            "cross-session cache leak: session B sees session A's key material"
+        );
+    }
+
+    #[test]
+    fn cache_is_bounded_under_host_key_flood() {
+        let cache = new_card_cache();
+        for i in 0..(MAX_CARD_CACHE_ENTRIES + 64) {
+            let mut name = key(&format!("key_{i}"));
+            let mut data = vec![i as u8; 8];
+            let op = write_op(&mut name, &mut data);
+            assert_eq!(handle_write_cache(&cache, &op, true), SCARD_S_SUCCESS);
+        }
+        assert!(
+            cache.lock().unwrap().len() <= MAX_CARD_CACHE_ENTRIES,
+            "card cache must be bounded against host key flood"
+        );
+    }
+
+    #[test]
+    fn write_then_read_same_device_roundtrips() {
+        let cache = new_card_cache();
+        let mut name = key("RoundTrip");
+        let mut data = vec![1, 2, 3, 4];
+        let op = write_op(&mut name, &mut data);
+        handle_write_cache(&cache, &op, true);
+        let stored = cache.lock().unwrap().get(&name[..name.len() - 1]).cloned();
+        assert_eq!(stored, Some(vec![1, 2, 3, 4]));
     }
 }
