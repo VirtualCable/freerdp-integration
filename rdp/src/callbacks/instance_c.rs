@@ -396,6 +396,20 @@ extern "C" fn gateway_authenticate(
     }
 }
 
+/// Decode a gateway consent message. Upstream passes `length_bytes` in BYTES,
+/// not WCHARs (the reference CLI divides by sizeof(WCHAR) before converting).
+/// Slicing `length_bytes` WCHARs would over-read 2x the host-supplied span.
+/// Pure: unit-testable without a FreeRDP connection.
+fn gateway_message_to_string(message: *const WCHAR, length_bytes: usize) -> String {
+    let wchar_len = length_bytes / std::mem::size_of::<WCHAR>();
+    if !message.is_null() && wchar_len > 0 {
+        let slice = unsafe { std::slice::from_raw_parts(message, wchar_len) };
+        String::from_utf16_lossy(slice)
+    } else {
+        String::new()
+    }
+}
+
 extern "C" fn present_gateway_message(
     instance: *mut freerdp,
     msg_type: UINT32,
@@ -406,20 +420,15 @@ extern "C" fn present_gateway_message(
 ) -> BOOL {
     log::debug!(" **** Present gateway message called... {instance:?}");
     if let Some(owner) = instance.owner() {
-        // Convert message to Rust string if needed, messages is in UTF-16 format
-        let message = if !message.is_null() && length > 0 {
-            let slice = unsafe { std::slice::from_raw_parts(message, length) };
-            String::from_utf16_lossy(slice)
-        } else {
-            String::new()
-        };
+        let wchar_len = length / std::mem::size_of::<WCHAR>();
+        let message = gateway_message_to_string(message, length);
 
         owner
             .on_present_gateway_message(
                 msg_type,
                 is_display_mandatory != 0,
                 is_consent_mandatory != 0,
-                length,
+                wchar_len,
                 message,
             )
             .into()
@@ -719,5 +728,41 @@ mod tests {
         done_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("post_disconnect never completed");
+    }
+    // ── Gateway consent message length contract (Fix S) ──────────────────
+
+    #[test]
+    fn gateway_message_length_is_bytes_not_wchars() {
+        // "Hi" as UTF-16LE = 2 WCHARs = 4 bytes. Upstream passes length=4.
+        let msg: Vec<u16> = "Hi".encode_utf16().collect();
+        let length_bytes = msg.len() * 2; // 4 bytes
+        let decoded = gateway_message_to_string(msg.as_ptr(), length_bytes);
+        assert_eq!(decoded, "Hi");
+    }
+
+    #[test]
+    fn gateway_message_unicode_decoded_correctly() {
+        let msg: Vec<u16> = "Consentimiento Ñ".encode_utf16().collect();
+        let length_bytes = msg.len() * 2;
+        let decoded = gateway_message_to_string(msg.as_ptr(), length_bytes);
+        assert_eq!(decoded, "Consentimiento Ñ");
+    }
+
+    #[test]
+    fn gateway_message_null_or_zero_is_empty() {
+        assert_eq!(gateway_message_to_string(std::ptr::null(), 100), "");
+        let msg: Vec<u16> = "X".encode_utf16().collect();
+        assert_eq!(gateway_message_to_string(msg.as_ptr(), 0), "");
+        // Odd byte count truncates to whole WCHARs (no over-read).
+        assert_eq!(gateway_message_to_string(msg.as_ptr(), 1), "");
+    }
+
+    #[test]
+    fn gateway_message_exact_buffer_no_overread() {
+        // Exact 2-WCHAR buffer; length in bytes = 4. Post-fix reads 2 WCHARs.
+        // Pre-fix read 4 WCHARs (2x over-read past the allocation).
+        let msg: Vec<u16> = vec![0x0041, 0x0042]; // "AB"
+        let decoded = gateway_message_to_string(msg.as_ptr(), 4);
+        assert_eq!(decoded, "AB");
     }
 }
