@@ -11,7 +11,9 @@ pub(crate) mod consts;
 pub(crate) mod device;
 pub(crate) mod handlers;
 
-use freerdp_sys::{CHANNEL_RC_NO_MEMORY, CHANNEL_RC_OK, DEVICE, PDEVICE_SERVICE_ENTRY_POINTS, UINT};
+use freerdp_sys::{
+    CHANNEL_RC_NO_MEMORY, CHANNEL_RC_OK, DEVICE, PDEVICE_SERVICE_ENTRY_POINTS, UINT,
+};
 
 use crate::context::OwnerFromCtx;
 use crate::utils::log;
@@ -72,7 +74,7 @@ pub unsafe extern "C" fn device_service_entry(
     };
 
     for (idx, printer) in printers.iter().enumerate() {
-        let (irp_tx, irp_rx) = flume::unbounded();
+        let (irp_tx, irp_rx) = flume::bounded(device::PRINTER_IRP_QUEUE_DEPTH);
         let integration_clone = integration.clone();
         let printer_name = printer.name.clone();
 
@@ -119,7 +121,8 @@ pub unsafe extern "C" fn device_service_entry(
         printer_bytes.extend_from_slice(&0u16.to_le_bytes());
 
         let total_stream_len = 24 + driver_bytes.len() + printer_bytes.len();
-        let data_stream = unsafe { freerdp_sys::Stream_New(std::ptr::null_mut(), total_stream_len) };
+        let data_stream =
+            unsafe { freerdp_sys::Stream_New(std::ptr::null_mut(), total_stream_len) };
         if data_stream.is_null() {
             log::error!("printer: Stream_New failed for device.data");
             unsafe {
@@ -162,7 +165,10 @@ pub unsafe extern "C" fn device_service_entry(
         let result = unsafe { register_fn(entry_points.devman, device_ptr) };
         if result == CHANNEL_RC_OK {
             let _ = Box::into_raw(device_box);
-            log::info!("printer: device for '{}' registered successfully", printer.name);
+            log::info!(
+                "printer: device for '{}' registered successfully",
+                printer.name
+            );
         } else {
             log::error!(
                 "printer: failed to register device for '{}': error {}",
