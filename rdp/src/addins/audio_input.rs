@@ -286,8 +286,28 @@ mod tests {
     /// Captured receive-callback invocations: (format, data, userData).
     type RecvSink = Arc<Mutex<Vec<(AUDIO_FORMAT, Vec<u8>, usize)>>>;
 
+    /// Optional hold: park the reader INSIDE the receive callback so a test
+    /// can run close()/free() while a callback is in flight — the exact UAF
+    /// window (upstream frees the audin plugin/callback right after Close).
+    /// Only packets of at least `min_size` bytes are held. Memory-safe: the
+    /// reader blocks on a condvar, nothing is freed underneath it.
+    #[derive(Default)]
+    struct RecvHold {
+        enabled: std::sync::atomic::AtomicBool,
+        min_size: usize,
+        entered: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        inflight: Arc<AtomicU32>,
+    }
+
+    /// Per-test receive state, recovered from the userData pointer.
+    struct RecvState {
+        sink: RecvSink,
+        hold: Option<Arc<RecvHold>>,
+    }
+
     /// The receive callback FreeRDP passes to Open. Recovers the per-test
-    /// sink from the userData pointer (a leaked Box<RecvSink>), so calls
+    /// state from the userData pointer (a leaked Box<RecvState>), so calls
     /// from the reader thread land in the right test. No globals.
     unsafe extern "C" fn fake_receive(
         format: *const AUDIO_FORMAT,
@@ -297,7 +317,26 @@ mod tests {
     ) -> UINT {
         let fmt = unsafe { *format };
         let bytes = unsafe { std::slice::from_raw_parts(data, size) }.to_vec();
-        let sink = unsafe { &*(user_data as *const RecvSink) };
+        // Clone the Arcs out first so the state stays alive even if the
+        // harness is dropped while we are parked (pre-fix RED run).
+        let (sink, hold) = unsafe {
+            let st = &*(user_data as *const RecvState);
+            (st.sink.clone(), st.hold.clone())
+        };
+        if let Some(hold) = &hold {
+            if hold.enabled.load(Ordering::SeqCst) && size >= hold.min_size.max(1) {
+                hold.inflight.fetch_add(1, Ordering::SeqCst);
+                let (lock, cvar) = &*hold.entered;
+                *lock.lock().unwrap() = true;
+                cvar.notify_all();
+                let (rlock, rcvar) = &*hold.release;
+                let mut released = rlock.lock().unwrap();
+                while !*released {
+                    released = rcvar.wait(released).unwrap();
+                }
+                hold.inflight.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
         sink.lock().unwrap().push((fmt, bytes, user_data as usize));
         CHANNEL_RC_OK
     }
@@ -398,6 +437,9 @@ mod tests {
 
     impl Harness {
         fn new(fail_start: bool) -> Self {
+            Self::with_hold(fail_start, None)
+        }
+        fn with_hold(fail_start: bool, hold: Option<Arc<RecvHold>>) -> Self {
             let mock = MockAudioInput::new(fail_start);
             let integrations = crate::integrations::RdpIntegrations {
                 audio_output: None,
@@ -437,9 +479,13 @@ mod tests {
                 stop_tx: None,
             }));
 
-            // userData = leaked per-test sink; reclaimed in Drop.
+            // userData = leaked per-test state; reclaimed in Drop.
             let sink: RecvSink = Arc::new(Mutex::new(Vec::new()));
-            let user_data = Box::into_raw(Box::new(sink.clone())) as *mut std::ffi::c_void;
+            let state = RecvState {
+                sink: sink.clone(),
+                hold,
+            };
+            let user_data = Box::into_raw(Box::new(state)) as *mut std::ffi::c_void;
 
             Self {
                 plugin,
@@ -492,7 +538,7 @@ mod tests {
                 if !self.freed {
                     let _ = free(self.device());
                 }
-                let _ = Box::from_raw(self.user_data as *mut RecvSink);
+                let _ = Box::from_raw(self.user_data as *mut RecvState);
                 let _ = Box::from_raw(self.ctx);
                 let _ = Box::from_raw(self.rdp);
             }
@@ -700,5 +746,186 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(h.received().is_empty());
         h.close();
+    }
+
+    // ── Lifetime guarantee (Fix B: reader quiesce on close) ──────────────
+    //
+    // NEW safety contract: when Close returns, no receive callback is in
+    // flight or will ever run again — upstream audin frees the plugin and
+    // its callback right after Close (FreeRDP 3.15 and 3.26), so any later
+    // (receive_cb)(...) is a use-after-free. Deterministic and memory-safe:
+    // the fake receive parks the reader on a condvar.
+    //
+    // Against UNFIXED code these FAIL (Close returns while the reader is
+    // still inside receive); against the join/quiesce fix they PASS.
+
+    /// Park the reader INSIDE receive, call close on another thread, and
+    /// require it not to return while the callback is in flight.
+    #[test]
+    fn close_waits_for_inflight_receive() {
+        let hold = Arc::new(RecvHold {
+            min_size: 1,
+            ..Default::default()
+        });
+        hold.enabled.store(true, Ordering::SeqCst);
+        let mut h = Harness::with_hold(false, Some(hold.clone()));
+        h.set_format(&pcm_format(48000, 1, 16), 4);
+        assert_eq!(h.open(), CHANNEL_RC_OK);
+
+        // One packet -> reader enters receive and parks there.
+        h.mock.push(vec![0xAA; 8]);
+        let (lock, cvar) = &*hold.entered;
+        let mut entered = lock.lock().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !*entered {
+            let now = std::time::Instant::now();
+            assert!(now < deadline, "reader never entered receive");
+            let (g, _) = cvar.wait_timeout(entered, deadline - now).unwrap();
+            entered = g;
+        }
+        drop(entered);
+        assert_eq!(hold.inflight.load(Ordering::SeqCst), 1);
+
+        // Close on a separate thread (post-fix it blocks until quiesced).
+        let dev = h.device() as usize;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rc = unsafe { close(dev as *mut IAudinDevice) };
+            let _ = done_tx.send(rc);
+        });
+
+        // Give the closer ample time to (incorrectly) return early.
+        let early_return = done_rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_ok();
+
+        // ALWAYS release the parked callback before asserting.
+        let (rlock, rcvar) = &*hold.release;
+        *rlock.lock().unwrap() = true;
+        rcvar.notify_all();
+
+        let rc = if early_return {
+            CHANNEL_RC_OK
+        } else {
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("close never returned after the in-flight receive completed")
+        };
+
+        // Let the released reader fully exit before any assertion unwinds.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !early_return,
+            "close returned while a receive callback was still in flight — \
+             upstream frees the plugin right after Close: use-after-free"
+        );
+        assert_eq!(rc, CHANNEL_RC_OK);
+        assert_eq!(hold.inflight.load(Ordering::SeqCst), 0);
+    }
+
+    /// Packets queued behind an in-flight receive must never be relayed
+    /// after close. The defect window is the callback itself: while the
+    /// reader is INSIDE receive (which can block in the host stack), close
+    /// returns and upstream frees the plugin; the receive still running is
+    /// a use-after-free, and its completion touches freed state. This test
+    /// pins that no receive is in flight when close returns, with queued
+    /// packets present (they must drop, not relay).
+    #[test]
+    fn close_drains_queued_packets_no_receive_after_close() {
+        let hold = Arc::new(RecvHold {
+            min_size: 1,
+            ..Default::default()
+        });
+        hold.enabled.store(true, Ordering::SeqCst);
+        let mut h = Harness::with_hold(false, Some(hold.clone()));
+        h.set_format(&pcm_format(48000, 1, 16), 2);
+        assert_eq!(h.open(), CHANNEL_RC_OK);
+
+        // Packet 0 parks the reader inside receive; packets 1..3 queue.
+        for i in 0..4u8 {
+            h.mock.push(vec![i; 4]);
+        }
+        let (lock, cvar) = &*hold.entered;
+        let mut entered = lock.lock().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !*entered {
+            let now = std::time::Instant::now();
+            assert!(now < deadline, "reader never entered receive");
+            let (g, _) = cvar.wait_timeout(entered, deadline - now).unwrap();
+            entered = g;
+        }
+        drop(entered);
+        assert_eq!(hold.inflight.load(Ordering::SeqCst), 1);
+
+        // Close on another thread; it must NOT return while receive is in
+        // flight (pre-fix it returns immediately -> early_return = true).
+        let dev = h.device() as usize;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rc = unsafe { close(dev as *mut IAudinDevice) };
+            let _ = done_tx.send(rc);
+        });
+        let early_return = done_rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_ok();
+
+        // Release the parked receive; the reader then sees the stop signal
+        // and exits without relaying the queued packets.
+        let (rlock, rcvar) = &*hold.release;
+        *rlock.lock().unwrap() = true;
+        rcvar.notify_all();
+        let rc = if early_return {
+            CHANNEL_RC_OK
+        } else {
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("close never returned after the in-flight receive completed")
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let got = h.received();
+        assert!(
+            !early_return,
+            "close returned while a receive callback was in flight with \
+             packets queued — use-after-free on the freed plugin"
+        );
+        assert_eq!(rc, CHANNEL_RC_OK);
+        assert_eq!(hold.inflight.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            got.len(),
+            1,
+            "queued packets must be drained, not relayed after close"
+        );
+        assert_eq!(got[0].1, vec![0u8; 8]); // packet 0, the in-flight one
+    }
+
+    /// A consumer packet racing in AFTER close must never reach the receive
+    /// callback. With the shipped stop-check right after recv, a packet
+    /// sent after close (reader parked in recv) is dropped by the stop
+    /// check — this test pins that behavior so the fix preserves it, and
+    /// also pins that close itself never leaves a receive in flight.
+    #[test]
+    fn late_packet_after_close_is_never_relayed() {
+        let h = Harness::new(false);
+        h.set_format(&pcm_format(48000, 1, 16), 2);
+        assert_eq!(h.open(), CHANNEL_RC_OK);
+        // Keep our own sender clone alive past close, like a consumer
+        // push_data path can.
+        let tx = h.mock.data_tx.lock().unwrap().clone().unwrap();
+        h.close();
+        // Reader is parked in recv; the late packet wakes it, the stop
+        // check fires, and nothing is relayed.
+        let _ = tx.send(vec![0xEE; 4]);
+        let settle = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        while h.received().len() < 1 && std::time::Instant::now() < settle {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let got = h.received();
+        drop(tx);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            got.is_empty(),
+            "a packet sent after close must never be relayed"
+        );
     }
 }
