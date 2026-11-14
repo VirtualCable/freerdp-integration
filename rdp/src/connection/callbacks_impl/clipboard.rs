@@ -169,15 +169,33 @@ impl ClipboardHandler for Rdp {
             {
                 match format {
                     RdpClipboardFormat::TextUnicode => {
-                        let clipboard_text = if let Some(ref clipboard_integration) =
-                            self.config.integrations.clipboard
-                        {
-                            clipboard_integration.get_text().unwrap_or_default()
-                        } else {
-                            String::new()
-                        };
+                        // Serve the ANNOUNCED snapshot, not a live re-read of
+                        // the local clipboard: a host FORMAT_DATA_REQUEST must
+                        // only receive what was announced (announce==serve
+                        // invariant). Re-reading get_text() live would disclose
+                        // un-announced local clipboard changes at host-chosen
+                        // moments. The snapshot is written by
+                        // send_text_is_available on announce.
+                        let clipboard_text = context.get_local_text();
+                        if clipboard_text.is_empty() {
+                            // No text was announced: refuse the request rather
+                            // than pulling live local content.
+                            log::debug!(
+                                "Clipboard: no announced text snapshot, refusing format data request"
+                            );
+                            let response_header = freerdp_sys::CLIPRDR_HEADER {
+                                msgType: 0,
+                                msgFlags: freerdp_sys::CB_RESPONSE_FAIL as u16,
+                                dataLen: 0,
+                            };
+                            let format_data_response = freerdp_sys::CLIPRDR_FORMAT_DATA_RESPONSE {
+                                common: response_header,
+                                requestedFormatData: std::ptr::null(),
+                            };
+                            return context.send_client_format_data_response(&format_data_response);
+                        }
 
-                        log::debug!("Providing clipboard text data: {}", clipboard_text);
+                        log::debug!("Providing announced clipboard text snapshot");
 
                         let mut text_bytes = clipboard_text.encode_utf16().collect::<Vec<u16>>();
                         text_bytes.push(0); // Add null terminator
@@ -244,5 +262,171 @@ impl ClipboardHandler for Rdp {
         }
 
         freerdp_sys::CHANNEL_RC_OK
+    }
+}
+
+#[cfg(test)]
+mod announce_serve_tests {
+    //! announce==serve invariant (Fix V): a host FORMAT_DATA_REQUEST must be
+    //! served from the ANNOUNCED snapshot (RdpClipboard.text), never a live
+    //! re-read of the local clipboard. With no announced text, the request is
+    //! refused (CB_RESPONSE_FAIL) rather than pulling live local content.
+    use super::*;
+    use crate::integrations::clipboard::{ClipboardCallback, ClipboardIntegration};
+    use std::sync::Mutex;
+
+    /// Clipboard whose LIVE get_text() differs from the announced snapshot,
+    /// so serving live vs snapshot is observable.
+    #[derive(Debug)]
+    struct LiveClipboard {
+        live: Mutex<String>,
+    }
+    impl ClipboardIntegration for LiveClipboard {
+        fn start(&self, _cb: Arc<dyn ClipboardCallback>) {}
+        fn stop(&self) {}
+        fn set_text(&self, text: &str) -> anyhow::Result<()> {
+            *self.live.lock().unwrap() = text.to_string();
+            Ok(())
+        }
+        fn get_text(&self) -> anyhow::Result<String> {
+            Ok(self.live.lock().unwrap().clone())
+        }
+    }
+
+    /// Fake CliprdrClientContext capturing the FormatDataResponse bytes.
+    struct RespSink {
+        responses: Mutex<Vec<(u16, Vec<u8>)>>, // (msgFlags, payload)
+    }
+    unsafe extern "C" fn rec_response(
+        ctx: *mut freerdp_sys::CliprdrClientContext,
+        resp: *const freerdp_sys::CLIPRDR_FORMAT_DATA_RESPONSE,
+    ) -> u32 {
+        let sink = unsafe { &*((*ctx).custom as *const RespSink) };
+        let flags = unsafe { (*resp).common.msgFlags };
+        let len = unsafe { (*resp).common.dataLen } as usize;
+        let ptr = unsafe { (*resp).requestedFormatData };
+        let bytes = if ptr.is_null() || len == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+        };
+        sink.responses.lock().unwrap().push((flags, bytes));
+        freerdp_sys::CHANNEL_RC_OK
+    }
+
+    struct Fixture {
+        rdp: *mut crate::Rdp,
+        ctx: *mut freerdp_sys::CliprdrClientContext,
+        sink: *mut RespSink,
+        live: Arc<LiveClipboard>,
+    }
+    impl Fixture {
+        fn new(live_text: &str) -> Self {
+            let live = Arc::new(LiveClipboard {
+                live: Mutex::new(live_text.to_string()),
+            });
+            let integrations = crate::integrations::RdpIntegrations {
+                audio_output: None,
+                audio_input: None,
+                webcam: None,
+                clipboard: Some(live.clone()),
+                smartcard: None,
+                printer: None,
+            };
+            let (update_tx, _rx) = flume::unbounded();
+            let (rdp, _cmd) = crate::Rdp::new(
+                crate::settings::RdpSettings::default(),
+                update_tx,
+                true,
+                None,
+                integrations,
+            );
+            let sink = Box::into_raw(Box::new(RespSink {
+                responses: Mutex::new(Vec::new()),
+            }));
+            let ctx = Box::into_raw(Box::new(unsafe {
+                std::mem::zeroed::<freerdp_sys::CliprdrClientContext>()
+            }));
+            unsafe {
+                (*ctx).custom = sink as *mut std::ffi::c_void;
+                (*ctx).ClientFormatDataResponse = Some(rec_response);
+            }
+            rdp.channels.write().unwrap().set_cliprdr_ptr(ctx);
+            let rdp = Box::into_raw(Box::new(rdp));
+            Self {
+                rdp,
+                ctx,
+                sink,
+                live,
+            }
+        }
+        fn responses(&self) -> Vec<(u16, Vec<u8>)> {
+            unsafe { (*self.sink).responses.lock().unwrap().clone() }
+        }
+        fn request(&self) -> u32 {
+            let req = freerdp_sys::CLIPRDR_FORMAT_DATA_REQUEST {
+                common: unsafe { std::mem::zeroed() },
+                requestedFormatId: freerdp_sys::CF_UNICODETEXT,
+            };
+            unsafe { (*self.rdp).on_receive_format_data_request(&req) }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = Box::from_raw(self.rdp);
+                let _ = Box::from_raw(self.ctx);
+                let _ = Box::from_raw(self.sink);
+            }
+        }
+    }
+
+    fn utf16_bytes(s: &str) -> Vec<u8> {
+        let mut v: Vec<u16> = s.encode_utf16().collect();
+        v.push(0);
+        v.iter().flat_map(|c| c.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn serves_announced_snapshot_not_live() {
+        let f = Fixture::new("LIVE-SECRET");
+        // Announce a snapshot distinct from the live clipboard.
+        unsafe {
+            (*f.rdp)
+                .channels
+                .read()
+                .unwrap()
+                .cliprdr()
+                .unwrap()
+                .send_text_is_available("ANNOUNCED");
+        }
+        // Live clipboard changes AFTER the announce (must not be disclosed).
+        *f.live.live.lock().unwrap() = "LIVE-CHANGED".to_string();
+        let rc = f.request();
+        assert_eq!(rc, freerdp_sys::CHANNEL_RC_OK);
+        let resp = f.responses();
+        assert_eq!(resp.len(), 1);
+        assert_eq!(resp[0].0, freerdp_sys::CB_RESPONSE_OK as u16);
+        assert_eq!(
+            resp[0].1,
+            utf16_bytes("ANNOUNCED"),
+            "must serve the announced snapshot, not the live clipboard"
+        );
+    }
+
+    #[test]
+    fn no_announced_text_refuses_request() {
+        let f = Fixture::new("LIVE-SECRET");
+        // No announce: snapshot is empty.
+        let rc = f.request();
+        assert_eq!(rc, freerdp_sys::CHANNEL_RC_OK);
+        let resp = f.responses();
+        assert_eq!(resp.len(), 1);
+        assert_eq!(
+            resp[0].0,
+            freerdp_sys::CB_RESPONSE_FAIL as u16,
+            "with no announced text the request must be refused, not served live"
+        );
+        assert!(resp[0].1.is_empty());
     }
 }

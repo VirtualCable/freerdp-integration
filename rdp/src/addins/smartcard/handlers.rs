@@ -1215,7 +1215,6 @@ mod transmit_tests {
     //! incoherent null-buffer-with-nonzero-length must be rejected before any
     //! backend read, and a null/zero buffer is a safe empty APDU.
     use super::*;
-    use crate::integrations::smartcard::ScardContext;
     use crate::integrations::smartcard::tests::dummy::DummySmartcardHandle;
 
     fn make_operation(send_buf: *mut u8, send_len: u32) -> freerdp_sys::SMARTCARD_OPERATION {
