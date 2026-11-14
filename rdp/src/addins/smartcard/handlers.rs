@@ -12,8 +12,9 @@ use std::time::Duration;
 
 use crate::integrations::SmartcardIntegration;
 use crate::integrations::smartcard::{
-    SCARD_E_INSUFFICIENT_BUFFER, SCARD_E_INVALID_HANDLE, SCARD_E_NO_READERS_AVAILABLE,
-    SCARD_E_UNSUPPORTED_FEATURE, SCARD_S_SUCCESS, SCARD_STATE_ATRMATCH,
+    SCARD_E_INSUFFICIENT_BUFFER, SCARD_E_INVALID_HANDLE, SCARD_E_INVALID_PARAMETER,
+    SCARD_E_NO_READERS_AVAILABLE, SCARD_E_UNSUPPORTED_FEATURE, SCARD_S_SUCCESS,
+    SCARD_STATE_ATRMATCH,
 };
 use crate::utils::log;
 
@@ -547,8 +548,24 @@ fn handle_transmit(
     );
 
     let send_pci = get_io_request(call.pioSendPci);
-    let send_data =
-        unsafe { std::slice::from_raw_parts(call.pbSendBuffer, call.cbSendLength as usize) };
+    // Mirror the sibling guards (handle_control / handle_set_attrib): upstream
+    // smartcard_unpack_transmit_call accepts a NULL pbSendBuffer NDR pointer
+    // and leaves pbSendBuffer=NULL while cbSendLength may be non-zero. A
+    // from_raw_parts on NULL is UB. Reject incoherent NDR (null buffer with a
+    // non-zero length) before any backend read; a null/zero buffer is an empty
+    // APDU slice.
+    if call.pbSendBuffer.is_null() && call.cbSendLength != 0 {
+        log::error!(
+            "smartcard: TRANSMIT rejected: null pbSendBuffer with cbSendLength={}",
+            call.cbSendLength
+        );
+        return SCARD_E_INVALID_PARAMETER;
+    }
+    let send_data = if call.pbSendBuffer.is_null() || call.cbSendLength == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(call.pbSendBuffer, call.cbSendLength as usize) }
+    };
 
     log::trace!(
         "smartcard: TRANSMIT APDU send ({} bytes): {}",
@@ -1163,5 +1180,59 @@ mod tests {
         let mut name: Vec<u16> = "Cached_ContainerInfo_".encode_utf16().collect();
         name.extend("１２".encode_utf16());
         assert_eq!(cached_container_info_index(&name), None);
+    }
+}
+
+#[cfg(test)]
+mod transmit_tests {
+    //! TRANSMIT null-buffer guard (Fix P): a host PDU may carry a NULL
+    //! pbSendBuffer NDR pointer. Building a slice from NULL is UB; an
+    //! incoherent null-buffer-with-nonzero-length must be rejected before any
+    //! backend read, and a null/zero buffer is a safe empty APDU.
+    use super::*;
+    use crate::integrations::smartcard::ScardContext;
+    use crate::integrations::smartcard::tests::dummy::DummySmartcardHandle;
+
+    fn make_operation(send_buf: *mut u8, send_len: u32) -> freerdp_sys::SMARTCARD_OPERATION {
+        let mut op: freerdp_sys::SMARTCARD_OPERATION = unsafe { std::mem::zeroed() };
+        op.call.transmit.cbSendLength = send_len;
+        op.call.transmit.pbSendBuffer = send_buf;
+        op.call.transmit.cbRecvLength = 256;
+        op
+    }
+
+    fn dummy() -> Arc<dyn SmartcardIntegration> {
+        Arc::new(DummySmartcardHandle::new())
+    }
+
+    #[test]
+    fn null_send_buffer_with_nonzero_length_is_rejected() {
+        let integration = dummy();
+        let op = make_operation(std::ptr::null_mut(), 16);
+        let out = unsafe { freerdp_sys::Stream_New(std::ptr::null_mut(), 4096) };
+        let rc = handle_transmit(&integration, &op, out);
+        // Rejected before any backend read (no NULL-slice UB).
+        assert_eq!(rc, SCARD_E_INVALID_PARAMETER);
+        unsafe { freerdp_sys::Stream_Free(out, 1) };
+    }
+
+    #[test]
+    fn null_send_buffer_with_zero_length_is_safe_empty_apdu() {
+        let integration = dummy();
+        let op = make_operation(std::ptr::null_mut(), 0);
+        let out = unsafe { freerdp_sys::Stream_New(std::ptr::null_mut(), 4096) };
+        // Must not panic (empty slice, not a NULL deref).
+        let _rc = handle_transmit(&integration, &op, out);
+        unsafe { freerdp_sys::Stream_Free(out, 1) };
+    }
+
+    #[test]
+    fn valid_send_buffer_is_forwarded_without_panic() {
+        let integration = dummy();
+        let mut apdu = vec![0x00u8, 0xA4, 0x04, 0x00, 0x02];
+        let op = make_operation(apdu.as_mut_ptr(), apdu.len() as u32);
+        let out = unsafe { freerdp_sys::Stream_New(std::ptr::null_mut(), 4096) };
+        let _rc = handle_transmit(&integration, &op, out);
+        unsafe { freerdp_sys::Stream_Free(out, 1) };
     }
 }
