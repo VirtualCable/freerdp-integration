@@ -101,8 +101,12 @@ pub trait InstanceCallbacks {
             data,
             length
         );
-        // For now, we accept all certificates. Implement proper verification as needed.
-        true
+        // Fail closed by default. This callback is only reached when FreeRDP's
+        // own verification did NOT fully succeed (chain not trusted by the
+        // system CA store, or hostname/IP mismatch). Accepting here would
+        // override that rejection and give false security. A real policy
+        // (pin / fingerprint allowlist / custom CA) must override this.
+        false
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -126,8 +130,10 @@ pub trait InstanceCallbacks {
             fingerprint,
             flags
         );
-        // For now, we accept all certificates. Implement proper verification as needed.
-        1
+        // Fail closed by default (0 = reject, no store). See
+        // on_verify_x509_certificate: this is only reached when FreeRDP's
+        // verification did not fully succeed; never accept-and-store (1).
+        0
     }
 
     fn on_logon_error_info(&mut self, data_str: &str, type_str: &str) -> bool {
@@ -227,5 +233,56 @@ pub trait InstanceCallbacks {
             userarg
         );
         -1 // Indicate no retry by default
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Certificate-verification contract (Fix J): the trait defaults must
+    //! fail closed. FreeRDP performs real verification (system CA store +
+    //! hostname/IP SAN match) when IgnoreCertificate=false (verify_cert=true);
+    //! these callbacks are only reached when that verification did NOT fully
+    //! succeed, so accepting here would override the rejection and give false
+    //! security. verify_cert=false sets IgnoreCertificate=true and FreeRDP
+    //! skips verification entirely (these callbacks are not invoked).
+    use super::*;
+
+    struct Dummy;
+    impl InstanceCallbacks for Dummy {}
+
+    #[test]
+    fn x509_default_rejects() {
+        let mut d = Dummy;
+        assert!(!d.on_verify_x509_certificate(std::ptr::null(), 0, "host.example", 3389, 0));
+    }
+
+    #[test]
+    fn x509_default_rejects_changed_cert() {
+        let mut d = Dummy;
+        // VERIFY_CERT_FLAG_CHANGED = 64: MitM / regenerated-cert signal.
+        assert!(!d.on_verify_x509_certificate(std::ptr::null(), 0, "host.example", 3389, 64));
+    }
+
+    #[test]
+    fn certificate_default_rejects_no_store() {
+        let mut d = Dummy;
+        // 0 = reject (not 1 = accept-and-store, not 2 = accept-temporary).
+        assert_eq!(
+            d.on_verify_certificate("host", 3389, "cn", "subj", "issuer", "fp", 0),
+            0
+        );
+    }
+
+    #[test]
+    fn certificate_default_rejects_changed() {
+        let mut d = Dummy;
+        assert_eq!(
+            d.on_verify_certificate("host", 3389, "cn", "subj", "issuer", "fp", 64),
+            0
+        );
+        assert_eq!(
+            d.on_verify_certificate("host", 3389, "cn", "subj", "issuer", "fp", 128),
+            0
+        );
     }
 }

@@ -324,7 +324,8 @@ extern "C" fn verify_x509_certificate(
             .on_verify_x509_certificate(data, length, &hostname, port, flags)
             .into()
     } else {
-        true.into()
+        // Fail closed: no owner means no verification policy -> reject.
+        false.into()
     }
 }
 
