@@ -37,6 +37,26 @@ pub struct MicPlugin {
 /// legitimate packet and keeps disconnect from stalling indefinitely.
 const READER_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Library-side audio format envelope. The RDP HOST negotiates
+/// sample_rate/bits/frames_per_packet; upstream FreeRDP stores them raw and
+/// never gates them, so the library must reject out-of-envelope values where
+/// they are ACCEPTED (set_format / format_supported), before the reader sizes
+/// its per-chunk buffer from them (Vec::with_capacity(fps * bits/8 * 2)).
+/// Same constants as the rdphtml5 consumer (PR-07): hi-res audio up to
+/// 192 kHz, 8/16/32-bit, and FreeRDP's own OPUS_MAX_FRAMES = 5760.
+const MAX_AUDIO_SAMPLE_RATE: u32 = 192_000;
+const MAX_AUDIO_FRAMES_PER_PACKET: u32 = 5760;
+
+/// Whether a host-negotiated mono PCM format is within the safe envelope.
+/// Pure: unit-testable without a FreeRDP connection.
+fn audio_format_in_envelope(sample_rate: u32, bits: u16, frames_per_packet: u32) -> bool {
+    sample_rate != 0
+        && sample_rate <= MAX_AUDIO_SAMPLE_RATE
+        && matches!(bits, 8 | 16 | 32)
+        && frames_per_packet != 0
+        && frames_per_packet <= MAX_AUDIO_FRAMES_PER_PACKET
+}
+
 pub unsafe extern "C" fn mic_entry(p_entry_points: PFREERDP_AUDIN_DEVICE_ENTRY_POINTS) -> UINT {
     if p_entry_points.is_null() {
         return 1;
@@ -85,6 +105,11 @@ unsafe extern "C" fn format_supported(
         if (*format).nChannels != 1 {
             return false.into();
         }
+        // Gate the format envelope here too: only 8/16/32-bit PCM mono is
+        // admissible (the reader duplicates mono->stereo for these widths).
+        if !matches!((*format).wBitsPerSample, 8 | 16 | 32) {
+            return false.into();
+        }
     }
     true.into()
 }
@@ -96,6 +121,18 @@ unsafe extern "C" fn set_format(
 ) -> UINT {
     let plugin = unsafe { &mut *(device as *mut MicPlugin) };
     let mut fmt = unsafe { *format };
+    // Reject out-of-envelope host values where they are ACCEPTED: upstream
+    // treats SetFormat != CHANNEL_RC_OK as fatal (audin_main.c), so a hostile
+    // fps/rate/bits never reaches the reader's per-chunk allocation.
+    if !audio_format_in_envelope(fmt.nSamplesPerSec, fmt.wBitsPerSample, frames_per_packet) {
+        log::error!(
+            "Mic set_format rejected: rate={} bits={} fps={} outside the safe envelope",
+            fmt.nSamplesPerSec,
+            fmt.wBitsPerSample,
+            frames_per_packet
+        );
+        return freerdp_sys::ERROR_INVALID_PARAMETER;
+    }
     fmt.nBlockAlign = (fmt.wBitsPerSample / 8) * fmt.nChannels;
     fmt.nAvgBytesPerSec = fmt.nSamplesPerSec * fmt.nBlockAlign as u32;
     plugin.format = fmt;
@@ -984,6 +1021,82 @@ mod tests {
         assert!(
             got.is_empty(),
             "a packet sent after close must never be relayed"
+        );
+    }
+    // ── Format-envelope guarantee (Fix H) ────────────────────────────────
+
+    #[test]
+    fn envelope_accepts_standard_formats() {
+        for (rate, bits, fps) in [
+            (8000, 16, 160),
+            (44100, 16, 441),
+            (48000, 16, 480),
+            (48000, 32, 960),
+            (192000, 32, 5760),
+            (8000, 8, 80),
+        ] {
+            assert!(
+                audio_format_in_envelope(rate, bits, fps),
+                "should accept rate={rate} bits={bits} fps={fps}"
+            );
+        }
+    }
+
+    #[test]
+    fn envelope_rejects_host_oversize_and_zero() {
+        assert!(!audio_format_in_envelope(48000, 16, u32::MAX));
+        assert!(!audio_format_in_envelope(48000, 16, 5761));
+        assert!(!audio_format_in_envelope(48000, 16, 0));
+        assert!(!audio_format_in_envelope(0, 16, 480));
+        assert!(!audio_format_in_envelope(192001, 16, 480));
+        assert!(!audio_format_in_envelope(48000, 24, 480));
+        assert!(!audio_format_in_envelope(48000, 0, 480));
+    }
+
+    #[test]
+    fn set_format_rejects_oversize_frames_per_packet() {
+        let h = Harness::new(false);
+        let fmt = pcm_format(48000, 1, 16);
+        assert_ne!(h.set_format(&fmt, u32::MAX), CHANNEL_RC_OK);
+        assert_ne!(h.set_format(&fmt, 5761), CHANNEL_RC_OK);
+        assert_ne!(h.set_format(&fmt, 0), CHANNEL_RC_OK);
+        assert!(h.mic_configs().is_empty());
+    }
+
+    #[test]
+    fn set_format_rejects_bad_rate_and_bits() {
+        let h = Harness::new(false);
+        assert_ne!(h.set_format(&pcm_format(0, 1, 16), 480), CHANNEL_RC_OK);
+        assert_ne!(h.set_format(&pcm_format(192001, 1, 16), 480), CHANNEL_RC_OK);
+        assert_ne!(h.set_format(&pcm_format(48000, 1, 24), 480), CHANNEL_RC_OK);
+        assert!(h.mic_configs().is_empty());
+    }
+
+    #[test]
+    fn set_format_accepts_valid_and_notifies() {
+        let h = Harness::new(false);
+        assert_eq!(h.set_format(&pcm_format(48000, 1, 16), 480), CHANNEL_RC_OK);
+        assert_eq!(h.mic_configs(), vec![(48000, 480)]);
+    }
+
+    #[test]
+    fn format_supported_gates_bits() {
+        let h = Harness::new(false);
+        assert_ne!(
+            unsafe { format_supported(h.device(), &pcm_format(48000, 1, 16)) },
+            0
+        );
+        assert_ne!(
+            unsafe { format_supported(h.device(), &pcm_format(48000, 1, 8)) },
+            0
+        );
+        assert_ne!(
+            unsafe { format_supported(h.device(), &pcm_format(48000, 1, 32)) },
+            0
+        );
+        assert_eq!(
+            unsafe { format_supported(h.device(), &pcm_format(48000, 1, 24)) },
+            0
         );
     }
 }
