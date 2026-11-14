@@ -47,6 +47,11 @@ impl RdpContext {
         };
 
         unsafe {
+            // Hold the provider-install lock across context_new + re-assert:
+            // freerdp_client_context_new re-registers the stock static loader
+            // into the process-global slot, and we must re-install our custom
+            // provider before any other session can observe the stock state.
+            let _install_guard = addin::lock_provider_install();
             let ctx_ptr = freerdp_client_context_new(&entry_points);
             if ctx_ptr.is_null() {
                 return Err(anyhow::anyhow!("Failed to create client context"));
