@@ -377,10 +377,29 @@ mod tests {
     /// fake is `#[repr(C)]` with the C struct first), so writes from ANY
     /// thread — including the detached writer thread — land in the right
     /// test's sink. No globals, tests run safely in parallel.
+    ///
+    /// `hold` (optional) lets a test deterministically park the writer
+    /// thread INSIDE a frame `Write`: on entry the thread increments
+    /// `inflight`, signals `entered`, then blocks until the test sets
+    /// `release`. Only PDUs larger than `min_size` are held — the 2-byte
+    /// Success/Error acks written synchronously by on_data must pass
+    /// through. This models an in-flight `(*channel).Write` at the moment
+    /// `on_close` runs — the exact UAF window — without any real freed
+    /// memory.
+    #[derive(Default)]
+    struct WriteHold {
+        enabled: std::sync::atomic::AtomicBool,
+        min_size: usize,
+        entered: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        inflight: Arc<AtomicU32>,
+    }
+
     #[repr(C)]
     struct FakeChannel {
         inner: freerdp_sys::IWTSVirtualChannel,
         sink: WriteSink,
+        hold: Option<Arc<WriteHold>>,
     }
 
     // The fake is shared with the writer thread in these tests.
@@ -395,20 +414,45 @@ mod tests {
         buffer: *const freerdp_sys::BYTE,
         _reserved: *mut std::ffi::c_void,
     ) -> freerdp_sys::UINT {
+        // Clone the Arcs out FIRST: pre-fix the harness may drop the fake
+        // while this call is still running (that is the UAF under test).
+        // Holding our own refs keeps sink/hold alive for the rest of the
+        // call, so the RED run fails on assertions, not on freed memory.
+        let (sink, hold) = unsafe {
+            let fake = &*(channel as *const FakeChannel);
+            (fake.sink.clone(), fake.hold.clone())
+        };
         let bytes = unsafe { std::slice::from_raw_parts(buffer, size as usize) }.to_vec();
-        let fake = unsafe { &*(channel as *const FakeChannel) };
-        fake.sink.lock().unwrap().push((channel as usize, bytes));
+        if let Some(hold) = &hold {
+            if hold.enabled.load(Ordering::SeqCst) && size as usize >= hold.min_size.max(1) {
+                hold.inflight.fetch_add(1, Ordering::SeqCst);
+                let (lock, cvar) = &*hold.entered;
+                *lock.lock().unwrap() = true;
+                cvar.notify_all();
+                let (rlock, rcvar) = &*hold.release;
+                let mut released = rlock.lock().unwrap();
+                while !*released {
+                    released = rcvar.wait(released).unwrap();
+                }
+                hold.inflight.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        sink.lock().unwrap().push((channel as usize, bytes));
         freerdp_sys::CHANNEL_RC_OK
     }
 
     impl FakeChannel {
         fn new(sink: WriteSink) -> Box<Self> {
+            Self::with_hold(sink, None)
+        }
+        fn with_hold(sink: WriteSink, hold: Option<Arc<WriteHold>>) -> Box<Self> {
             Box::new(FakeChannel {
                 inner: freerdp_sys::IWTSVirtualChannel {
                     Write: Some(fake_write),
                     Close: None,
                 },
                 sink,
+                hold,
             })
         }
         fn ptr(&mut self) -> *mut freerdp_sys::IWTSVirtualChannel {
@@ -568,15 +612,19 @@ mod tests {
         writes: WriteSink,
         channel_ptr: usize,
         // MUST outlive the writer thread: dropped only after close() has
-        // quiesced it (post-fix). Field order matters for Drop.
-        _channel: Box<FakeChannel>,
+        // quiesced it (post-fix). Option so guarantee tests can leak the
+        // fake (pre-fix the writer may still touch it after close).
+        _channel: Option<Box<FakeChannel>>,
         closed: bool,
     }
 
     impl Harness {
         fn new(mock: Arc<MockWebcam>) -> Self {
+            Self::with_hold(mock, None)
+        }
+        fn with_hold(mock: Arc<MockWebcam>, hold: Option<Arc<WriteHold>>) -> Self {
             let writes: WriteSink = Arc::new(Mutex::new(Vec::new()));
-            let mut channel = FakeChannel::new(writes.clone());
+            let mut channel = FakeChannel::with_hold(writes.clone(), hold);
             let channel_ptr = channel.ptr() as usize;
             let ctx = make_ctx(mock.clone(), channel.ptr());
             Self {
@@ -584,7 +632,7 @@ mod tests {
                 mock,
                 writes,
                 channel_ptr,
-                _channel: channel,
+                _channel: Some(channel),
                 closed: false,
             }
         }
@@ -626,6 +674,28 @@ mod tests {
                 h.written().len()
             );
             std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Pre-fix, on_close frees the ctx while the writer thread may still be
+    /// running (the very UAF under test). Give the detached writer a moment
+    /// to exit (rx disconnects on stop_stream) before the harness drops the
+    /// fake channel, so the RED run fails on assertions, not on allocator
+    /// corruption. Post-fix this is a no-op wait: the writer is already
+    /// quiesced when close returns.
+    fn settle_writer() {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    /// Leak the fake channel instead of freeing it. Pre-fix the writer
+    /// thread can still be inside `(*channel).Write` when the test ends —
+    /// freeing the fake then corrupts the allocator and masks the intended
+    /// assertion failure with SIGABRT. Leaking one small struct per
+    /// guarantee test keeps the RED run a clean FAILED. Post-fix nothing
+    /// references the channel after close, so this is merely conservative.
+    fn leak_fake(h: &mut Harness) {
+        if let Some(fake) = h._channel.take() {
+            let _ = Box::into_raw(fake);
         }
     }
 
@@ -877,5 +947,205 @@ mod tests {
         let rc = unsafe { on_open(h.ctx as *mut _) };
         assert_eq!(rc, freerdp_sys::CHANNEL_RC_OK);
         h.close();
+    }
+
+    // ── Lifetime guarantee (Fix A: writer quiesce on close) ──────────────
+    //
+    // These pin the NEW safety contract: when on_close returns, no frame
+    // Write is in flight or will ever run again on this channel — upstream
+    // dvcman frees the DVCMAN_CHANNEL right after OnClose returns (3.15 and
+    // 3.26), so any later (*channel).Write is a use-after-free. They are
+    // deterministic and memory-safe: the fake Write parks the writer thread
+    // on a condvar instead of touching freed memory.
+    //
+    // Against UNFIXED code they FAIL (on_close returns while the writer is
+    // still inside Write); against the WriterGate fix they PASS.
+
+    /// Park the writer INSIDE Write, call on_close on another thread, and
+    /// require it not to return while the write is in flight.
+    ///
+    /// The fake channel is leaked up front: pre-fix the writer may still
+    /// be inside Write when the test ends, and freeing the fake then would
+    /// corrupt the allocator (SIGABRT) instead of the intended assertion.
+    #[test]
+    fn on_close_waits_for_inflight_write() {
+        let hold = Arc::new(WriteHold {
+            min_size: 3, // hold frame PDUs only; 2-byte acks pass through
+            ..Default::default()
+        });
+        hold.enabled.store(true, Ordering::SeqCst);
+        let mock = MockWebcam::new(false, (640, 480), (640, 480), 15);
+        let mut h = Harness::with_hold(mock.clone(), Some(hold.clone()));
+        let ptr = h.channel_ptr;
+        leak_fake(&mut h); // keep the fake alive no matter how this test exits
+        h.send(&start_streams_payload(0, FMT_MJPG, 320, 240, 15, 1));
+
+        // One frame -> writer enters Write and parks there.
+        h.mock.send_frame(vec![0xAA; 32], ptr);
+        let (lock, cvar) = &*hold.entered;
+        let mut entered = lock.lock().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !*entered {
+            let now = std::time::Instant::now();
+            assert!(now < deadline, "writer never entered Write");
+            let (g, _) = cvar
+                .wait_timeout(entered, deadline - now)
+                .unwrap();
+            entered = g;
+        }
+        drop(entered);
+        assert_eq!(hold.inflight.load(Ordering::SeqCst), 1);
+
+        // Close on a separate thread (post-fix it blocks until quiesced).
+        // Raw pointers are not Send; the ctx is exclusively owned by the
+        // closer from here on (h.closed = true below).
+        let ctx_addr = h.ctx as usize;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rc = unsafe { on_close(ctx_addr as *mut IWTSVirtualChannelCallback) };
+            let _ = done_tx.send(rc);
+        });
+
+        // Give the closer ample time to (incorrectly) return early.
+        let early_return = done_rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_ok();
+
+        // ALWAYS release the parked write before asserting: pre-fix the
+        // writer would otherwise stay parked forever. Post-fix the closer
+        // is still waiting here and completes right after the release.
+        let (rlock, rcvar) = &*hold.release;
+        *rlock.lock().unwrap() = true;
+        rcvar.notify_all();
+
+        // Bounded wait for completion: if on_close never completes even
+        // after the write was released, fail instead of hanging the suite.
+        let rc = if early_return {
+            // Already returned; result was consumed by recv_timeout above.
+            freerdp_sys::CHANNEL_RC_OK
+        } else {
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("on_close never returned after the in-flight write completed")
+        };
+
+        // Let the released writer fully exit before any assertion can
+        // unwind (its rx disconnected on stop_stream).
+        settle_writer();
+        h.closed = true; // ctx freed by the closer thread
+        assert!(
+            !early_return,
+            "on_close returned while a frame Write was still in flight — \
+             upstream frees the channel right after OnClose: use-after-free"
+        );
+        assert_eq!(rc, freerdp_sys::CHANNEL_RC_OK);
+        assert_eq!(hold.inflight.load(Ordering::SeqCst), 0);
+    }
+
+    /// Frames queued behind an in-flight write must be DRAINED, not written
+    /// after close (their channel_ptr dies with the channel).
+    #[test]
+    fn on_close_drains_queued_frames_no_writes_after_close() {
+        let hold = Arc::new(WriteHold {
+            min_size: 3, // hold frame PDUs only; 2-byte acks pass through
+            ..Default::default()
+        });
+        hold.enabled.store(true, Ordering::SeqCst);
+        let mock = MockWebcam::new(false, (640, 480), (640, 480), 15);
+        let mut h = Harness::with_hold(mock.clone(), Some(hold.clone()));
+        let ptr = h.channel_ptr;
+        h.send(&start_streams_payload(0, FMT_MJPG, 320, 240, 15, 1));
+
+        // Frame 1 parks the writer inside Write; frames 2..4 queue behind.
+        for i in 0..4u8 {
+            h.mock.send_frame(vec![i; 32], ptr);
+        }
+        let (lock, cvar) = &*hold.entered;
+        let mut entered = lock.lock().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !*entered {
+            let now = std::time::Instant::now();
+            assert!(now < deadline, "writer never entered Write");
+            let (g, _) = cvar.wait_timeout(entered, deadline - now).unwrap();
+            entered = g;
+        }
+        drop(entered);
+
+        let ctx_addr = h.ctx as usize;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rc = unsafe { on_close(ctx_addr as *mut IWTSVirtualChannelCallback) };
+            let _ = done_tx.send(rc);
+        });
+        // Let on_close run its stop/drain while the writer is parked.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let (rlock, rcvar) = &*hold.release;
+        *rlock.lock().unwrap() = true;
+        rcvar.notify_all();
+        let rc = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("on_close never returned after the in-flight write completed");
+        assert_eq!(rc, freerdp_sys::CHANNEL_RC_OK);
+        h.closed = true;
+
+        // Only the Success ack and the ONE in-flight frame may appear.
+        // Pre-fix the writer drains the queue after release and writes
+        // frames 1..3 too (5 writes) — wait for that to settle so the
+        // assertion FAILS deterministically instead of racing.
+        let settle = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while h.written().len() < 5 && std::time::Instant::now() < settle {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let writes = h.written();
+        // Settle the (pre-fix still running) writer BEFORE asserting so a
+        // failing assert cannot race the harness drop into the allocator.
+        settle_writer();
+        leak_fake(&mut h);
+        assert_eq!(writes.len(), 2, "queued frames must be drained, not written");
+        assert_eq!(writes[0], header(SUCCESS));
+        assert_eq!(writes[1][..3], [1, SAMPLE_RESP, 0]);
+        assert_eq!(writes[1][3], 0u8); // frame 0, the in-flight one
+
+        // And nothing ever arrives afterwards.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(h.written().len(), 2, "write after close = use-after-free");
+    }
+
+    /// A frame racing in AFTER stop_stream (consumer push_frame holds the
+    /// sender a moment longer) must never reach the channel.
+    #[test]
+    fn late_frame_after_close_is_never_written() {
+        let mock = MockWebcam::new(false, (640, 480), (640, 480), 15);
+        let mut h = Harness::new(mock.clone());
+        let ptr = h.channel_ptr;
+        h.send(&start_streams_payload(0, FMT_MJPG, 320, 240, 15, 1));
+        // Keep our own sender clone alive past stop_stream, like the
+        // consumer's push_frame path can.
+        let tx = mock.frame_tx.lock().unwrap().clone().unwrap();
+        h.close();
+        let _ = tx.send(WebcamFrame {
+            data: vec![0xEE; 16],
+            channel_ptr: ptr,
+        });
+        // Pre-fix the writer is still alive (sender kept open) and writes
+        // the late frame — wait for that so the assertion FAILS
+        // deterministically instead of racing.
+        let settle = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while h.written().len() < 2 && std::time::Instant::now() < settle {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let late_writes = h.written();
+        // Reclaim the writer thread before asserting (and before the fake
+        // channel is dropped): dropping our sender clone disconnects rx
+        // and the loop exits.
+        drop(tx);
+        settle_writer();
+        leak_fake(&mut h);
+        assert_eq!(
+            late_writes,
+            vec![header(SUCCESS)],
+            "a frame sent after close must never be written"
+        );
     }
 }
