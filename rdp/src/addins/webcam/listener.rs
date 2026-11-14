@@ -136,20 +136,36 @@ pub unsafe extern "C" fn on_control_data(
         unsafe { write_to_channel(ctx.channel, &pdu) };
 
         log::info!("Webcam Control: Creating dynamic listener for RDCamera_Capture_Device_0...");
-        let (raw_dev_ctx, dev_listener, err) = unsafe {
-            create_device_listener(
-                ctx.webcam.clone(),
-                ctx.channel_mgr,
-                "RDCamera_Capture_Device_0",
-                ctx.rdpcontext,
-            )
-        };
-        if err == CHANNEL_RC_OK {
-            ctx.dev_listener = Some(dev_listener);
-            ctx.dev_listener_ctx = Some(raw_dev_ctx);
-            log::info!("Webcam Control: Dynamic listener created successfully");
+        // Gate against repeated SelectVersionResponse PDUs: a host can replay
+        // this 2-byte PDU; without a gate each repeat allocates a NEW
+        // DeviceListenerCtx and overwrites the raw-pointer slots without
+        // freeing the old ones (~48-byte host-controlled leak per PDU, plus
+        // duplicate listeners). If a listener already exists, reuse it.
+        if ctx.dev_listener.is_some() {
+            log::debug!(
+                "Webcam Control: device listener already exists, ignoring repeat SelectVersionResponse"
+            );
         } else {
-            log::error!("Webcam Control: Failed to create dynamic listener: {err}");
+            let (raw_dev_ctx, dev_listener, err) = unsafe {
+                create_device_listener(
+                    ctx.webcam.clone(),
+                    ctx.channel_mgr,
+                    "RDCamera_Capture_Device_0",
+                    ctx.rdpcontext,
+                )
+            };
+            if err == CHANNEL_RC_OK {
+                ctx.dev_listener = Some(dev_listener);
+                ctx.dev_listener_ctx = Some(raw_dev_ctx);
+                log::info!("Webcam Control: Dynamic listener created successfully");
+            } else {
+                log::error!("Webcam Control: Failed to create dynamic listener: {err}");
+                // Reclaim the ctx we allocated; CreateListener failed so the
+                // listener was not registered.
+                unsafe {
+                    let _ = Box::from_raw(raw_dev_ctx);
+                }
+            }
         }
     }
 
@@ -584,6 +600,30 @@ mod tests {
         }
         drop(created);
         h.close();
+    }
+
+    #[test]
+    fn repeated_version_response_does_not_leak_listeners() {
+        // Fix Q: a host can replay the 2-byte SelectVersionResponse PDU. Each
+        // repeat must NOT allocate a new DeviceListenerCtx / listener (the
+        // old raw-pointer slots would be overwritten without freeing -> leak).
+        let mut h = ControlHarness::new("Test Cam");
+        for _ in 0..5 {
+            assert_eq!(send_control_pdu(h.cctx, &[1, 4]), CHANNEL_RC_OK);
+        }
+        // Exactly ONE listener created despite 5 responses.
+        assert_eq!(
+            h.created.lock().unwrap().len(),
+            1,
+            "repeat SelectVersionResponse must reuse the existing listener"
+        );
+        unsafe {
+            assert!((*h.cctx).dev_listener.is_some());
+            assert!((*h.cctx).dev_listener_ctx.is_some());
+        }
+        h.close();
+        // The single listener is destroyed exactly once on close.
+        assert_eq!(h.destroyed.lock().unwrap().len(), 1);
     }
 
     #[test]
